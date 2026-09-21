@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - run: npm install
+
+      # Math, ECS and geometry. No GPU needed.
+      - run: npm test
+
+      # Compiles every shader and validates every pipeline against Dawn using
+      # a software adapter, then reads pass outputs back and asserts that
+      # occlusion occludes, shadows darken and bloom glows.
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:gpu
+
+      # The CDN build must work the way a consumer loads it: a plain script
+      # tag and a global.
+      - run: npm run build
+      - run: npm run test:bundle

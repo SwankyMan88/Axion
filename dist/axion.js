@@ -1,0 +1,3514 @@
+/*! Axion 0.2.0 — WebGPU, data-oriented 3D engine. MIT. */
+var Axion = (() => {
+  var __defProp = Object.defineProperty;
+  var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+  var __getOwnPropNames = Object.getOwnPropertyNames;
+  var __hasOwnProp = Object.prototype.hasOwnProperty;
+  var __export = (target, all) => {
+    for (var name in all)
+      __defProp(target, name, { get: all[name], enumerable: true });
+  };
+  var __copyProps = (to, from, except, desc) => {
+    if (from && typeof from === "object" || typeof from === "function") {
+      for (let key of __getOwnPropNames(from))
+        if (!__hasOwnProp.call(to, key) && key !== except)
+          __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+    }
+    return to;
+  };
+  var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
+
+  // src/index.js
+  var index_exports = {};
+  __export(index_exports, {
+    AO_BLUR_WGSL: () => AO_BLUR_WGSL,
+    AO_WGSL: () => AO_WGSL,
+    App: () => App,
+    Arena: () => Arena,
+    BLOOM_DOWN_WGSL: () => BLOOM_DOWN_WGSL,
+    BLOOM_PREFILTER_WGSL: () => BLOOM_PREFILTER_WGSL,
+    BLOOM_UP_WGSL: () => BLOOM_UP_WGSL,
+    Bounds: () => Bounds,
+    CUBE_FACES: () => CUBE_FACES,
+    Camera: () => Camera,
+    Dynamic: () => Dynamic,
+    DynamicBuffer: () => DynamicBuffer,
+    FINAL_WGSL: () => FINAL_WGSL,
+    FlyControls: () => FlyControls,
+    Hidden: () => Hidden,
+    InstanceColor: () => InstanceColor,
+    LocalToWorld: () => LocalToWorld,
+    M_MATERIAL: () => M_MATERIAL,
+    M_MESH: () => M_MESH,
+    MeshRef: () => MeshRef,
+    Motion: () => Motion,
+    NULL_ENTITY: () => NULL_ENTITY,
+    OrbitControls: () => OrbitControls,
+    PointLight: () => PointLight,
+    RESOLVE_WGSL: () => RESOLVE_WGSL,
+    Renderer: () => Renderer,
+    SHADOW_WGSL: () => SHADOW_WGSL,
+    STANDARD_WGSL: () => STANDARD_WGSL,
+    T_POS: () => T_POS,
+    T_ROT: () => T_ROT,
+    T_SCALE: () => T_SCALE,
+    Transform: () => Transform,
+    UnsupportedError: () => UnsupportedError,
+    VERSION: () => VERSION,
+    VERTEX_STRIDE_BYTES: () => VERTEX_STRIDE_BYTES,
+    World: () => World,
+    box: () => box,
+    composeRange: () => composeRange,
+    createDevice: () => createDevice,
+    defineComponent: () => defineComponent,
+    entityGen: () => entityGen,
+    entityIndex: () => entityIndex,
+    icosphere: () => icosphere,
+    math: () => math_exports,
+    motionSystem: () => motionSystem,
+    plane: () => plane,
+    resizeCanvas: () => resizeCanvas,
+    roundedBox: () => roundedBox,
+    sphere: () => sphere,
+    torus: () => torus,
+    transformSystem: () => transformSystem
+  });
+
+  // src/gpu/device.js
+  var UnsupportedError = class extends Error {
+  };
+  async function createDevice(canvas, {
+    powerPreference = "high-performance",
+    requiredFeatures = [],
+    alphaMode = "opaque"
+  } = {}) {
+    if (typeof navigator === "undefined" || !navigator.gpu) {
+      throw new UnsupportedError(
+        "WebGPU is not available in this browser. Axion requires WebGPU (Chrome/Edge 113+, Safari 18+, or Firefox with dom.webgpu.enabled)."
+      );
+    }
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference });
+    if (!adapter) throw new UnsupportedError("No suitable GPU adapter found.");
+    const features = requiredFeatures.filter((f) => adapter.features.has(f));
+    const device = await adapter.requestDevice({
+      requiredFeatures: features,
+      requiredLimits: {
+        maxStorageBufferBindingSize: Math.min(
+          adapter.limits.maxStorageBufferBindingSize,
+          512 * 1024 * 1024
+        )
+      }
+    });
+    const context = canvas.getContext("webgpu");
+    const format = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({ device, format, alphaMode });
+    const info = {
+      vendor: adapter.info?.vendor ?? "unknown",
+      architecture: adapter.info?.architecture ?? "unknown",
+      features: [...device.features],
+      limits: adapter.limits
+    };
+    device.lost.then((reason) => {
+      console.error("[axion] GPU device lost:", reason.message);
+    });
+    device.addEventListener?.("uncapturederror", (e) => {
+      console.error("[axion] GPU error:", e.error?.message ?? e.error);
+    });
+    return { device, context, format, adapter, info };
+  }
+  function resizeCanvas(canvas, maxDpr = 2) {
+    const dpr = Math.min(globalThis.devicePixelRatio || 1, maxDpr);
+    const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+    const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+    if (canvas.width === w && canvas.height === h) return false;
+    canvas.width = w;
+    canvas.height = h;
+    return true;
+  }
+
+  // src/gpu/buffers.js
+  var align = (n, a) => Math.ceil(n / a) * a;
+  var Arena = class {
+    constructor(device, usage, initialBytes = 1 << 20, label = "arena") {
+      this.device = device;
+      this.usage = usage | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+      this.label = label;
+      this.capacity = align(initialBytes, 256);
+      this.offset = 0;
+      this.buffer = device.createBuffer({ size: this.capacity, usage: this.usage, label });
+    }
+    /** Reserve `bytes`, returning the byte offset. Grows (and copies) if needed. */
+    alloc(bytes, alignment = 4) {
+      const start = align(this.offset, alignment);
+      const end = start + bytes;
+      if (end > this.capacity) this._grow(end);
+      this.offset = end;
+      return start;
+    }
+    write(byteOffset, data) {
+      this.device.queue.writeBuffer(
+        this.buffer,
+        byteOffset,
+        data.buffer,
+        data.byteOffset,
+        data.byteLength
+      );
+    }
+    /** Alloc + write in one step. */
+    upload(data, alignment = 4) {
+      const off = this.alloc(data.byteLength, alignment);
+      this.write(off, data);
+      return off;
+    }
+    _grow(needed) {
+      let cap = this.capacity;
+      while (cap < needed) cap *= 2;
+      const next = this.device.createBuffer({ size: cap, usage: this.usage, label: this.label });
+      const enc = this.device.createCommandEncoder({ label: `${this.label}-grow` });
+      enc.copyBufferToBuffer(this.buffer, 0, next, 0, this.offset);
+      this.device.queue.submit([enc.finish()]);
+      this.buffer.destroy();
+      this.buffer = next;
+      this.capacity = cap;
+    }
+    destroy() {
+      this.buffer.destroy();
+    }
+  };
+  var DynamicBuffer = class {
+    constructor(device, usage, floatCapacity, label = "dynamic") {
+      this.device = device;
+      this.usage = usage | GPUBufferUsage.COPY_DST;
+      this.label = label;
+      this.cpu = new Float32Array(floatCapacity);
+      this.buffer = device.createBuffer({
+        size: align(this.cpu.byteLength, 256),
+        usage: this.usage,
+        label
+      });
+    }
+    ensure(floats) {
+      if (floats <= this.cpu.length) return;
+      let n = this.cpu.length;
+      while (n < floats) n *= 2;
+      this.cpu = new Float32Array(n);
+      this.buffer.destroy();
+      this.buffer = this.device.createBuffer({
+        size: align(this.cpu.byteLength, 256),
+        usage: this.usage,
+        label: this.label
+      });
+    }
+    /** Upload only the first `floats` elements actually written this frame. */
+    flush(floats) {
+      if (floats === 0) return;
+      this.device.queue.writeBuffer(
+        this.buffer,
+        0,
+        this.cpu.buffer,
+        this.cpu.byteOffset,
+        floats * 4
+      );
+    }
+    destroy() {
+      this.buffer.destroy();
+    }
+  };
+
+  // src/render/shaders.js
+  var COMMON = (
+    /* wgsl */
+    `
+struct Camera {
+  viewProj : mat4x4<f32>,
+  view     : mat4x4<f32>,
+  invView  : mat4x4<f32>,
+  position : vec4<f32>,   // xyz = eye, w = time
+  params   : vec4<f32>,   // x = lightCount, y = exposure, z = fogDensity, w = fxaa
+  ambient  : vec4<f32>,   // rgb = sky ambient, a = ground ambient scale
+  fog      : vec4<f32>,   // rgb = fog color, a = aerial perspective blend
+  proj     : vec4<f32>,   // x = P[0][0], y = P[1][1], z = near, w = aspect
+  ssr      : vec4<f32>,   // x = intensity, y = steps, z = thickness, w = maxDistance
+  screen   : vec4<f32>,   // x = width, y = height, z = 1/width, w = 1/height
+  ao       : vec4<f32>,   // x = intensity, y = radius, z = power, w = bias
+  bloom    : vec4<f32>,   // x = threshold, y = knee, z = strength, w = unused
+  shadow   : vec4<f32>,   // x = map size, y = pcf radius, z = normal bias, w = unused
+  fade     : vec4<f32>,   // x = AO fade distance, y = SSR fade distance, zw = unused
+};
+
+const PI : f32 = 3.14159265359;
+
+fn octEncode(n : vec3<f32>) -> vec2<f32> {
+  let d = n / (abs(n.x) + abs(n.y) + abs(n.z) + 1e-6);
+  if (d.z >= 0.0) { return d.xy; }
+  return (vec2<f32>(1.0) - abs(d.yx)) * vec2<f32>(sign(d.x), sign(d.y));
+}
+
+fn octDecode(e : vec2<f32>) -> vec3<f32> {
+  var n = vec3<f32>(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+  if (n.z < 0.0) {
+    let t = (vec2<f32>(1.0) - abs(n.yx)) * vec2<f32>(sign(n.x), sign(n.y));
+    n = vec3<f32>(t.x, t.y, n.z);
+  }
+  return normalize(n);
+}
+
+/**
+ * Reverse-Z with an infinite far plane collapses to one term:
+ *   depth = near / -z_view,  so  -z_view = near / depth.
+ * No far plane appears, which is exactly why there is none to tune.
+ */
+fn linearDepth(d : f32, near : f32) -> f32 {
+  return near / max(d, 1e-7);
+}
+
+fn viewPosFromUV(uv : vec2<f32>, d : f32, proj : vec4<f32>) -> vec3<f32> {
+  let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  let dist = linearDepth(d, proj.z);
+  return vec3<f32>(ndc.x * dist / proj.x, ndc.y * dist / proj.y, -dist);
+}
+
+// Analytic environment: a three-band sky over a dim ground. It costs nothing
+// and gives metal something to reflect when a screen-space ray runs out of
+// screen \u2014 the difference between "reflective" and "black".
+fn sampleEnvironment(dir : vec3<f32>, roughness : f32, ambient : vec3<f32>) -> vec3<f32> {
+  let up = clamp(dir.y, -1.0, 1.0);
+  let sky = ambient * 1.7;
+  let horizon = ambient * 2.1 + vec3<f32>(0.025, 0.022, 0.020);
+  let ground = ambient * 0.40;
+
+  var env = mix(ground, horizon, smoothstep(-0.25, 0.22, up));
+  env = mix(env, sky, smoothstep(0.05, 0.85, up));
+  env = env + vec3<f32>(pow(max(up, 0.0), 8.0) * 0.30);
+
+  let avg = (sky + horizon + ground) / 3.0;
+  return mix(env, avg, roughness * roughness);
+}
+
+/** Fullscreen triangle from the vertex index alone \u2014 no vertex buffer. */
+struct FSOut {
+  @builtin(position) clip : vec4<f32>,
+  @location(0) uv : vec2<f32>,
+};
+
+fn fullscreen(vi : u32) -> FSOut {
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  let p = pos[vi];
+  var out : FSOut;
+  out.clip = vec4<f32>(p, 0.0, 1.0);
+  out.uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+  return out;
+}
+`
+  );
+  var CUBE_FACES = [
+    { f: [1, 0, 0], u: [0, -1, 0] },
+    { f: [-1, 0, 0], u: [0, -1, 0] },
+    { f: [0, 1, 0], u: [0, 0, 1] },
+    { f: [0, -1, 0], u: [0, 0, -1] },
+    { f: [0, 0, 1], u: [0, -1, 0] },
+    { f: [0, 0, -1], u: [0, -1, 0] }
+  ];
+  var CUBE_WGSL = (
+    /* wgsl */
+    `
+const FACE_F = array<vec3<f32>, 6>(
+  vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0),
+  vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0),
+  vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, -1.0));
+const FACE_U = array<vec3<f32>, 6>(
+  vec3<f32>(0.0, -1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0),
+  vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, -1.0),
+  vec3<f32>(0.0, -1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0));
+
+fn faceIndex(v : vec3<f32>) -> i32 {
+  let a = abs(v);
+  if (a.x >= a.y && a.x >= a.z) { return select(1, 0, v.x > 0.0); }
+  if (a.y >= a.z) { return select(3, 2, v.y > 0.0); }
+  return select(5, 4, v.z > 0.0);
+}
+`
+  );
+  var SHADOW_WGSL = (
+    /* wgsl */
+    `
+struct Face {
+  viewProj : mat4x4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> face : Face;
+@group(0) @binding(1) var<storage, read> models : array<mat4x4<f32>>;
+
+@vertex
+fn vs(@builtin(instance_index) ii : u32,
+      @location(0) position : vec3<f32>) -> @builtin(position) vec4<f32> {
+  return face.viewProj * (models[ii] * vec4<f32>(position, 1.0));
+}
+`
+  );
+  var STANDARD_WGSL = (
+    /* wgsl */
+    `
+${COMMON}
+${CUBE_WGSL}
+
+struct Instance {
+  model : mat4x4<f32>,
+  color : vec4<f32>,   // rgb = albedo tint, a = alpha
+  pbr   : vec4<f32>,   // x = metallic, y = roughness, z = emissive, w = unused
+  surf  : vec4<f32>,   // x = noise scale, y = noise strength, z = bump, w = oxide
+};
+
+struct Light {
+  posRange   : vec4<f32>,  // xyz = world position, w = range
+  colorPower : vec4<f32>,  // rgb = color, a = intensity
+  shadowInfo : vec4<f32>,  // x = shadow slot (-1 = none), y = near, z = bias, w = far
+};
+
+@group(0) @binding(0) var<uniform> camera : Camera;
+@group(0) @binding(1) var<storage, read> instances : array<Instance>;
+@group(0) @binding(2) var<storage, read> lights : array<Light>;
+@group(0) @binding(3) var shadowMaps : texture_depth_2d_array;
+@group(0) @binding(4) var shadowSampler : sampler_comparison;
+
+struct VSOut {
+  @builtin(position) clip : vec4<f32>,
+  @location(0) worldPos   : vec3<f32>,
+  @location(1) normal     : vec3<f32>,
+  @location(2) uv         : vec2<f32>,
+  @location(3) color      : vec4<f32>,
+  @location(4) pbr        : vec4<f32>,
+  @location(5) surf       : vec4<f32>,
+};
+
+struct GBuffer {
+  @location(0) color   : vec4<f32>,
+  @location(1) surface : vec4<f32>,
+  @location(2) albedo  : vec4<f32>,
+};
+
+@vertex
+fn vs(
+  @builtin(instance_index) ii : u32,
+  @location(0) position : vec3<f32>,
+  @location(1) normal   : vec3<f32>,
+  @location(2) uv       : vec2<f32>,
+) -> VSOut {
+  let inst = instances[ii];
+  let world = inst.model * vec4<f32>(position, 1.0);
+  let n = normalize((inst.model * vec4<f32>(normal, 0.0)).xyz);
+
+  var out : VSOut;
+  out.clip = camera.viewProj * world;
+  out.worldPos = world.xyz;
+  out.normal = n;
+  out.uv = uv;
+  out.color = inst.color;
+  out.pbr = inst.pbr;
+  out.surf = inst.surf;
+  return out;
+}
+
+/* ----------------------------------------------------------- noise ----- */
+
+fn hash31(p : vec3<f32>) -> f32 {
+  var q = fract(p * 0.3183099 + vec3<f32>(0.1, 0.1, 0.1));
+  q = q * 17.0;
+  return fract(q.x * q.y * q.z * (q.x + q.y + q.z));
+}
+
+/** Trilinear value noise with a smootherstep fade \u2014 no visible lattice. */
+fn valueNoise(p : vec3<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+
+  let n000 = hash31(i + vec3<f32>(0.0, 0.0, 0.0));
+  let n100 = hash31(i + vec3<f32>(1.0, 0.0, 0.0));
+  let n010 = hash31(i + vec3<f32>(0.0, 1.0, 0.0));
+  let n110 = hash31(i + vec3<f32>(1.0, 1.0, 0.0));
+  let n001 = hash31(i + vec3<f32>(0.0, 0.0, 1.0));
+  let n101 = hash31(i + vec3<f32>(1.0, 0.0, 1.0));
+  let n011 = hash31(i + vec3<f32>(0.0, 1.0, 1.0));
+  let n111 = hash31(i + vec3<f32>(1.0, 1.0, 1.0));
+
+  let x00 = mix(n000, n100, u.x);
+  let x10 = mix(n010, n110, u.x);
+  let x01 = mix(n001, n101, u.x);
+  let x11 = mix(n011, n111, u.x);
+  return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
+
+/** Four-octave fBm. Lacunarity 2.02 to keep octaves from lining up. */
+fn fbm(p : vec3<f32>) -> f32 {
+  var sum = 0.0;
+  var amp = 0.5;
+  var freq = p;
+  for (var i = 0; i < 4; i = i + 1) {
+    sum = sum + valueNoise(freq) * amp;
+    freq = freq * 2.02;
+    amp = amp * 0.5;
+  }
+  return sum;
+}
+
+/* ---------------------------------------------------------- shadowing --- */
+
+/**
+ * Point-light shadow lookup.
+ *
+ * The stored value is the cube-face projected depth, so the reference depth
+ * reduces to a single reciprocal of the major-axis distance \u2014 no per-pixel
+ * matrix multiply, no six-way projection test, just the face basis this file
+ * and the JS side both read from one table.
+ *
+ * PCF taps use a Vogel disk: evenly spaced by construction, so the penumbra
+ * reads as a smooth gradient instead of the grid stipple a box kernel leaves.
+ */
+fn sampleShadow(slot : i32, toFrag : vec3<f32>, nDotL : f32,
+                near : f32, bias : f32, far : f32) -> f32 {
+  let face = faceIndex(toFrag);
+  let F = FACE_F[face];
+  let U = FACE_U[face];
+  let R = cross(F, U);
+
+  let ma = dot(toFrag, F);
+  if (ma <= near) { return 1.0; }
+
+  let sc = dot(toFrag, R) / ma;
+  let tc = dot(toFrag, U) / ma;
+  if (abs(sc) > 1.0 || abs(tc) > 1.0) { return 1.0; }
+
+  let uv = vec2<f32>(sc * 0.5 + 0.5, 0.5 - tc * 0.5);
+
+  // depth = A - B/distance, the exact inverse of the cube-face projection.
+  let A = far / (far - near);
+  let B = near * far / (far - near);
+
+  // Slope-scaled bias: a surface nearly edge-on to the light needs far more
+  // tolerance than one facing it, and a constant bias has to be set for the
+  // worst case, which detaches every contact shadow.
+  let slope = clamp(1.0 - nDotL, 0.0, 1.0);
+  let d = ma * (1.0 + bias * (0.35 + slope * 3.0));
+  let refDepth = A - B / d;
+
+  let texel = camera.shadow.y / camera.shadow.x;
+  let layer = slot * 6 + face;
+
+  var sum = 0.0;
+  let rot = fract(sin(dot(toFrag.xy, vec2<f32>(12.9898, 78.233))) * 43758.5453) * 6.2831853;
+  for (var i = 0; i < 12; i = i + 1) {
+    let r = sqrt((f32(i) + 0.5) / 12.0);
+    let theta = f32(i) * 2.39996323 + rot;
+    let offset = vec2<f32>(cos(theta), sin(theta)) * r * texel;
+    sum = sum + textureSampleCompareLevel(shadowMaps, shadowSampler, uv + offset, layer, refDepth);
+  }
+  return sum / 12.0;
+}
+
+/* ---------------------------------------------------------- lighting --- */
+
+fn distributionGGX(nDotH : f32, roughness : f32) -> f32 {
+  let a = roughness * roughness;
+  let a2 = a * a;
+  let d = nDotH * nDotH * (a2 - 1.0) + 1.0;
+  return a2 / max(PI * d * d, 1e-5);
+}
+
+fn geometrySmith(nDotV : f32, nDotL : f32, roughness : f32) -> f32 {
+  let r = roughness + 1.0;
+  let k = (r * r) / 8.0;
+  let gv = nDotV / (nDotV * (1.0 - k) + k);
+  let gl = nDotL / (nDotL * (1.0 - k) + k);
+  return gv * gl;
+}
+
+fn fresnelSchlick(cosTheta : f32, f0 : vec3<f32>) -> vec3<f32> {
+  return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+@fragment
+fn fs(in : VSOut) -> GBuffer {
+  var albedo = in.color.rgb;
+  var metallic = clamp(in.pbr.x, 0.0, 1.0);
+  var roughness = clamp(in.pbr.y, 0.04, 1.0);
+  var N = normalize(in.normal);
+
+  let noiseScale = in.surf.x;
+  if (noiseScale > 0.0) {
+    let p = in.worldPos * noiseScale;
+    let h = fbm(p);
+
+    // Bump from the gradient of the same field. Three extra taps, and the
+    // offset is tied to the feature size so detail never aliases into mush.
+    let e = 0.55;
+    let dx = fbm(p + vec3<f32>(e, 0.0, 0.0)) - h;
+    let dy = fbm(p + vec3<f32>(0.0, e, 0.0)) - h;
+    let dz = fbm(p + vec3<f32>(0.0, 0.0, e)) - h;
+    let grad = vec3<f32>(dx, dy, dz) * noiseScale;
+    N = normalize(N - (grad - N * dot(grad, N)) * in.surf.z);
+
+    // Weathering: a second, coarser field decides where the finish is gone.
+    let wear = smoothstep(0.42, 0.72, fbm(p * 0.27));
+    let oxide = vec3<f32>(0.21, 0.11, 0.07) * (0.6 + h * 0.8);
+
+    albedo = mix(albedo, albedo * (0.72 + h * 0.62), in.surf.y);
+    albedo = mix(albedo, oxide, wear * in.surf.w);
+    roughness = clamp(roughness + (h - 0.45) * in.surf.y * 0.85 + wear * in.surf.w * 0.4, 0.05, 1.0);
+    metallic = clamp(metallic * (1.0 - wear * in.surf.w * 0.85), 0.0, 1.0);
+  }
+
+  let V = normalize(camera.position.xyz - in.worldPos);
+  let nDotV = max(dot(N, V), 1e-4);
+  let f0 = mix(vec3<f32>(0.04), albedo, metallic);
+  var Lo = vec3<f32>(0.0);
+
+  let count = u32(camera.params.x);
+  for (var i : u32 = 0u; i < count; i = i + 1u) {
+    let light = lights[i];
+    let toLight = light.posRange.xyz - in.worldPos;
+    let dist = length(toLight);
+    if (dist > light.posRange.w) { continue; }
+    let L = toLight / max(dist, 1e-4);
+    let nDotL = max(dot(N, L), 0.0);
+    if (nDotL <= 0.0) { continue; }
+    let H = normalize(V + L);
+
+    // Windowed inverse-square: reaches exactly zero at the light's range, so
+    // culling by range can never pop.
+    let ratio = dist / light.posRange.w;
+    let window = clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);
+    let atten = (window * window) / (dist * dist + 1.0);
+
+    var shadow = 1.0;
+    let slot = i32(light.shadowInfo.x);
+    if (slot >= 0) {
+      // Offset along the geometric normal before the lookup: this moves the
+      // sample off the surface that casts it, which kills acne without the
+      // depth bias that would otherwise detach the contact shadow.
+      let offset = normalize(in.normal) * camera.shadow.z;
+      shadow = sampleShadow(slot, (in.worldPos + offset) - light.posRange.xyz, nDotL,
+                            light.shadowInfo.y, light.shadowInfo.z, light.shadowInfo.w);
+      if (shadow <= 0.001) { continue; }
+    }
+
+    let radiance = light.colorPower.rgb * light.colorPower.a * atten * shadow;
+
+    let D = distributionGGX(max(dot(N, H), 0.0), roughness);
+    let G = geometrySmith(nDotV, nDotL, roughness);
+    let F = fresnelSchlick(max(dot(H, V), 0.0), f0);
+    let spec = (D * G * F) / max(4.0 * nDotV * nDotL, 1e-4);
+    let kD = (vec3<f32>(1.0) - F) * (1.0 - metallic);
+    Lo = Lo + (kD * albedo / PI + spec) * radiance * nDotL;
+  }
+
+  var out : GBuffer;
+  // Ambient is deferred to the resolve pass so occlusion can modulate it.
+  out.color = vec4<f32>(Lo + albedo * in.pbr.z, in.color.a);
+  let viewN = normalize((camera.view * vec4<f32>(N, 0.0)).xyz);
+  let oct = octEncode(viewN);
+  out.surface = vec4<f32>(oct.x, oct.y, roughness, metallic);
+  out.albedo = vec4<f32>(albedo, 1.0);
+  return out;
+}
+`
+  );
+  var AO_WGSL = (
+    /* wgsl */
+    `
+${COMMON}
+
+@group(0) @binding(0) var<uniform> camera : Camera;
+@group(0) @binding(1) var texSampler : sampler;
+@group(0) @binding(2) var depthTex : texture_depth_2d;
+@group(0) @binding(3) var surfaceTex : texture_2d<f32>;
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
+
+fn loadDepth(uv : vec2<f32>) -> f32 {
+  let c = vec2<i32>(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) *
+                    vec2<f32>(camera.screen.x - 1.0, camera.screen.y - 1.0));
+  return textureLoad(depthTex, c, 0);
+}
+
+/**
+ * Horizon-based ambient occlusion.
+ *
+ * For each of six directions the march finds the steepest horizon the
+ * neighbourhood raises against the surface, and integrates the cosine-weighted
+ * visibility left over. Six slices at quarter resolution is cheap; the
+ * interleaved rotation plus the depth-aware blur that follows is what turns
+ * that sparse sampling into a smooth term.
+ */
+@fragment
+fn fs(in : FSOut) -> @location(0) f32 {
+  let d = loadDepth(in.uv);
+  if (d <= 1e-7) { return 1.0; }
+
+  let P = viewPosFromUV(in.uv, d, camera.proj);
+  let N = octDecode(textureSampleLevel(surfaceTex, texSampler, in.uv, 0.0).xy);
+
+  // Two places this estimator has no signal, and both look like dithering if
+  // you let them through:
+  //
+  //   Distance \u2014 the world-space radius projects to under a pixel, so
+  //   neighbouring pixels sample unrelated geometry and the result is salt and
+  //   pepper rather than occlusion.
+  //
+  //   Grazing angles \u2014 a surface nearly edge-on to the view has almost no
+  //   depth resolution across a pixel, so the horizon test flips at random.
+  //
+  // Fading out is honest: no occlusion beats invented occlusion.
+  let dist = -P.z;
+  let distanceFade = 1.0 - smoothstep(camera.fade.x * 0.65, camera.fade.x, dist);
+  if (distanceFade <= 0.001) { return 1.0; }
+  let grazeFade = smoothstep(0.12, 0.38, abs(dot(N, normalize(-P))));
+  if (grazeFade <= 0.001) { return 1.0; }
+
+  let radius = camera.ao.y;
+  // Project the world-space radius to screen: distant geometry must not be
+  // sampled with a metre-wide kernel measured in pixels.
+  let radiusUV = clamp(radius * camera.proj.x / max(-P.z, 1e-3) * 0.5, 0.004, 0.22);
+
+  let pix = in.uv * camera.screen.xy;
+  let rot = fract(52.9829189 * fract(0.06711056 * pix.x + 0.00583715 * pix.y)) * 6.2831853;
+
+  var occlusion = 0.0;
+  let SLICES = 6;
+  let STEPS = 5;
+
+  for (var s = 0; s < SLICES; s = s + 1) {
+    let theta = rot + f32(s) * (3.14159265 / f32(SLICES));
+    let dir = vec2<f32>(cos(theta), sin(theta));
+
+    var best = 0.0;
+    for (var t = 1; t <= STEPS; t = t + 1) {
+      let frac = f32(t) / f32(STEPS);
+      let uv = in.uv + dir * radiusUV * frac;
+      if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { break; }
+
+      let sd = loadDepth(uv);
+      if (sd <= 1e-7) { continue; }
+      let S = viewPosFromUV(uv, sd, camera.proj);
+      let v = S - P;
+      let len = length(v);
+      if (len < 1e-4 || len > radius) { continue; }
+
+      // Falloff by distance keeps a far wall from occluding the foreground.
+      let horizon = dot(v / len, N) - camera.ao.w;
+      let falloff = 1.0 - clamp(len / radius, 0.0, 1.0);
+      best = max(best, horizon * falloff);
+    }
+    occlusion = occlusion + max(best, 0.0);
+  }
+
+  let strength = camera.ao.x * distanceFade * grazeFade;
+  let ao = clamp(1.0 - occlusion / f32(SLICES) * strength, 0.0, 1.0);
+  return pow(ao, camera.ao.z);
+}
+`
+  );
+  var AO_BLUR_WGSL = (
+    /* wgsl */
+    `
+${COMMON}
+
+@group(0) @binding(0) var<uniform> camera : Camera;
+@group(0) @binding(1) var texSampler : sampler;
+@group(0) @binding(2) var aoTex : texture_2d<f32>;
+@group(0) @binding(3) var depthTex : texture_depth_2d;
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
+
+fn loadDepth(uv : vec2<f32>) -> f32 {
+  let c = vec2<i32>(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) *
+                    vec2<f32>(camera.screen.x - 1.0, camera.screen.y - 1.0));
+  return textureLoad(depthTex, c, 0);
+}
+
+/**
+ * Depth-aware box blur. Weighting each tap by how close its depth is to the
+ * centre's is what stops AO from bleeding across a silhouette and drawing a
+ * dark halo around every object.
+ */
+@fragment
+fn fs(in : FSOut) -> @location(0) f32 {
+  let dims = vec2<f32>(textureDimensions(aoTex, 0));
+  let texel = 1.0 / dims;
+  let centerZ = linearDepth(loadDepth(in.uv), camera.proj.z);
+
+  var sum = 0.0;
+  var weight = 0.0;
+  for (var y = -2; y <= 2; y = y + 1) {
+    for (var x = -2; x <= 2; x = x + 1) {
+      let uv = in.uv + vec2<f32>(f32(x), f32(y)) * texel;
+      let z = linearDepth(loadDepth(uv), camera.proj.z);
+      let w = exp(-abs(z - centerZ) * 2.0);
+      sum = sum + textureSampleLevel(aoTex, texSampler, uv, 0.0).r * w;
+      weight = weight + w;
+    }
+  }
+  return sum / max(weight, 1e-4);
+}
+`
+  );
+  var RESOLVE_WGSL = (
+    /* wgsl */
+    `
+${COMMON}
+
+@group(0) @binding(0) var<uniform> camera : Camera;
+@group(0) @binding(1) var texSampler : sampler;
+@group(0) @binding(2) var sceneColor : texture_2d<f32>;
+@group(0) @binding(3) var surfaceTex : texture_2d<f32>;
+@group(0) @binding(4) var albedoTex : texture_2d<f32>;
+@group(0) @binding(5) var depthTex : texture_depth_2d;
+@group(0) @binding(6) var aoTex : texture_2d<f32>;
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
+
+fn loadDepth(uv : vec2<f32>) -> f32 {
+  let c = vec2<i32>(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) *
+                    vec2<f32>(camera.screen.x - 1.0, camera.screen.y - 1.0));
+  return textureLoad(depthTex, c, 0);
+}
+
+fn viewToUV(p : vec3<f32>) -> vec2<f32> {
+  let dist = max(-p.z, 1e-5);
+  let ndc = vec2<f32>(camera.proj.x * p.x / dist, camera.proj.y * p.y / dist);
+  return vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+}
+
+struct Reflection {
+  color : vec3<f32>,
+  hit   : f32,
+};
+
+/**
+ * Screen-space reflection.
+ *
+ * March the reflected ray in view space with a geometrically growing step, so
+ * near contacts are precise and distant ones are still reached in a bounded
+ * number of taps. On a crossing, binary-refine, then reject anything thicker
+ * than the depth buffer can justify \u2014 that rejection is what keeps thin
+ * geometry from smearing a false reflection across the floor.
+ */
+fn traceSSR(origin : vec3<f32>, dir : vec3<f32>, jitter : f32) -> Reflection {
+  var result : Reflection;
+  result.color = vec3<f32>(0.0);
+  result.hit = 0.0;
+
+  let steps = i32(camera.ssr.y);
+  let maxDist = camera.ssr.w;
+  var stepLen = maxDist / f32(steps) * 0.22;
+
+  var t = stepLen * (0.5 + jitter);
+  var prevT = 0.0;
+  var hitT = -1.0;
+
+  for (var i = 0; i < steps; i = i + 1) {
+    let p = origin + dir * t;
+    if (-p.z < camera.proj.z) { break; }
+
+    let uv = viewToUV(p);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { break; }
+
+    let sceneZ = -linearDepth(loadDepth(uv), camera.proj.z);
+    let diff = sceneZ - p.z;          // positive: the ray is behind geometry
+
+    // Thickness scales with distance: one depth sample stands for a bigger
+    // slab of world the further away it is.
+    if (diff > 0.0 && diff < camera.ssr.z * max(1.0, -p.z * 0.45)) {
+      hitT = t;
+      break;
+    }
+    if (diff > 0.0) { break; }        // behind, but too deep to be this surface
+
+    prevT = t;
+    stepLen = stepLen * 1.14;
+    t = t + stepLen;
+    if (t > maxDist) { break; }
+  }
+
+  if (hitT < 0.0) { return result; }
+
+  var lo = prevT;
+  var hi = hitT;
+  for (var i = 0; i < 6; i = i + 1) {
+    let mid = (lo + hi) * 0.5;
+    let p = origin + dir * mid;
+    let sceneZ = -linearDepth(loadDepth(viewToUV(p)), camera.proj.z);
+    if (sceneZ - p.z > 0.0) { hi = mid; } else { lo = mid; }
+  }
+
+  let p = origin + dir * hi;
+  let uv = viewToUV(p);
+
+  // Fade at the screen edges, at the end of the ray, and when the ray points
+  // back at the camera \u2014 the three places SSR has no information.
+  let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+  let edgeFade = smoothstep(0.0, 0.12, edge);
+  let distFade = 1.0 - smoothstep(maxDist * 0.6, maxDist, hi);
+  let faceFade = clamp(1.0 - dir.z * 1.4, 0.0, 1.0);
+
+  result.color = textureSampleLevel(sceneColor, texSampler, uv, 0.0).rgb;
+  result.hit = edgeFade * distFade * faceFade;
+  return result;
+}
+
+@fragment
+fn fs(in : FSOut) -> @location(0) vec4<f32> {
+  let d = loadDepth(in.uv);
+  var hdr = textureSampleLevel(sceneColor, texSampler, in.uv, 0.0).rgb;
+
+  let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
+  let dirView = normalize(vec3<f32>(ndc.x / camera.proj.x, ndc.y / camera.proj.y, -1.0));
+  let viewDirWorld = normalize((camera.invView * vec4<f32>(dirView, 0.0)).xyz);
+
+  if (d <= 1e-7) {
+    return vec4<f32>(sampleEnvironment(viewDirWorld, 0.0, camera.ambient.rgb) * 0.8, 1.0);
+  }
+
+  let surf = textureSampleLevel(surfaceTex, texSampler, in.uv, 0.0);
+  let albedo = textureSampleLevel(albedoTex, texSampler, in.uv, 0.0).rgb;
+  let ao = textureSampleLevel(aoTex, texSampler, in.uv, 0.0).r;
+
+  let N = octDecode(surf.xy);
+  let roughness = surf.z;
+  let metallic = surf.w;
+
+  let P = viewPosFromUV(in.uv, d, camera.proj);
+  let V = normalize(-P);
+  let R = normalize(reflect(-V, N));
+  let Nworld = normalize((camera.invView * vec4<f32>(N, 0.0)).xyz);
+
+  // Deferred hemispheric ambient, occluded. Doing this here rather than in the
+  // geometry pass is the whole reason AO reads as contact darkening instead of
+  // a grey wash over lit surfaces.
+  let up = clamp(Nworld.y * 0.5 + 0.5, 0.0, 1.0);
+  let ground = camera.ambient.rgb * camera.ambient.a;
+  let ambient = mix(ground, camera.ambient.rgb, up) * albedo * (1.0 - metallic * 0.6) * ao;
+  hdr = hdr + ambient;
+
+  let pix = in.uv * camera.screen.xy;
+  let jitter = fract(52.9829189 * fract(0.06711056 * pix.x + 0.00583715 * pix.y));
+
+  let nDotV = max(dot(N, V), 1e-4);
+  // Metals tint their reflection with their own albedo \u2014 f0 is the albedo, not
+  // white. Getting this wrong is what makes every metal read as chrome.
+  let f0 = mix(vec3<f32>(0.04), albedo, metallic);
+  // Roughness-aware Fresnel: a rough surface never reaches a full grazing
+  // mirror, so the horizon does not blow out.
+  let grazing = max(vec3<f32>(1.0 - roughness), f0);
+  let fres = f0 + (grazing - f0) * pow(1.0 - nDotV, 5.0);
+  // Same story as AO: a reflection ray from a distant, grazing pixel crosses
+  // most of the depth buffer per step, so it hits or misses essentially at
+  // random. Fade to the analytic environment instead of stippling.
+  let viewDist = -P.z;
+  let ssrFade = 1.0 - smoothstep(camera.fade.y * 0.6, camera.fade.y, viewDist);
+  let weight = clamp(1.0 - roughness * 1.35, 0.0, 1.0) * camera.ssr.x * ssrFade;
+
+  let Rworld = normalize((camera.invView * vec4<f32>(R, 0.0)).xyz);
+  var reflected = sampleEnvironment(Rworld, roughness, camera.ambient.rgb);
+
+  if (weight > 0.001) {
+    let ssr = traceSSR(P, R, jitter);
+    reflected = mix(reflected, ssr.color, ssr.hit * weight);
+  }
+
+  let fogAmount = clamp(1.0 - exp(-(-P.z) * camera.params.z), 0.0, 1.0);
+  // Occlusion applies to the environment reflection too: a crevice sees little
+  // sky, and unoccluded specular is what makes AO'd scenes look plastic.
+  hdr = hdr + reflected * fres * mix(0.35, 1.0, metallic) * (1.0 - fogAmount) * mix(1.0, ao, 0.7);
+
+  // Aerial perspective: distant surfaces fade toward the sky *in their own
+  // view direction*, not toward one flat colour. Fog to a constant is what
+  // draws a hard line along the horizon, because the ground is fading to one
+  // colour while the sky right above it is another.
+  let aerial = sampleEnvironment(viewDirWorld, 0.85, camera.ambient.rgb) * 0.8;
+  let fogTarget = mix(camera.fog.rgb, aerial, camera.fog.a);
+  hdr = mix(hdr, fogTarget, fogAmount);
+
+  return vec4<f32>(hdr, 1.0);
+}
+`
+  );
+  var BLOOM_COMMON = (
+    /* wgsl */
+    `
+${COMMON}
+
+@group(0) @binding(0) var<uniform> camera : Camera;
+@group(0) @binding(1) var texSampler : sampler;
+@group(0) @binding(2) var src : texture_2d<f32>;
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
+
+/** Thirteen-tap downsample (Jimenez). Stable under motion; no pulsing fireflies. */
+fn downsample13(uv : vec2<f32>, texel : vec2<f32>) -> vec3<f32> {
+  let a = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>(-2.0,  2.0), 0.0).rgb;
+  let b = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 0.0,  2.0), 0.0).rgb;
+  let c = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 2.0,  2.0), 0.0).rgb;
+  let d = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>(-2.0,  0.0), 0.0).rgb;
+  let e = textureSampleLevel(src, texSampler, uv, 0.0).rgb;
+  let f = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 2.0,  0.0), 0.0).rgb;
+  let g = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>(-2.0, -2.0), 0.0).rgb;
+  let h = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 0.0, -2.0), 0.0).rgb;
+  let i = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 2.0, -2.0), 0.0).rgb;
+  let j = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>(-1.0,  1.0), 0.0).rgb;
+  let k = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 1.0,  1.0), 0.0).rgb;
+  let l = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>(-1.0, -1.0), 0.0).rgb;
+  let m = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 1.0, -1.0), 0.0).rgb;
+
+  return e * 0.125 + (a + c + g + i) * 0.03125 + (b + d + f + h) * 0.0625 +
+         (j + k + l + m) * 0.125;
+}
+`
+  );
+  var BLOOM_PREFILTER_WGSL = (
+    /* wgsl */
+    `
+${BLOOM_COMMON}
+
+/** Soft-knee threshold: a hard cut makes bloom flicker on moving highlights. */
+@fragment
+fn fs(in : FSOut) -> @location(0) vec4<f32> {
+  let texel = 1.0 / vec2<f32>(textureDimensions(src, 0));
+  let c = downsample13(in.uv, texel);
+
+  let brightness = max(c.r, max(c.g, c.b));
+  let knee = camera.bloom.y;
+  let threshold = camera.bloom.x;
+  var soft = brightness - threshold + knee;
+  soft = clamp(soft, 0.0, 2.0 * knee);
+  soft = soft * soft / (4.0 * knee + 1e-4);
+  let contribution = max(soft, brightness - threshold) / max(brightness, 1e-4);
+
+  return vec4<f32>(c * contribution, 1.0);
+}
+`
+  );
+  var BLOOM_DOWN_WGSL = (
+    /* wgsl */
+    `
+${BLOOM_COMMON}
+
+@fragment
+fn fs(in : FSOut) -> @location(0) vec4<f32> {
+  let texel = 1.0 / vec2<f32>(textureDimensions(src, 0));
+  return vec4<f32>(downsample13(in.uv, texel), 1.0);
+}
+`
+  );
+  var BLOOM_UP_WGSL = (
+    /* wgsl */
+    `
+${BLOOM_COMMON}
+
+/**
+ * Tent upsample, blended additively onto the larger mip. Walking the pyramid
+ * back up with a small filter produces a wide, smooth glow from cheap passes \u2014
+ * far better than one big gaussian at full resolution.
+ */
+@fragment
+fn fs(in : FSOut) -> @location(0) vec4<f32> {
+  let texel = 1.0 / vec2<f32>(textureDimensions(src, 0));
+  let r = texel * 1.0;
+
+  let a = textureSampleLevel(src, texSampler, in.uv + vec2<f32>(-r.x,  r.y), 0.0).rgb;
+  let b = textureSampleLevel(src, texSampler, in.uv + vec2<f32>( 0.0,  r.y), 0.0).rgb;
+  let c = textureSampleLevel(src, texSampler, in.uv + vec2<f32>( r.x,  r.y), 0.0).rgb;
+  let d = textureSampleLevel(src, texSampler, in.uv + vec2<f32>(-r.x,  0.0), 0.0).rgb;
+  let e = textureSampleLevel(src, texSampler, in.uv, 0.0).rgb;
+  let f = textureSampleLevel(src, texSampler, in.uv + vec2<f32>( r.x,  0.0), 0.0).rgb;
+  let g = textureSampleLevel(src, texSampler, in.uv + vec2<f32>(-r.x, -r.y), 0.0).rgb;
+  let h = textureSampleLevel(src, texSampler, in.uv + vec2<f32>( 0.0, -r.y), 0.0).rgb;
+  let i = textureSampleLevel(src, texSampler, in.uv + vec2<f32>( r.x, -r.y), 0.0).rgb;
+
+  let sum = e * 4.0 + (b + d + f + h) * 2.0 + (a + c + g + i);
+  return vec4<f32>(sum / 16.0, 1.0);
+}
+`
+  );
+  var FINAL_WGSL = (
+    /* wgsl */
+    `
+${COMMON}
+
+@group(0) @binding(0) var<uniform> camera : Camera;
+@group(0) @binding(1) var texSampler : sampler;
+@group(0) @binding(2) var hdrTex : texture_2d<f32>;
+@group(0) @binding(3) var bloomTex : texture_2d<f32>;
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
+
+fn tonemapACES(x : vec3<f32>) -> vec3<f32> {
+  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn luma(c : vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722)); }
+
+/** Graded pixel: HDR + bloom, tonemapped and gamma-encoded. FXAA runs on this. */
+fn gradeAt(uv : vec2<f32>) -> vec3<f32> {
+  let hdr = textureSampleLevel(hdrTex, texSampler, uv, 0.0).rgb;
+  let bloom = textureSampleLevel(bloomTex, texSampler, uv, 0.0).rgb;
+  return pow(tonemapACES((hdr + bloom * camera.bloom.z) * camera.params.y), vec3<f32>(1.0 / 2.2));
+}
+
+@fragment
+fn fs(in : FSOut) -> @location(0) vec4<f32> {
+  var color = gradeAt(in.uv);
+
+  // FXAA (console variant): one diagonal blend along the detected edge. Cheap,
+  // and it is the reason this pipeline can skip MSAA and still keep its depth
+  // buffer sampleable for the reflection march and the occlusion pass.
+  if (camera.params.w > 0.5) {
+    let texel = camera.screen.zw;
+    let lNW = luma(gradeAt(in.uv + vec2<f32>(-texel.x, -texel.y)));
+    let lNE = luma(gradeAt(in.uv + vec2<f32>( texel.x, -texel.y)));
+    let lSW = luma(gradeAt(in.uv + vec2<f32>(-texel.x,  texel.y)));
+    let lSE = luma(gradeAt(in.uv + vec2<f32>( texel.x,  texel.y)));
+    let lM = luma(color);
+
+    let lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+    let lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+    let range = lMax - lMin;
+
+    if (range >= max(0.0312, lMax * 0.125)) {
+      var dir = vec2<f32>(
+        -((lNW + lNE) - (lSW + lSE)),
+         ((lNW + lSW) - (lNE + lSE)));
+      let reduce = max((lNW + lNE + lSW + lSE) * 0.03125, 0.0078125);
+      let scale = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
+      dir = clamp(dir * scale, vec2<f32>(-8.0), vec2<f32>(8.0)) * texel;
+
+      let a = 0.5 * (gradeAt(in.uv + dir * (1.0 / 3.0 - 0.5)) +
+                     gradeAt(in.uv + dir * (2.0 / 3.0 - 0.5)));
+      let b = a * 0.5 + 0.25 * (gradeAt(in.uv - dir * 0.5) + gradeAt(in.uv + dir * 0.5));
+      let lB = luma(b);
+      if (lB >= lMin && lB <= lMax) { color = b; } else { color = a; }
+    }
+  }
+
+  return vec4<f32>(color, 1.0);
+}
+`
+  );
+
+  // src/geometry/primitives.js
+  var primitives_exports = {};
+  __export(primitives_exports, {
+    VERTEX_STRIDE_BYTES: () => VERTEX_STRIDE_BYTES,
+    VERTEX_STRIDE_FLOATS: () => VERTEX_STRIDE_FLOATS,
+    box: () => box,
+    icosphere: () => icosphere,
+    plane: () => plane,
+    roundedBox: () => roundedBox,
+    sphere: () => sphere,
+    torus: () => torus
+  });
+  var VERTEX_STRIDE_FLOATS = 8;
+  var VERTEX_STRIDE_BYTES = 32;
+  function mesh(positions, normals, uvs, indices) {
+    const n = positions.length / 3;
+    const v = new Float32Array(n * VERTEX_STRIDE_FLOATS);
+    let cx = 0, cy = 0, cz = 0;
+    for (let i = 0; i < n; i++) {
+      const o = i * 8;
+      v[o] = positions[i * 3];
+      v[o + 1] = positions[i * 3 + 1];
+      v[o + 2] = positions[i * 3 + 2];
+      v[o + 3] = normals[i * 3];
+      v[o + 4] = normals[i * 3 + 1];
+      v[o + 5] = normals[i * 3 + 2];
+      v[o + 6] = uvs[i * 2];
+      v[o + 7] = uvs[i * 2 + 1];
+      cx += v[o];
+      cy += v[o + 1];
+      cz += v[o + 2];
+    }
+    cx /= n;
+    cy /= n;
+    cz /= n;
+    let r2 = 0;
+    for (let i = 0; i < n; i++) {
+      const o = i * 8;
+      const dx = v[o] - cx, dy = v[o + 1] - cy, dz = v[o + 2] - cz;
+      const d = dx * dx + dy * dy + dz * dz;
+      if (d > r2) r2 = d;
+    }
+    return {
+      vertices: v,
+      indices: indices instanceof Uint32Array ? indices : new Uint32Array(indices),
+      vertexCount: n,
+      bounds: new Float32Array([cx, cy, cz, Math.sqrt(r2)])
+    };
+  }
+  function box(w = 1, h = 1, d = 1) {
+    const half = [w / 2, h / 2, d / 2];
+    const p = [], nm = [], uv = [], idx = [];
+    const faces = [
+      { n: [1, 0, 0], u: [0, 0, -1], v: [0, 1, 0] },
+      { n: [-1, 0, 0], u: [0, 0, 1], v: [0, 1, 0] },
+      { n: [0, 1, 0], u: [1, 0, 0], v: [0, 0, -1] },
+      { n: [0, -1, 0], u: [1, 0, 0], v: [0, 0, 1] },
+      { n: [0, 0, 1], u: [1, 0, 0], v: [0, 1, 0] },
+      { n: [0, 0, -1], u: [-1, 0, 0], v: [0, 1, 0] }
+    ];
+    faces.forEach((f, fi) => {
+      for (const [su, sv, tu, tv] of [[-1, -1, 0, 0], [1, -1, 1, 0], [1, 1, 1, 1], [-1, 1, 0, 1]]) {
+        p.push(
+          (f.n[0] + f.u[0] * su + f.v[0] * sv) * half[0],
+          (f.n[1] + f.u[1] * su + f.v[1] * sv) * half[1],
+          (f.n[2] + f.u[2] * su + f.v[2] * sv) * half[2]
+        );
+        nm.push(f.n[0], f.n[1], f.n[2]);
+        uv.push(tu, tv);
+      }
+      const b = fi * 4;
+      idx.push(b, b + 1, b + 2, b, b + 2, b + 3);
+    });
+    return mesh(p, nm, uv, idx);
+  }
+  function roundedBox(w = 1, h = 1, d = 1, radius = 0.08, segments = 6) {
+    const half = [w / 2, h / 2, d / 2];
+    const r = Math.min(radius, Math.min(half[0], Math.min(half[1], half[2])) * 0.999);
+    const inner = [
+      Math.max(half[0] - r, 0),
+      Math.max(half[1] - r, 0),
+      Math.max(half[2] - r, 0)
+    ];
+    const faces = [
+      { n: [1, 0, 0], u: [0, 0, -1], v: [0, 1, 0] },
+      { n: [-1, 0, 0], u: [0, 0, 1], v: [0, 1, 0] },
+      { n: [0, 1, 0], u: [1, 0, 0], v: [0, 0, -1] },
+      { n: [0, -1, 0], u: [1, 0, 0], v: [0, 0, 1] },
+      { n: [0, 0, 1], u: [1, 0, 0], v: [0, 1, 0] },
+      { n: [0, 0, -1], u: [-1, 0, 0], v: [0, 1, 0] }
+    ];
+    const p = [], nm = [], uv = [], idx = [];
+    const row = segments + 1;
+    const clampAbs = (x, lim) => Math.max(-lim, Math.min(lim, x));
+    faces.forEach((f, fi) => {
+      const base = fi * row * row;
+      for (let j = 0; j <= segments; j++) {
+        const sv = j / segments * 2 - 1;
+        for (let i = 0; i <= segments; i++) {
+          const su = i / segments * 2 - 1;
+          const s = [
+            (f.n[0] + f.u[0] * su + f.v[0] * sv) * half[0],
+            (f.n[1] + f.u[1] * su + f.v[1] * sv) * half[1],
+            (f.n[2] + f.u[2] * su + f.v[2] * sv) * half[2]
+          ];
+          const c = [clampAbs(s[0], inner[0]), clampAbs(s[1], inner[1]), clampAbs(s[2], inner[2])];
+          let nx = s[0] - c[0], ny = s[1] - c[1], nz = s[2] - c[2];
+          const len = Math.hypot(nx, ny, nz);
+          if (len < 1e-9) {
+            nx = f.n[0];
+            ny = f.n[1];
+            nz = f.n[2];
+          } else {
+            nx /= len;
+            ny /= len;
+            nz /= len;
+          }
+          p.push(c[0] + nx * r, c[1] + ny * r, c[2] + nz * r);
+          nm.push(nx, ny, nz);
+          uv.push(i / segments, j / segments);
+        }
+      }
+      for (let j = 0; j < segments; j++) {
+        for (let i = 0; i < segments; i++) {
+          const a = base + j * row + i, b = a + row;
+          idx.push(a, a + 1, b + 1, a, b + 1, b);
+        }
+      }
+    });
+    return mesh(p, nm, uv, idx);
+  }
+  function sphere(radius = 0.5, segments = 24, rings = 16) {
+    const p = [], nm = [], uv = [], idx = [];
+    for (let y = 0; y <= rings; y++) {
+      const vt = y / rings, phi = vt * Math.PI;
+      for (let x = 0; x <= segments; x++) {
+        const u = x / segments, theta = u * Math.PI * 2;
+        const nx = Math.sin(phi) * Math.cos(theta);
+        const ny = Math.cos(phi);
+        const nz = Math.sin(phi) * Math.sin(theta);
+        p.push(nx * radius, ny * radius, nz * radius);
+        nm.push(nx, ny, nz);
+        uv.push(u, 1 - vt);
+      }
+    }
+    const row = segments + 1;
+    for (let y = 0; y < rings; y++) {
+      for (let x = 0; x < segments; x++) {
+        const a = y * row + x, b = a + row;
+        idx.push(a, a + 1, b, a + 1, b + 1, b);
+      }
+    }
+    return mesh(p, nm, uv, idx);
+  }
+  function plane(w = 1, d = 1, sx = 1, sz = 1) {
+    const p = [], nm = [], uv = [], idx = [];
+    for (let z = 0; z <= sz; z++) {
+      for (let x = 0; x <= sx; x++) {
+        p.push((x / sx - 0.5) * w, 0, (z / sz - 0.5) * d);
+        nm.push(0, 1, 0);
+        uv.push(x / sx, z / sz);
+      }
+    }
+    const row = sx + 1;
+    for (let z = 0; z < sz; z++) {
+      for (let x = 0; x < sx; x++) {
+        const a = z * row + x, b = a + row;
+        idx.push(a, b, a + 1, a + 1, b, b + 1);
+      }
+    }
+    return mesh(p, nm, uv, idx);
+  }
+  function torus(radius = 0.5, tube = 0.2, radial = 24, tubular = 16) {
+    const p = [], nm = [], uv = [], idx = [];
+    for (let j = 0; j <= radial; j++) {
+      const u = j / radial * Math.PI * 2;
+      const cu = Math.cos(u), su = Math.sin(u);
+      for (let i = 0; i <= tubular; i++) {
+        const v = i / tubular * Math.PI * 2;
+        const cv = Math.cos(v), sv = Math.sin(v);
+        const x = (radius + tube * cv) * cu;
+        const y = tube * sv;
+        const z = (radius + tube * cv) * su;
+        p.push(x, y, z);
+        nm.push(cv * cu, sv, cv * su);
+        uv.push(j / radial, i / tubular);
+      }
+    }
+    const row = tubular + 1;
+    for (let j = 0; j < radial; j++) {
+      for (let i = 0; i < tubular; i++) {
+        const a = j * row + i, b = a + row;
+        idx.push(a, a + 1, b, a + 1, b + 1, b);
+      }
+    }
+    return mesh(p, nm, uv, idx);
+  }
+  function icosphere(radius = 0.5, subdivisions = 2) {
+    const t = (1 + Math.sqrt(5)) / 2;
+    let verts = [
+      [-1, t, 0],
+      [1, t, 0],
+      [-1, -t, 0],
+      [1, -t, 0],
+      [0, -1, t],
+      [0, 1, t],
+      [0, -1, -t],
+      [0, 1, -t],
+      [t, 0, -1],
+      [t, 0, 1],
+      [-t, 0, -1],
+      [-t, 0, 1]
+    ].map((v) => {
+      const l = Math.hypot(...v);
+      return [v[0] / l, v[1] / l, v[2] / l];
+    });
+    let faces = [
+      [0, 11, 5],
+      [0, 5, 1],
+      [0, 1, 7],
+      [0, 7, 10],
+      [0, 10, 11],
+      [1, 5, 9],
+      [5, 11, 4],
+      [11, 10, 2],
+      [10, 7, 6],
+      [7, 1, 8],
+      [3, 9, 4],
+      [3, 4, 2],
+      [3, 2, 6],
+      [3, 6, 8],
+      [3, 8, 9],
+      [4, 9, 5],
+      [2, 4, 11],
+      [6, 2, 10],
+      [8, 6, 7],
+      [9, 8, 1]
+    ];
+    for (let s = 0; s < subdivisions; s++) {
+      const cache = /* @__PURE__ */ new Map();
+      const mid = (a, b) => {
+        const key = a < b ? `${a}_${b}` : `${b}_${a}`;
+        let m = cache.get(key);
+        if (m !== void 0) return m;
+        const va = verts[a], vb = verts[b];
+        const v = [va[0] + vb[0], va[1] + vb[1], va[2] + vb[2]];
+        const l = Math.hypot(...v);
+        verts.push([v[0] / l, v[1] / l, v[2] / l]);
+        m = verts.length - 1;
+        cache.set(key, m);
+        return m;
+      };
+      const next = [];
+      for (const [a, b, c] of faces) {
+        const ab = mid(a, b), bc = mid(b, c), ca = mid(c, a);
+        next.push([a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]);
+      }
+      faces = next;
+    }
+    const p = [], nm = [], uv = [], idx = [];
+    for (const v of verts) {
+      p.push(v[0] * radius, v[1] * radius, v[2] * radius);
+      nm.push(v[0], v[1], v[2]);
+      uv.push(Math.atan2(v[2], v[0]) / (Math.PI * 2) + 0.5, Math.asin(v[1]) / Math.PI + 0.5);
+    }
+    for (const f of faces) idx.push(f[0], f[1], f[2]);
+    return mesh(p, nm, uv, idx);
+  }
+
+  // src/core/ecs.js
+  var INDEX_BITS = 22;
+  var INDEX_MASK = (1 << INDEX_BITS) - 1;
+  var GEN_MASK = 1023;
+  var entityIndex = (e) => e & INDEX_MASK;
+  var entityGen = (e) => e >>> INDEX_BITS & GEN_MASK;
+  var makeEntity = (i, g) => ((g & GEN_MASK) << INDEX_BITS | i & INDEX_MASK) >>> 0;
+  var NULL_ENTITY = 4294967295;
+  var ARRAY_KINDS = {
+    f32: Float32Array,
+    f64: Float64Array,
+    i32: Int32Array,
+    u32: Uint32Array,
+    i16: Int16Array,
+    u16: Uint16Array,
+    i8: Int8Array,
+    u8: Uint8Array
+  };
+  var nextComponentId = 0;
+  function defineComponent(name, kind = "f32", stride = 1) {
+    const Ctor = ARRAY_KINDS[kind];
+    if (!Ctor) throw new Error(`axion: unknown component kind "${kind}"`);
+    if (nextComponentId >= 256) throw new Error("axion: component limit (256) reached");
+    return { id: nextComponentId++, name, kind, Ctor, stride, tag: stride === 0 };
+  }
+  var Archetype = class {
+    constructor(components, capacity) {
+      this.components = components;
+      this.ids = components.map((c) => c.id);
+      this.key = this.ids.join(",");
+      this.has = new Uint8Array(256);
+      for (const c of components) this.has[c.id] = 1;
+      this.capacity = capacity;
+      this.count = 0;
+      this.entities = new Uint32Array(capacity);
+      this.columns = /* @__PURE__ */ new Map();
+      for (const c of components) {
+        if (!c.tag) this.columns.set(c.id, new c.Ctor(capacity * c.stride));
+      }
+      this.version = 0;
+    }
+    grow() {
+      const cap = this.capacity * 2;
+      const ents = new Uint32Array(cap);
+      ents.set(this.entities);
+      this.entities = ents;
+      for (const c of this.components) {
+        if (c.tag) continue;
+        const old = this.columns.get(c.id);
+        const next = new c.Ctor(cap * c.stride);
+        next.set(old);
+        this.columns.set(c.id, next);
+      }
+      this.capacity = cap;
+    }
+    addRow(entity) {
+      if (this.count === this.capacity) this.grow();
+      const row = this.count++;
+      this.entities[row] = entity;
+      return row;
+    }
+    /** Swap-remove. Returns the entity that was moved into `row`, or NULL. */
+    removeRow(row) {
+      const last = --this.count;
+      if (row !== last) {
+        this.entities[row] = this.entities[last];
+        for (const c of this.components) {
+          if (c.tag) continue;
+          const col = this.columns.get(c.id);
+          col.copyWithin(row * c.stride, last * c.stride, (last + 1) * c.stride);
+        }
+        this.version++;
+        return this.entities[row];
+      }
+      this.version++;
+      return NULL_ENTITY;
+    }
+  };
+  var World = class {
+    constructor({ initialCapacity = 1024 } = {}) {
+      this.initialCapacity = initialCapacity;
+      this.archetypes = [];
+      this.archetypeByKey = /* @__PURE__ */ new Map();
+      this.generations = new Uint16Array(initialCapacity);
+      this.locArchetype = new Int32Array(initialCapacity).fill(-1);
+      this.locRow = new Uint32Array(initialCapacity);
+      this.alive = new Uint8Array(initialCapacity);
+      this.freeList = [];
+      this.nextIndex = 0;
+      this.resources = /* @__PURE__ */ new Map();
+      this._systems = [];
+      this._queryCache = /* @__PURE__ */ new Map();
+      this._structureVersion = 0;
+    }
+    /* -- entity lifecycle -- */
+    _reserveIndex() {
+      if (this.freeList.length) return this.freeList.pop();
+      const i = this.nextIndex++;
+      if (i >= this.generations.length) this._growEntityTables();
+      return i;
+    }
+    _growEntityTables() {
+      const n = this.generations.length * 2;
+      const g = new Uint16Array(n);
+      g.set(this.generations);
+      this.generations = g;
+      const a = new Int32Array(n).fill(-1);
+      a.set(this.locArchetype);
+      this.locArchetype = a;
+      const r = new Uint32Array(n);
+      r.set(this.locRow);
+      this.locRow = r;
+      const al = new Uint8Array(n);
+      al.set(this.alive);
+      this.alive = al;
+    }
+    /**
+     * Create an entity.
+     *   world.spawn([Transform, Renderable])
+     *   world.spawn([Transform], (cols, row) => { ... })  // init in place
+     */
+    spawn(components, init) {
+      const idx = this._reserveIndex();
+      this.alive[idx] = 1;
+      const e = makeEntity(idx, this.generations[idx]);
+      const arch = this._archetypeFor(components);
+      const row = arch.addRow(e);
+      this.locArchetype[idx] = arch.index;
+      this.locRow[idx] = row;
+      if (init) init(arch.columns, row, e);
+      return e;
+    }
+    /** Bulk spawn: one archetype, n contiguous rows. Returns the first row. */
+    spawnMany(components, n, init) {
+      const arch = this._archetypeFor(components);
+      const archIndex = arch.index;
+      const first = arch.count;
+      while (arch.capacity < arch.count + n) arch.grow();
+      for (let k = 0; k < n; k++) {
+        const idx = this._reserveIndex();
+        this.alive[idx] = 1;
+        const e = makeEntity(idx, this.generations[idx]);
+        const row = arch.addRow(e);
+        this.locArchetype[idx] = archIndex;
+        this.locRow[idx] = row;
+      }
+      if (init) init(arch.columns, first, n, arch.entities);
+      return { archetype: arch, first, count: n };
+    }
+    isAlive(e) {
+      const i = entityIndex(e);
+      return this.alive[i] === 1 && this.generations[i] === entityGen(e);
+    }
+    destroy(e) {
+      const i = entityIndex(e);
+      if (!this.isAlive(e)) return false;
+      const arch = this.archetypes[this.locArchetype[i]];
+      const moved = arch.removeRow(this.locRow[i]);
+      if (moved !== NULL_ENTITY) this.locRow[entityIndex(moved)] = this.locRow[i];
+      this.alive[i] = 0;
+      this.locArchetype[i] = -1;
+      this.generations[i] = this.generations[i] + 1 & GEN_MASK;
+      this.freeList.push(i);
+      return true;
+    }
+    /** Column view + row for a single entity. Convenience, not a hot path. */
+    get(e, component) {
+      const i = entityIndex(e);
+      if (!this.isAlive(e)) return null;
+      const arch = this.archetypes[this.locArchetype[i]];
+      const col = arch.columns.get(component.id);
+      if (!col) return null;
+      return { array: col, offset: this.locRow[i] * component.stride, row: this.locRow[i] };
+    }
+    /* -- archetypes -- */
+    _archetypeFor(components) {
+      const sorted = [...components].sort((a, b) => a.id - b.id);
+      const key = sorted.map((c) => c.id).join(",");
+      let arch = this.archetypeByKey.get(key);
+      if (!arch) {
+        arch = new Archetype(sorted, this.initialCapacity);
+        arch.index = this.archetypes.length;
+        this.archetypeByKey.set(key, arch);
+        this.archetypes.push(arch);
+        this._structureVersion++;
+        this._queryCache.clear();
+      }
+      return arch;
+    }
+    /* -- queries -- */
+    /**
+     * Match archetypes containing all of `all` and none of `none`.
+     * Returns a cached array of archetypes; iterate them yourself for speed:
+     *
+     *   for (const a of world.query([Transform, Velocity])) {
+     *     const t = a.columns.get(Transform.id);
+     *     for (let r = 0; r < a.count; r++) { ... }
+     *   }
+     */
+    query(all, none = []) {
+      const key = all.map((c) => c.id).join(",") + "|" + none.map((c) => c.id).join(",");
+      let list = this._queryCache.get(key);
+      if (list) return list;
+      list = this.archetypes.filter((a) => all.every((c) => a.has[c.id]) && none.every((c) => !a.has[c.id]));
+      this._queryCache.set(key, list);
+      return list;
+    }
+    /* -- resources & systems -- */
+    setResource(name, value) {
+      this.resources.set(name, value);
+      return value;
+    }
+    getResource(name) {
+      return this.resources.get(name);
+    }
+    /**
+     * Systems run in ascending `order`. A system is just a function
+     * (world, dt) => void — no base class, no lifecycle to remember.
+     */
+    addSystem(fn, { order = 0, name = fn.name || "system" } = {}) {
+      this._systems.push({ fn, order, name, ms: 0 });
+      this._systems.sort((a, b) => a.order - b.order);
+      return fn;
+    }
+    removeSystem(fn) {
+      const i = this._systems.findIndex((s) => s.fn === fn);
+      if (i >= 0) this._systems.splice(i, 1);
+    }
+    /** Run one frame of simulation. `profile` records per-system ms. */
+    step(dt, profile = false) {
+      const sys = this._systems;
+      if (!profile) {
+        for (let i = 0; i < sys.length; i++) sys[i].fn(this, dt);
+        return;
+      }
+      for (let i = 0; i < sys.length; i++) {
+        const t0 = performance.now();
+        sys[i].fn(this, dt);
+        sys[i].ms = performance.now() - t0;
+      }
+    }
+    get systemTimings() {
+      return this._systems.map((s) => ({ name: s.name, ms: s.ms }));
+    }
+    get entityCount() {
+      let n = 0;
+      for (const a of this.archetypes) n += a.count;
+      return n;
+    }
+  };
+
+  // src/core/components.js
+  var Transform = defineComponent("Transform", "f32", 10);
+  var T_POS = 0;
+  var T_ROT = 3;
+  var T_SCALE = 7;
+  var LocalToWorld = defineComponent("LocalToWorld", "f32", 16);
+  var Bounds = defineComponent("Bounds", "f32", 4);
+  var MeshRef = defineComponent("MeshRef", "u32", 2);
+  var M_MESH = 0;
+  var M_MATERIAL = 1;
+  var Motion = defineComponent("Motion", "f32", 6);
+  var InstanceColor = defineComponent("InstanceColor", "f32", 4);
+  var Dynamic = defineComponent("Dynamic", "u8", 0);
+  var Hidden = defineComponent("Hidden", "u8", 0);
+  var PointLight = defineComponent("PointLight", "f32", 5);
+
+  // src/core/math.js
+  var math_exports = {};
+  __export(math_exports, {
+    DEG2RAD: () => DEG2RAD,
+    EPSILON: () => EPSILON,
+    RAD2DEG: () => RAD2DEG,
+    f32: () => f32,
+    frustumFromMatrix: () => frustumFromMatrix,
+    m4compose: () => m4compose,
+    m4copy: () => m4copy,
+    m4identity: () => m4identity,
+    m4invert: () => m4invert,
+    m4lookAt: () => m4lookAt,
+    m4mul: () => m4mul,
+    m4ortho: () => m4ortho,
+    m4perspectiveReverseZ: () => m4perspectiveReverseZ,
+    m4transformPoint: () => m4transformPoint,
+    qFromAxisAngle: () => qFromAxisAngle,
+    qFromEulerYXZ: () => qFromEulerYXZ,
+    qidentity: () => qidentity,
+    qmul: () => qmul,
+    qnormalize: () => qnormalize,
+    qrotateV3: () => qrotateV3,
+    qslerp: () => qslerp,
+    scratch: () => scratch,
+    sphereInFrustum: () => sphereInFrustum,
+    v3add: () => v3add,
+    v3addScaled: () => v3addScaled,
+    v3copy: () => v3copy,
+    v3cross: () => v3cross,
+    v3dot: () => v3dot,
+    v3len: () => v3len,
+    v3lenSq: () => v3lenSq,
+    v3lerp: () => v3lerp,
+    v3normalize: () => v3normalize,
+    v3scale: () => v3scale,
+    v3set: () => v3set,
+    v3sub: () => v3sub
+  });
+  var EPSILON = 1e-6;
+  var DEG2RAD = Math.PI / 180;
+  var RAD2DEG = 180 / Math.PI;
+  var f32 = (n) => new Float32Array(n);
+  function v3set(o, oi, x, y, z) {
+    o[oi] = x;
+    o[oi + 1] = y;
+    o[oi + 2] = z;
+    return o;
+  }
+  function v3copy(o, oi, a, ai) {
+    o[oi] = a[ai];
+    o[oi + 1] = a[ai + 1];
+    o[oi + 2] = a[ai + 2];
+    return o;
+  }
+  function v3add(o, oi, a, ai, b, bi) {
+    o[oi] = a[ai] + b[bi];
+    o[oi + 1] = a[ai + 1] + b[bi + 1];
+    o[oi + 2] = a[ai + 2] + b[bi + 2];
+    return o;
+  }
+  function v3sub(o, oi, a, ai, b, bi) {
+    o[oi] = a[ai] - b[bi];
+    o[oi + 1] = a[ai + 1] - b[bi + 1];
+    o[oi + 2] = a[ai + 2] - b[bi + 2];
+    return o;
+  }
+  function v3scale(o, oi, a, ai, s) {
+    o[oi] = a[ai] * s;
+    o[oi + 1] = a[ai + 1] * s;
+    o[oi + 2] = a[ai + 2] * s;
+    return o;
+  }
+  function v3addScaled(o, oi, a, ai, b, bi, s) {
+    o[oi] = a[ai] + b[bi] * s;
+    o[oi + 1] = a[ai + 1] + b[bi + 1] * s;
+    o[oi + 2] = a[ai + 2] + b[bi + 2] * s;
+    return o;
+  }
+  function v3dot(a, ai, b, bi) {
+    return a[ai] * b[bi] + a[ai + 1] * b[bi + 1] + a[ai + 2] * b[bi + 2];
+  }
+  function v3cross(o, oi, a, ai, b, bi) {
+    const ax = a[ai], ay = a[ai + 1], az = a[ai + 2];
+    const bx = b[bi], by = b[bi + 1], bz = b[bi + 2];
+    o[oi] = ay * bz - az * by;
+    o[oi + 1] = az * bx - ax * bz;
+    o[oi + 2] = ax * by - ay * bx;
+    return o;
+  }
+  function v3len(a, ai) {
+    return Math.hypot(a[ai], a[ai + 1], a[ai + 2]);
+  }
+  function v3lenSq(a, ai) {
+    return a[ai] * a[ai] + a[ai + 1] * a[ai + 1] + a[ai + 2] * a[ai + 2];
+  }
+  function v3normalize(o, oi, a, ai) {
+    const l = v3len(a, ai);
+    const s = l > EPSILON ? 1 / l : 0;
+    return v3scale(o, oi, a, ai, s);
+  }
+  function v3lerp(o, oi, a, ai, b, bi, t) {
+    o[oi] = a[ai] + (b[bi] - a[ai]) * t;
+    o[oi + 1] = a[ai + 1] + (b[bi + 1] - a[ai + 1]) * t;
+    o[oi + 2] = a[ai + 2] + (b[bi + 2] - a[ai + 2]) * t;
+    return o;
+  }
+  function qidentity(o, oi) {
+    o[oi] = 0;
+    o[oi + 1] = 0;
+    o[oi + 2] = 0;
+    o[oi + 3] = 1;
+    return o;
+  }
+  function qFromAxisAngle(o, oi, a, ai, angle) {
+    const h = angle * 0.5, s = Math.sin(h);
+    o[oi] = a[ai] * s;
+    o[oi + 1] = a[ai + 1] * s;
+    o[oi + 2] = a[ai + 2] * s;
+    o[oi + 3] = Math.cos(h);
+    return o;
+  }
+  function qFromEulerYXZ(o, oi, yaw, pitch, roll) {
+    const cy = Math.cos(yaw * 0.5), sy = Math.sin(yaw * 0.5);
+    const cx = Math.cos(pitch * 0.5), sx = Math.sin(pitch * 0.5);
+    const cz = Math.cos(roll * 0.5), sz = Math.sin(roll * 0.5);
+    o[oi] = sx * cy * cz + cx * sy * sz;
+    o[oi + 1] = cx * sy * cz - sx * cy * sz;
+    o[oi + 2] = cx * cy * sz - sx * sy * cz;
+    o[oi + 3] = cx * cy * cz + sx * sy * sz;
+    return o;
+  }
+  function qmul(o, oi, a, ai, b, bi) {
+    const ax = a[ai], ay = a[ai + 1], az = a[ai + 2], aw = a[ai + 3];
+    const bx = b[bi], by = b[bi + 1], bz = b[bi + 2], bw = b[bi + 3];
+    o[oi] = aw * bx + ax * bw + ay * bz - az * by;
+    o[oi + 1] = aw * by - ax * bz + ay * bw + az * bx;
+    o[oi + 2] = aw * bz + ax * by - ay * bx + az * bw;
+    o[oi + 3] = aw * bw - ax * bx - ay * by - az * bz;
+    return o;
+  }
+  function qnormalize(o, oi, a, ai) {
+    const x = a[ai], y = a[ai + 1], z = a[ai + 2], w = a[ai + 3];
+    const l = Math.hypot(x, y, z, w) || 1;
+    const s = 1 / l;
+    o[oi] = x * s;
+    o[oi + 1] = y * s;
+    o[oi + 2] = z * s;
+    o[oi + 3] = w * s;
+    return o;
+  }
+  function qrotateV3(o, oi, q, qi, v, vi) {
+    const qx = q[qi], qy = q[qi + 1], qz = q[qi + 2], qw = q[qi + 3];
+    const vx = v[vi], vy = v[vi + 1], vz = v[vi + 2];
+    const tx = 2 * (qy * vz - qz * vy);
+    const ty = 2 * (qz * vx - qx * vz);
+    const tz = 2 * (qx * vy - qy * vx);
+    o[oi] = vx + qw * tx + (qy * tz - qz * ty);
+    o[oi + 1] = vy + qw * ty + (qz * tx - qx * tz);
+    o[oi + 2] = vz + qw * tz + (qx * ty - qy * tx);
+    return o;
+  }
+  function qslerp(o, oi, a, ai, b, bi, t) {
+    let ax = a[ai], ay = a[ai + 1], az = a[ai + 2], aw = a[ai + 3];
+    let bx = b[bi], by = b[bi + 1], bz = b[bi + 2], bw = b[bi + 3];
+    let cos = ax * bx + ay * by + az * bz + aw * bw;
+    if (cos < 0) {
+      cos = -cos;
+      bx = -bx;
+      by = -by;
+      bz = -bz;
+      bw = -bw;
+    }
+    let s0, s1;
+    if (1 - cos > EPSILON) {
+      const omega = Math.acos(cos), sin = Math.sin(omega);
+      s0 = Math.sin((1 - t) * omega) / sin;
+      s1 = Math.sin(t * omega) / sin;
+    } else {
+      s0 = 1 - t;
+      s1 = t;
+    }
+    o[oi] = s0 * ax + s1 * bx;
+    o[oi + 1] = s0 * ay + s1 * by;
+    o[oi + 2] = s0 * az + s1 * bz;
+    o[oi + 3] = s0 * aw + s1 * bw;
+    return o;
+  }
+  function m4identity(o, oi) {
+    o.fill(0, oi, oi + 16);
+    o[oi] = 1;
+    o[oi + 5] = 1;
+    o[oi + 10] = 1;
+    o[oi + 15] = 1;
+    return o;
+  }
+  function m4copy(o, oi, a, ai) {
+    for (let i = 0; i < 16; i++) o[oi + i] = a[ai + i];
+    return o;
+  }
+  function m4compose(o, oi, p, pi, q, qi, s, si) {
+    const x = q[qi], y = q[qi + 1], z = q[qi + 2], w = q[qi + 3];
+    const x2 = x + x, y2 = y + y, z2 = z + z;
+    const xx = x * x2, xy = x * y2, xz = x * z2;
+    const yy = y * y2, yz = y * z2, zz = z * z2;
+    const wx = w * x2, wy = w * y2, wz = w * z2;
+    const sx = s[si], sy = s[si + 1], sz = s[si + 2];
+    o[oi] = (1 - (yy + zz)) * sx;
+    o[oi + 1] = (xy + wz) * sx;
+    o[oi + 2] = (xz - wy) * sx;
+    o[oi + 3] = 0;
+    o[oi + 4] = (xy - wz) * sy;
+    o[oi + 5] = (1 - (xx + zz)) * sy;
+    o[oi + 6] = (yz + wx) * sy;
+    o[oi + 7] = 0;
+    o[oi + 8] = (xz + wy) * sz;
+    o[oi + 9] = (yz - wx) * sz;
+    o[oi + 10] = (1 - (xx + yy)) * sz;
+    o[oi + 11] = 0;
+    o[oi + 12] = p[pi];
+    o[oi + 13] = p[pi + 1];
+    o[oi + 14] = p[pi + 2];
+    o[oi + 15] = 1;
+    return o;
+  }
+  function m4mul(o, oi, a, ai, b, bi) {
+    const a00 = a[ai], a01 = a[ai + 1], a02 = a[ai + 2], a03 = a[ai + 3];
+    const a10 = a[ai + 4], a11 = a[ai + 5], a12 = a[ai + 6], a13 = a[ai + 7];
+    const a20 = a[ai + 8], a21 = a[ai + 9], a22 = a[ai + 10], a23 = a[ai + 11];
+    const a30 = a[ai + 12], a31 = a[ai + 13], a32 = a[ai + 14], a33 = a[ai + 15];
+    for (let c = 0; c < 4; c++) {
+      const b0 = b[bi + c * 4], b1 = b[bi + c * 4 + 1], b2 = b[bi + c * 4 + 2], b3 = b[bi + c * 4 + 3];
+      o[oi + c * 4] = a00 * b0 + a10 * b1 + a20 * b2 + a30 * b3;
+      o[oi + c * 4 + 1] = a01 * b0 + a11 * b1 + a21 * b2 + a31 * b3;
+      o[oi + c * 4 + 2] = a02 * b0 + a12 * b1 + a22 * b2 + a32 * b3;
+      o[oi + c * 4 + 3] = a03 * b0 + a13 * b1 + a23 * b2 + a33 * b3;
+    }
+    return o;
+  }
+  function m4invert(o, oi, a, ai) {
+    const m = a, i = ai;
+    const a00 = m[i], a01 = m[i + 1], a02 = m[i + 2], a03 = m[i + 3];
+    const a10 = m[i + 4], a11 = m[i + 5], a12 = m[i + 6], a13 = m[i + 7];
+    const a20 = m[i + 8], a21 = m[i + 9], a22 = m[i + 10], a23 = m[i + 11];
+    const a30 = m[i + 12], a31 = m[i + 13], a32 = m[i + 14], a33 = m[i + 15];
+    const b00 = a00 * a11 - a01 * a10, b01 = a00 * a12 - a02 * a10, b02 = a00 * a13 - a03 * a10;
+    const b03 = a01 * a12 - a02 * a11, b04 = a01 * a13 - a03 * a11, b05 = a02 * a13 - a03 * a12;
+    const b06 = a20 * a31 - a21 * a30, b07 = a20 * a32 - a22 * a30, b08 = a20 * a33 - a23 * a30;
+    const b09 = a21 * a32 - a22 * a31, b10 = a21 * a33 - a23 * a31, b11 = a22 * a33 - a23 * a32;
+    let det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
+    if (Math.abs(det) < 1e-12) return m4identity(o, oi);
+    det = 1 / det;
+    o[oi] = (a11 * b11 - a12 * b10 + a13 * b09) * det;
+    o[oi + 1] = (a02 * b10 - a01 * b11 - a03 * b09) * det;
+    o[oi + 2] = (a31 * b05 - a32 * b04 + a33 * b03) * det;
+    o[oi + 3] = (a22 * b04 - a21 * b05 - a23 * b03) * det;
+    o[oi + 4] = (a12 * b08 - a10 * b11 - a13 * b07) * det;
+    o[oi + 5] = (a00 * b11 - a02 * b08 + a03 * b07) * det;
+    o[oi + 6] = (a32 * b02 - a30 * b05 - a33 * b01) * det;
+    o[oi + 7] = (a20 * b05 - a22 * b02 + a23 * b01) * det;
+    o[oi + 8] = (a10 * b10 - a11 * b08 + a13 * b06) * det;
+    o[oi + 9] = (a01 * b08 - a00 * b10 - a03 * b06) * det;
+    o[oi + 10] = (a30 * b04 - a31 * b02 + a33 * b00) * det;
+    o[oi + 11] = (a21 * b02 - a20 * b04 - a23 * b00) * det;
+    o[oi + 12] = (a11 * b07 - a10 * b09 - a12 * b06) * det;
+    o[oi + 13] = (a00 * b09 - a01 * b07 + a02 * b06) * det;
+    o[oi + 14] = (a31 * b01 - a30 * b03 - a32 * b00) * det;
+    o[oi + 15] = (a20 * b03 - a21 * b01 + a22 * b00) * det;
+    return o;
+  }
+  function m4perspectiveReverseZ(o, oi, fovY, aspect, near) {
+    const f = 1 / Math.tan(fovY * 0.5);
+    o.fill(0, oi, oi + 16);
+    o[oi] = f / aspect;
+    o[oi + 5] = f;
+    o[oi + 10] = 0;
+    o[oi + 11] = -1;
+    o[oi + 14] = near;
+    return o;
+  }
+  function m4ortho(o, oi, l, r, b, t, near, far) {
+    o.fill(0, oi, oi + 16);
+    o[oi] = 2 / (r - l);
+    o[oi + 5] = 2 / (t - b);
+    o[oi + 10] = 1 / (near - far);
+    o[oi + 12] = (r + l) / (l - r);
+    o[oi + 13] = (t + b) / (b - t);
+    o[oi + 14] = near / (near - far);
+    o[oi + 15] = 1;
+    return o;
+  }
+  function m4lookAt(o, oi, eye, ei, target, ti, up, ui) {
+    const zx = eye[ei] - target[ti], zy = eye[ei + 1] - target[ti + 1], zz = eye[ei + 2] - target[ti + 2];
+    let zl = Math.hypot(zx, zy, zz) || 1;
+    const z0 = zx / zl, z1 = zy / zl, z2 = zz / zl;
+    let x0 = up[ui + 1] * z2 - up[ui + 2] * z1;
+    let x1 = up[ui + 2] * z0 - up[ui] * z2;
+    let x2 = up[ui] * z1 - up[ui + 1] * z0;
+    const xl = Math.hypot(x0, x1, x2) || 1;
+    x0 /= xl;
+    x1 /= xl;
+    x2 /= xl;
+    const y0 = z1 * x2 - z2 * x1, y1 = z2 * x0 - z0 * x2, y2 = z0 * x1 - z1 * x0;
+    o[oi] = x0;
+    o[oi + 1] = y0;
+    o[oi + 2] = z0;
+    o[oi + 3] = 0;
+    o[oi + 4] = x1;
+    o[oi + 5] = y1;
+    o[oi + 6] = z1;
+    o[oi + 7] = 0;
+    o[oi + 8] = x2;
+    o[oi + 9] = y2;
+    o[oi + 10] = z2;
+    o[oi + 11] = 0;
+    o[oi + 12] = -(x0 * eye[ei] + x1 * eye[ei + 1] + x2 * eye[ei + 2]);
+    o[oi + 13] = -(y0 * eye[ei] + y1 * eye[ei + 1] + y2 * eye[ei + 2]);
+    o[oi + 14] = -(z0 * eye[ei] + z1 * eye[ei + 1] + z2 * eye[ei + 2]);
+    o[oi + 15] = 1;
+    return o;
+  }
+  function m4transformPoint(o, oi, m, mi, v, vi) {
+    const x = v[vi], y = v[vi + 1], z = v[vi + 2];
+    const w = m[mi + 3] * x + m[mi + 7] * y + m[mi + 11] * z + m[mi + 15] || 1;
+    o[oi] = (m[mi] * x + m[mi + 4] * y + m[mi + 8] * z + m[mi + 12]) / w;
+    o[oi + 1] = (m[mi + 1] * x + m[mi + 5] * y + m[mi + 9] * z + m[mi + 13]) / w;
+    o[oi + 2] = (m[mi + 2] * x + m[mi + 6] * y + m[mi + 10] * z + m[mi + 14]) / w;
+    return o;
+  }
+  function frustumFromMatrix(out, oi, m, mi) {
+    const rows = [
+      [m[mi + 3], m[mi + 7], m[mi + 11], m[mi + 15]],
+      [m[mi], m[mi + 4], m[mi + 8], m[mi + 12]],
+      [m[mi + 1], m[mi + 5], m[mi + 9], m[mi + 13]],
+      [m[mi + 2], m[mi + 6], m[mi + 10], m[mi + 14]]
+    ];
+    const put = (i, a, b, s) => {
+      let x = rows[a][0] + s * rows[b][0];
+      let y = rows[a][1] + s * rows[b][1];
+      let z = rows[a][2] + s * rows[b][2];
+      let w = rows[a][3] + s * rows[b][3];
+      const l = Math.hypot(x, y, z) || 1;
+      out[oi + i * 4] = x / l;
+      out[oi + i * 4 + 1] = y / l;
+      out[oi + i * 4 + 2] = z / l;
+      out[oi + i * 4 + 3] = w / l;
+    };
+    put(0, 0, 1, 1);
+    put(1, 0, 1, -1);
+    put(2, 0, 2, 1);
+    put(3, 0, 2, -1);
+    put(4, 0, 3, 1);
+    put(5, 0, 3, -1);
+    return out;
+  }
+  function sphereInFrustum(planes, pi, cx, cy, cz, r) {
+    for (let i = 0; i < 6; i++) {
+      const o = pi + i * 4;
+      if (planes[o] * cx + planes[o + 1] * cy + planes[o + 2] * cz + planes[o + 3] < -r) return false;
+    }
+    return true;
+  }
+  var scratch = {
+    v3: [f32(3), f32(3), f32(3), f32(3)],
+    q: [f32(4), f32(4)],
+    m4: [f32(16), f32(16), f32(16)]
+  };
+
+  // src/render/renderer.js
+  var INSTANCE_FLOATS = 28;
+  var LIGHT_FLOATS = 12;
+  var CAMERA_FLOATS = 96;
+  var MAX_LIGHTS = 256;
+  var FACE_SLOT_BYTES = 256;
+  var HDR_FORMAT = "rgba16float";
+  var AO_FORMAT = "r16float";
+  var Renderer = class {
+    constructor({ device, context, format, canvas }, options = {}) {
+      this.device = device;
+      this.context = context;
+      this.format = format;
+      this.canvas = canvas;
+      this.clearColor = options.clearColor ?? [0.02, 0.025, 0.035, 1];
+      this.exposure = options.exposure ?? 1;
+      this.fogDensity = options.fogDensity ?? 0;
+      this.fogColor = options.fogColor ?? [0.02, 0.025, 0.035];
+      this.aerialPerspective = options.aerialPerspective ?? 0.85;
+      this.ambient = options.ambient ?? [0.09, 0.11, 0.15];
+      this.groundAmbient = options.groundAmbient ?? 0.35;
+      this.frustumCulling = options.frustumCulling !== false;
+      this.fxaa = options.fxaa !== false;
+      this.ssr = {
+        intensity: options.ssr?.intensity ?? 1,
+        steps: options.ssr?.steps ?? 48,
+        thickness: options.ssr?.thickness ?? 0.7,
+        maxDistance: options.ssr?.maxDistance ?? 70,
+        fadeDistance: options.ssr?.fadeDistance ?? 90
+      };
+      this.ao = {
+        intensity: options.ao?.intensity ?? 1,
+        radius: options.ao?.radius ?? 1.6,
+        power: options.ao?.power ?? 1.4,
+        bias: options.ao?.bias ?? 0.04,
+        fadeDistance: options.ao?.fadeDistance ?? 55
+      };
+      this.bloom = {
+        threshold: options.bloom?.threshold ?? 1,
+        knee: options.bloom?.knee ?? 0.6,
+        strength: options.bloom?.strength ?? 0.5,
+        levels: options.bloom?.levels ?? 5
+      };
+      this.shadows = {
+        enabled: options.shadows?.enabled !== false,
+        maxLights: options.shadows?.maxLights ?? 4,
+        size: options.shadows?.size ?? 512,
+        pcfRadius: options.shadows?.pcfRadius ?? 1.6,
+        normalBias: options.shadows?.normalBias ?? 0.045,
+        bias: options.shadows?.bias ?? 35e-4,
+        near: options.shadows?.near ?? 0.25,
+        maxCasters: options.shadows?.maxCasters ?? 4e4
+      };
+      this.vertexArena = new Arena(device, GPUBufferUsage.VERTEX, 4 << 20, "axion-vertices");
+      this.indexArena = new Arena(device, GPUBufferUsage.INDEX, 2 << 20, "axion-indices");
+      this.instances = new DynamicBuffer(device, GPUBufferUsage.STORAGE, 4096 * INSTANCE_FLOATS, "axion-instances");
+      this.shadowModels = new DynamicBuffer(device, GPUBufferUsage.STORAGE, 4096 * 16, "axion-shadow-models");
+      this.cameraBuffer = device.createBuffer({
+        size: CAMERA_FLOATS * 4,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        label: "axion-camera"
+      });
+      this.cameraData = new Float32Array(CAMERA_FLOATS);
+      this.lightBuffer = device.createBuffer({
+        size: MAX_LIGHTS * LIGHT_FLOATS * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        label: "axion-lights"
+      });
+      this.lightData = new Float32Array(MAX_LIGHTS * LIGHT_FLOATS);
+      const faceSlots = this.shadows.maxLights * 6;
+      this.faceBuffer = device.createBuffer({
+        size: Math.max(FACE_SLOT_BYTES, faceSlots * FACE_SLOT_BYTES),
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        label: "axion-shadow-faces"
+      });
+      this.faceData = new Float32Array((faceSlots || 1) * (FACE_SLOT_BYTES / 4));
+      this.meshes = [];
+      this.materials = [];
+      this._pipelines = /* @__PURE__ */ new Map();
+      this._modules = {
+        standard: device.createShaderModule({ code: STANDARD_WGSL, label: "axion-standard" }),
+        shadow: device.createShaderModule({ code: SHADOW_WGSL, label: "axion-shadow" }),
+        ao: device.createShaderModule({ code: AO_WGSL, label: "axion-ao" }),
+        aoBlur: device.createShaderModule({ code: AO_BLUR_WGSL, label: "axion-ao-blur" }),
+        resolve: device.createShaderModule({ code: RESOLVE_WGSL, label: "axion-resolve" }),
+        bloomPrefilter: device.createShaderModule({ code: BLOOM_PREFILTER_WGSL, label: "axion-bloom-prefilter" }),
+        bloomDown: device.createShaderModule({ code: BLOOM_DOWN_WGSL, label: "axion-bloom-down" }),
+        bloomUp: device.createShaderModule({ code: BLOOM_UP_WGSL, label: "axion-bloom-up" }),
+        final: device.createShaderModule({ code: FINAL_WGSL, label: "axion-final" })
+      };
+      this._buildLayouts();
+      this._buildStaticPipelines();
+      this._buildShadowTarget();
+      this._rebuildFrameBindGroup();
+      this._visArch = new Uint16Array(4096);
+      this._visRow = new Uint32Array(4096);
+      this._visKey = new Uint32Array(4096);
+      this._sVisArch = new Uint16Array(4096);
+      this._sVisRow = new Uint32Array(4096);
+      this._sVisMesh = new Uint32Array(4096);
+      this._frustum = new Float32Array(24);
+      this._shadowBatches = [];
+      this._targets = null;
+      this._targetSize = [0, 0];
+      this.stats = {
+        drawCalls: 0,
+        instances: 0,
+        culled: 0,
+        triangles: 0,
+        batches: 0,
+        shadowDraws: 0,
+        shadowCasters: 0,
+        shadowLights: 0,
+        cpuMs: 0
+      };
+      this.defaultMaterial = this.createMaterial({ color: [0.8, 0.8, 0.82] });
+    }
+    /* ------------------------------------------------------------- layouts */
+    _buildLayouts() {
+      const d = this.device;
+      const FRAG = GPUShaderStage.FRAGMENT;
+      const VERT = GPUShaderStage.VERTEX;
+      this._frameLayout = d.createBindGroupLayout({
+        label: "axion-frame",
+        entries: [
+          { binding: 0, visibility: VERT | FRAG, buffer: { type: "uniform" } },
+          { binding: 1, visibility: VERT, buffer: { type: "read-only-storage" } },
+          { binding: 2, visibility: FRAG, buffer: { type: "read-only-storage" } },
+          { binding: 3, visibility: FRAG, texture: { sampleType: "depth", viewDimension: "2d-array" } },
+          { binding: 4, visibility: FRAG, sampler: { type: "comparison" } }
+        ]
+      });
+      this._geometryLayout = d.createPipelineLayout({
+        bindGroupLayouts: [this._frameLayout],
+        label: "axion-geometry-layout"
+      });
+      this._shadowLayout = d.createBindGroupLayout({
+        label: "axion-shadow",
+        entries: [
+          { binding: 0, visibility: VERT, buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 64 } },
+          { binding: 1, visibility: VERT, buffer: { type: "read-only-storage" } }
+        ]
+      });
+      const tex = (n) => ({ binding: n, visibility: FRAG, texture: { sampleType: "float" } });
+      const depthTex = (n) => ({ binding: n, visibility: FRAG, texture: { sampleType: "depth" } });
+      const cam = { binding: 0, visibility: FRAG, buffer: { type: "uniform" } };
+      const samp = { binding: 1, visibility: FRAG, sampler: { type: "filtering" } };
+      this._aoLayout = d.createBindGroupLayout({
+        label: "axion-ao",
+        entries: [cam, samp, depthTex(2), tex(3)]
+      });
+      this._aoBlurLayout = d.createBindGroupLayout({
+        label: "axion-ao-blur",
+        entries: [cam, samp, tex(2), depthTex(3)]
+      });
+      this._resolveLayout = d.createBindGroupLayout({
+        label: "axion-resolve",
+        entries: [cam, samp, tex(2), tex(3), tex(4), depthTex(5), tex(6)]
+      });
+      this._bloomLayout = d.createBindGroupLayout({
+        label: "axion-bloom",
+        entries: [cam, samp, tex(2)]
+      });
+      this._finalLayout = d.createBindGroupLayout({
+        label: "axion-final",
+        entries: [cam, samp, tex(2), tex(3)]
+      });
+      this._sampler = d.createSampler({
+        magFilter: "linear",
+        minFilter: "linear",
+        addressModeU: "clamp-to-edge",
+        addressModeV: "clamp-to-edge",
+        label: "axion-linear"
+      });
+      this._shadowSampler = d.createSampler({
+        compare: "less",
+        magFilter: "linear",
+        minFilter: "linear",
+        addressModeU: "clamp-to-edge",
+        addressModeV: "clamp-to-edge",
+        label: "axion-shadow-cmp"
+      });
+    }
+    _fullscreenPipeline(label, layout, module, format, blend) {
+      return this.device.createRenderPipeline({
+        label,
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+        vertex: { module, entryPoint: "vs" },
+        fragment: { module, entryPoint: "fs", targets: [{ format, blend }] },
+        primitive: { topology: "triangle-list" }
+      });
+    }
+    _buildStaticPipelines() {
+      const m = this._modules;
+      this._shadowPipeline = this.device.createRenderPipeline({
+        label: "axion-shadow",
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [this._shadowLayout] }),
+        vertex: {
+          module: m.shadow,
+          entryPoint: "vs",
+          buffers: [{
+            arrayStride: VERTEX_STRIDE_BYTES,
+            attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }]
+          }]
+        },
+        // No fragment stage at all: a depth-only pass needs none, and leaving it
+        // out lets the driver take its fast path.
+        primitive: { topology: "triangle-list", cullMode: "front", frontFace: "ccw" },
+        depthStencil: { format: "depth32float", depthWriteEnabled: true, depthCompare: "less" }
+      });
+      this._aoPipeline = this._fullscreenPipeline("axion-ao", this._aoLayout, m.ao, AO_FORMAT);
+      this._aoBlurPipeline = this._fullscreenPipeline("axion-ao-blur", this._aoBlurLayout, m.aoBlur, AO_FORMAT);
+      this._resolvePipeline = this._fullscreenPipeline("axion-resolve", this._resolveLayout, m.resolve, HDR_FORMAT);
+      this._bloomPrefilterPipeline = this._fullscreenPipeline("axion-bloom-prefilter", this._bloomLayout, m.bloomPrefilter, HDR_FORMAT);
+      this._bloomDownPipeline = this._fullscreenPipeline("axion-bloom-down", this._bloomLayout, m.bloomDown, HDR_FORMAT);
+      this._bloomUpPipeline = this._fullscreenPipeline("axion-bloom-up", this._bloomLayout, m.bloomUp, HDR_FORMAT, {
+        color: { srcFactor: "one", dstFactor: "one", operation: "add" },
+        alpha: { srcFactor: "one", dstFactor: "one", operation: "add" }
+      });
+      this._finalPipeline = this._fullscreenPipeline("axion-final", this._finalLayout, m.final, this.format);
+    }
+    _buildShadowTarget() {
+      const layers = Math.max(6, this.shadows.maxLights * 6);
+      const size = this.shadows.size;
+      this._shadowTexture?.destroy();
+      this._shadowTexture = this.device.createTexture({
+        size: [size, size, layers],
+        format: "depth32float",
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        label: "axion-shadow-array"
+      });
+      this._shadowArrayView = this._shadowTexture.createView({ dimension: "2d-array" });
+      this._shadowFaceViews = [];
+      for (let i = 0; i < layers; i++) {
+        this._shadowFaceViews.push(this._shadowTexture.createView({
+          dimension: "2d",
+          baseArrayLayer: i,
+          arrayLayerCount: 1
+        }));
+      }
+      this._boundInstanceBuffer = null;
+    }
+    /* ------------------------------------------------------------ registry */
+    /** Upload a mesh into the shared arenas. Returns a mesh id. */
+    createMesh(geometry, name = `mesh${this.meshes.length}`) {
+      const vOffset = this.vertexArena.upload(geometry.vertices, VERTEX_STRIDE_BYTES);
+      const iOffset = this.indexArena.upload(geometry.indices, 4);
+      const id = this.meshes.length;
+      this.meshes.push({
+        id,
+        name,
+        baseVertex: vOffset / VERTEX_STRIDE_BYTES,
+        firstIndex: iOffset / 4,
+        indexCount: geometry.indices.length,
+        bounds: geometry.bounds
+      });
+      return id;
+    }
+    /**
+     * Materials are small value records, not shader programs. Two materials that
+     * differ only in color share a pipeline and therefore cause no state change
+     * between their draws; they still form separate instance batches.
+     *
+     * `noiseScale` above zero switches on procedural surface detail: fBm
+     * weathering that modulates albedo, roughness, metallic and the normal,
+     * evaluated per pixel in world space. No texture, no UV seams, no memory.
+     */
+    createMaterial({
+      color = [1, 1, 1],
+      alpha = 1,
+      metallic = 0,
+      roughness = 0.6,
+      emissive = 0,
+      transparent = false,
+      doubleSided = false,
+      castShadow = true,
+      noiseScale = 0,
+      noiseStrength = 0.6,
+      bump = 0.5,
+      oxide = 0,
+      name = `material${this.materials.length}`
+    } = {}) {
+      const id = this.materials.length;
+      this.materials.push({
+        id,
+        name,
+        color,
+        alpha,
+        metallic,
+        roughness,
+        emissive,
+        transparent,
+        doubleSided,
+        castShadow,
+        noiseScale,
+        noiseStrength,
+        bump,
+        oxide
+      });
+      return id;
+    }
+    /** Recreated only when the instance buffer was reallocated by a grow. */
+    _rebuildFrameBindGroup() {
+      if (this._boundInstanceBuffer === this.instances.buffer) return;
+      this._boundInstanceBuffer = this.instances.buffer;
+      this.frameBindGroup = this.device.createBindGroup({
+        layout: this._frameLayout,
+        label: "axion-frame",
+        entries: [
+          { binding: 0, resource: { buffer: this.cameraBuffer } },
+          { binding: 1, resource: { buffer: this.instances.buffer } },
+          { binding: 2, resource: { buffer: this.lightBuffer } },
+          { binding: 3, resource: this._shadowArrayView },
+          { binding: 4, resource: this._shadowSampler }
+        ]
+      });
+    }
+    _rebuildShadowBindGroup() {
+      if (this._boundShadowBuffer === this.shadowModels.buffer) return;
+      this._boundShadowBuffer = this.shadowModels.buffer;
+      this.shadowBindGroup = this.device.createBindGroup({
+        layout: this._shadowLayout,
+        label: "axion-shadow",
+        entries: [
+          { binding: 0, resource: { buffer: this.faceBuffer, size: 64 } },
+          { binding: 1, resource: { buffer: this.shadowModels.buffer } }
+        ]
+      });
+    }
+    _pipelineFor(material) {
+      const key = `${material.transparent ? 1 : 0}|${material.doubleSided ? 1 : 0}`;
+      let p = this._pipelines.get(key);
+      if (p) return p;
+      p = this.device.createRenderPipeline({
+        label: `axion-pipeline-${key}`,
+        layout: this._geometryLayout,
+        vertex: {
+          module: this._modules.standard,
+          entryPoint: "vs",
+          buffers: [{
+            arrayStride: VERTEX_STRIDE_BYTES,
+            attributes: [
+              { shaderLocation: 0, offset: 0, format: "float32x3" },
+              { shaderLocation: 1, offset: 12, format: "float32x3" },
+              { shaderLocation: 2, offset: 24, format: "float32x2" }
+            ]
+          }]
+        },
+        fragment: {
+          module: this._modules.standard,
+          entryPoint: "fs",
+          targets: [
+            {
+              format: HDR_FORMAT,
+              blend: material.transparent ? {
+                color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" },
+                alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" }
+              } : void 0
+            },
+            // Transparent surfaces must not overwrite the surface or albedo
+            // buffers, or the resolve would shade a reflection for a ghost.
+            { format: HDR_FORMAT, writeMask: material.transparent ? 0 : GPUColorWrite.ALL },
+            { format: HDR_FORMAT, writeMask: material.transparent ? 0 : GPUColorWrite.ALL }
+          ]
+        },
+        primitive: {
+          topology: "triangle-list",
+          cullMode: material.doubleSided ? "none" : "back",
+          frontFace: "ccw"
+        },
+        // Reverse-Z: clear to 0, keep the greater depth. Gives float32 depth its
+        // precision where it matters instead of wasting it near the near plane.
+        depthStencil: {
+          format: "depth32float",
+          depthWriteEnabled: !material.transparent,
+          depthCompare: "greater"
+        }
+      });
+      this._pipelines.set(key, p);
+      return p;
+    }
+    /* -------------------------------------------------------- attachments */
+    _ensureTargets() {
+      const { width, height } = this.canvas;
+      if (this._targetSize[0] === width && this._targetSize[1] === height) return;
+      for (const t2 of this._targets?.all ?? []) t2.destroy();
+      const make = (format, w, h, label) => this.device.createTexture({
+        size: [Math.max(1, w), Math.max(1, h)],
+        format,
+        label,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC
+      });
+      const color = make(HDR_FORMAT, width, height, "axion-scene-color");
+      const surface = make(HDR_FORMAT, width, height, "axion-surface");
+      const albedo = make(HDR_FORMAT, width, height, "axion-albedo");
+      const depth = make("depth32float", width, height, "axion-depth");
+      const hdr = make(HDR_FORMAT, width, height, "axion-hdr");
+      const aoW = Math.max(1, width >> 1), aoH = Math.max(1, height >> 1);
+      const ao = make(AO_FORMAT, aoW, aoH, "axion-ao");
+      const aoBlur = make(AO_FORMAT, aoW, aoH, "axion-ao-blur");
+      const bloom = [];
+      let bw = width >> 1, bh = height >> 1;
+      for (let i = 0; i < this.bloom.levels && bw > 8 && bh > 8; i++) {
+        bloom.push({ tex: make(HDR_FORMAT, bw, bh, `axion-bloom-${i}`), w: bw, h: bh });
+        bw >>= 1;
+        bh >>= 1;
+      }
+      this._targets = {
+        all: [color, surface, albedo, depth, hdr, ao, aoBlur, ...bloom.map((b) => b.tex)],
+        color,
+        surface,
+        albedo,
+        depth,
+        hdr,
+        ao,
+        aoBlur,
+        bloom,
+        colorView: color.createView(),
+        surfaceView: surface.createView(),
+        albedoView: albedo.createView(),
+        depthView: depth.createView(),
+        hdrView: hdr.createView(),
+        aoView: ao.createView(),
+        aoBlurView: aoBlur.createView(),
+        bloomViews: bloom.map((b) => b.tex.createView())
+      };
+      const t = this._targets;
+      const bg = (layout, resources, label) => this.device.createBindGroup({
+        layout,
+        label,
+        entries: resources.map((resource, i) => ({ binding: i, resource }))
+      });
+      const camRes = { buffer: this.cameraBuffer };
+      this.aoBindGroup = bg(this._aoLayout, [camRes, this._sampler, t.depthView, t.surfaceView], "axion-ao");
+      this.aoBlurBindGroup = bg(this._aoBlurLayout, [camRes, this._sampler, t.aoView, t.depthView], "axion-ao-blur");
+      this.resolveBindGroup = bg(
+        this._resolveLayout,
+        [camRes, this._sampler, t.colorView, t.surfaceView, t.albedoView, t.depthView, t.aoBlurView],
+        "axion-resolve"
+      );
+      this.finalBindGroup = bg(
+        this._finalLayout,
+        [camRes, this._sampler, t.hdrView, t.bloomViews[0] ?? t.hdrView],
+        "axion-final"
+      );
+      this.bloomFromHdr = bg(this._bloomLayout, [camRes, this._sampler, t.hdrView], "axion-bloom-src");
+      this.bloomBindGroups = t.bloomViews.map((v, i) => bg(this._bloomLayout, [camRes, this._sampler, v], `axion-bloom-${i}`));
+      this._targetSize = [width, height];
+    }
+    _growVisibility(n) {
+      if (n <= this._visArch.length) return;
+      let cap = this._visArch.length;
+      while (cap < n) cap *= 2;
+      this._visArch = new Uint16Array(cap);
+      this._visRow = new Uint32Array(cap);
+      this._visKey = new Uint32Array(cap);
+      this._sVisArch = new Uint16Array(cap);
+      this._sVisRow = new Uint32Array(cap);
+      this._sVisMesh = new Uint32Array(cap);
+    }
+    /* --------------------------------------------------------- shadow prep */
+    /**
+     * Build the cube-face view-projection matrices for one light.
+     *
+     * The basis comes from the same CUBE_FACES table the shader reads, so the
+     * render and the lookup cannot disagree — which is how cube shadows usually
+     * end up subtly, maddeningly wrong.
+     */
+    _writeFaceMatrices(slot, lx, ly, lz, near, far) {
+      const stride = FACE_SLOT_BYTES / 4;
+      const p10 = far / (near - far);
+      const p14 = near * far / (near - far);
+      for (let i = 0; i < 6; i++) {
+        const F = CUBE_FACES[i].f, U = CUBE_FACES[i].u;
+        const R = [
+          F[1] * U[2] - F[2] * U[1],
+          F[2] * U[0] - F[0] * U[2],
+          F[0] * U[1] - F[1] * U[0]
+        ];
+        const base = (slot * 6 + i) * stride;
+        const m = this.faceData;
+        const tx = -(R[0] * lx + R[1] * ly + R[2] * lz);
+        const ty = -(U[0] * lx + U[1] * ly + U[2] * lz);
+        const tz = F[0] * lx + F[1] * ly + F[2] * lz;
+        m[base + 0] = R[0];
+        m[base + 1] = U[0];
+        m[base + 2] = -F[0] * p10;
+        m[base + 3] = F[0];
+        m[base + 4] = R[1];
+        m[base + 5] = U[1];
+        m[base + 6] = -F[1] * p10;
+        m[base + 7] = F[1];
+        m[base + 8] = R[2];
+        m[base + 9] = U[2];
+        m[base + 10] = -F[2] * p10;
+        m[base + 11] = F[2];
+        m[base + 12] = tx;
+        m[base + 13] = ty;
+        m[base + 14] = tz * p10 + p14;
+        m[base + 15] = -tz;
+      }
+    }
+    /**
+     * Gather shadow casters per light and scatter their matrices into one
+     * buffer, grouped by mesh. Materials do not matter for a depth-only pass, so
+     * the sort key is just the mesh — fewer, bigger batches than the main pass.
+     */
+    _buildShadowBatches(world, lights) {
+      const batches = this._shadowBatches;
+      batches.length = 0;
+      if (lights.length === 0) return 0;
+      const archetypes = world.query([LocalToWorld, MeshRef, Bounds], [Hidden]);
+      const meshCount = Math.max(1, this.meshes.length);
+      if (!this._sCounts || this._sCounts.length < meshCount + 1) {
+        this._sCounts = new Uint32Array(meshCount + 1);
+        this._sCursor = new Uint32Array(meshCount + 1);
+      }
+      let total = 0;
+      for (const a of archetypes) total += a.count;
+      this._growVisibility(total);
+      let written = 0;
+      const cap = this.shadows.maxCasters;
+      for (let li = 0; li < lights.length; li++) {
+        const L = lights[li];
+        this._sCounts.fill(0, 0, meshCount + 1);
+        let visible = 0;
+        for (let ai = 0; ai < archetypes.length && written + visible < cap; ai++) {
+          const a = archetypes[ai];
+          const W = a.columns.get(LocalToWorld.id);
+          const R = a.columns.get(MeshRef.id);
+          const B = a.columns.get(Bounds.id);
+          for (let r = 0; r < a.count; r++) {
+            const mat = this.materials[R[r * 2 + M_MATERIAL]];
+            if (mat && mat.castShadow === false) continue;
+            const w = r * 16, b = r * 4;
+            const cx = W[w] * B[b] + W[w + 4] * B[b + 1] + W[w + 8] * B[b + 2] + W[w + 12];
+            const cy = W[w + 1] * B[b] + W[w + 5] * B[b + 1] + W[w + 9] * B[b + 2] + W[w + 13];
+            const cz = W[w + 2] * B[b] + W[w + 6] * B[b + 1] + W[w + 10] * B[b + 2] + W[w + 14];
+            const s = Math.max(
+              Math.hypot(W[w], W[w + 1], W[w + 2]),
+              Math.hypot(W[w + 4], W[w + 5], W[w + 6]),
+              Math.hypot(W[w + 8], W[w + 9], W[w + 10])
+            );
+            const radius = B[b + 3] * s;
+            const dx = cx - L.x, dy = cy - L.y, dz = cz - L.z;
+            const distSq = dx * dx + dy * dy + dz * dz;
+            if (distSq > (L.range + radius) * (L.range + radius)) continue;
+            if (distSq < radius * radius) continue;
+            const mesh2 = R[r * 2 + M_MESH];
+            this._sVisArch[visible] = ai;
+            this._sVisRow[visible] = r;
+            this._sVisMesh[visible] = mesh2;
+            this._sCounts[mesh2]++;
+            visible++;
+          }
+        }
+        if (visible === 0) {
+          L.slot = -1;
+          continue;
+        }
+        let running = written;
+        for (let k = 0; k < meshCount; k++) {
+          this._sCursor[k] = running;
+          if (this._sCounts[k] > 0) {
+            batches.push({ light: li, mesh: k, first: running, count: this._sCounts[k] });
+          }
+          running += this._sCounts[k];
+        }
+        this.shadowModels.ensure((written + visible) * 16);
+        const dst = this.shadowModels.cpu;
+        for (let i = 0; i < visible; i++) {
+          const a = archetypes[this._sVisArch[i]];
+          const r = this._sVisRow[i];
+          const slot = this._sCursor[this._sVisMesh[i]]++;
+          const W = a.columns.get(LocalToWorld.id);
+          for (let m = 0; m < 16; m++) dst[slot * 16 + m] = W[r * 16 + m];
+        }
+        written += visible;
+      }
+      return written;
+    }
+    /* ------------------------------------------------------------- frame  */
+    render(world, camera, time = 0) {
+      const t0 = performance.now();
+      this._ensureTargets();
+      const { width, height } = this.canvas;
+      const t = this._targets;
+      const lightList = [];
+      for (const a of world.query([Transform, PointLight])) {
+        const T = a.columns.get(Transform.id);
+        const L = a.columns.get(PointLight.id);
+        for (let r = 0; r < a.count && lightList.length < MAX_LIGHTS; r++) {
+          const tOff = r * 10 + T_POS, l = r * 5;
+          lightList.push({
+            x: T[tOff],
+            y: T[tOff + 1],
+            z: T[tOff + 2],
+            r: L[l],
+            g: L[l + 1],
+            b: L[l + 2],
+            intensity: L[l + 3],
+            range: L[l + 4],
+            slot: -1
+          });
+        }
+      }
+      let shadowLights = [];
+      if (this.shadows.enabled && this.shadows.maxLights > 0) {
+        const ex = camera.position[0], ey = camera.position[1], ez = camera.position[2];
+        shadowLights = lightList.map((l) => {
+          const d = Math.hypot(l.x - ex, l.y - ey, l.z - ez);
+          return { l, score: l.intensity / (1 + d * d * 0.01) };
+        }).sort((a, b) => b.score - a.score).slice(0, this.shadows.maxLights).map((e) => e.l);
+        shadowLights.forEach((l, i) => {
+          l.slot = i;
+        });
+      }
+      const shadowCasters = this.shadows.enabled ? this._buildShadowBatches(world, shadowLights) : 0;
+      if (shadowCasters > 0) {
+        this.shadowModels.flush(shadowCasters * 16);
+        for (const l of shadowLights) {
+          if (l.slot < 0) continue;
+          this._writeFaceMatrices(l.slot, l.x, l.y, l.z, this.shadows.near, l.range);
+        }
+        this.device.queue.writeBuffer(this.faceBuffer, 0, this.faceData);
+      }
+      this._rebuildShadowBindGroup();
+      for (let i = 0; i < lightList.length; i++) {
+        const l = lightList[i], o = i * LIGHT_FLOATS;
+        this.lightData[o] = l.x;
+        this.lightData[o + 1] = l.y;
+        this.lightData[o + 2] = l.z;
+        this.lightData[o + 3] = l.range;
+        this.lightData[o + 4] = l.r;
+        this.lightData[o + 5] = l.g;
+        this.lightData[o + 6] = l.b;
+        this.lightData[o + 7] = l.intensity;
+        this.lightData[o + 8] = shadowCasters > 0 ? l.slot : -1;
+        this.lightData[o + 9] = this.shadows.near;
+        this.lightData[o + 10] = this.shadows.bias;
+        this.lightData[o + 11] = l.range;
+      }
+      if (lightList.length > 0) {
+        this.device.queue.writeBuffer(
+          this.lightBuffer,
+          0,
+          this.lightData.buffer,
+          0,
+          lightList.length * LIGHT_FLOATS * 4
+        );
+      }
+      const cd = this.cameraData;
+      cd.set(camera.viewProj, 0);
+      cd.set(camera.view, 16);
+      cd.set(camera.invView, 32);
+      cd[48] = camera.position[0];
+      cd[49] = camera.position[1];
+      cd[50] = camera.position[2];
+      cd[51] = time;
+      cd[52] = lightList.length;
+      cd[53] = this.exposure;
+      cd[54] = this.fogDensity;
+      cd[55] = this.fxaa ? 1 : 0;
+      cd.set(this.ambient, 56);
+      cd[59] = this.groundAmbient;
+      cd.set(this.fogColor, 60);
+      cd[63] = this.aerialPerspective;
+      cd[64] = camera.projection[0];
+      cd[65] = camera.projection[5];
+      cd[66] = camera.near;
+      cd[67] = camera.aspect;
+      cd[68] = this.ssr.intensity;
+      cd[69] = this.ssr.steps;
+      cd[70] = this.ssr.thickness;
+      cd[71] = this.ssr.maxDistance;
+      cd[72] = width;
+      cd[73] = height;
+      cd[74] = 1 / width;
+      cd[75] = 1 / height;
+      cd[76] = this.ao.intensity;
+      cd[77] = this.ao.radius;
+      cd[78] = this.ao.power;
+      cd[79] = this.ao.bias;
+      cd[80] = this.bloom.threshold;
+      cd[81] = this.bloom.knee;
+      cd[82] = this.bloom.strength;
+      cd[83] = 0;
+      cd[84] = this.shadows.size;
+      cd[85] = this.shadows.pcfRadius;
+      cd[86] = this.shadows.normalBias;
+      cd[87] = 0;
+      cd[88] = this.ao.fadeDistance;
+      cd[89] = this.ssr.fadeDistance;
+      cd[90] = 0;
+      cd[91] = 0;
+      this.device.queue.writeBuffer(this.cameraBuffer, 0, cd);
+      if (this.frustumCulling) frustumFromMatrix(this._frustum, 0, camera.viewProj, 0);
+      const archetypes = world.query([LocalToWorld, MeshRef, Bounds], [Hidden]);
+      let total = 0;
+      for (const a of archetypes) total += a.count;
+      this._growVisibility(total);
+      const matCount = Math.max(1, this.materials.length);
+      const keyCount = Math.max(1, this.meshes.length) * matCount;
+      if (!this._counts || this._counts.length < keyCount + 1) {
+        this._counts = new Uint32Array(keyCount + 1);
+        this._cursor = new Uint32Array(keyCount + 1);
+      } else {
+        this._counts.fill(0, 0, keyCount + 1);
+      }
+      let visible = 0, culled = 0;
+      for (let ai = 0; ai < archetypes.length; ai++) {
+        const a = archetypes[ai];
+        const W = a.columns.get(LocalToWorld.id);
+        const R = a.columns.get(MeshRef.id);
+        const B = a.columns.get(Bounds.id);
+        const n = a.count;
+        for (let r = 0; r < n; r++) {
+          if (this.frustumCulling) {
+            const w = r * 16, b = r * 4;
+            const cx = W[w] * B[b] + W[w + 4] * B[b + 1] + W[w + 8] * B[b + 2] + W[w + 12];
+            const cy = W[w + 1] * B[b] + W[w + 5] * B[b + 1] + W[w + 9] * B[b + 2] + W[w + 13];
+            const cz = W[w + 2] * B[b] + W[w + 6] * B[b + 1] + W[w + 10] * B[b + 2] + W[w + 14];
+            const s = Math.max(
+              Math.hypot(W[w], W[w + 1], W[w + 2]),
+              Math.hypot(W[w + 4], W[w + 5], W[w + 6]),
+              Math.hypot(W[w + 8], W[w + 9], W[w + 10])
+            );
+            if (!sphereInFrustum(this._frustum, 0, cx, cy, cz, B[b + 3] * s)) {
+              culled++;
+              continue;
+            }
+          }
+          const key = R[r * 2 + M_MESH] * matCount + R[r * 2 + M_MATERIAL];
+          this._visArch[visible] = ai;
+          this._visRow[visible] = r;
+          this._visKey[visible] = key;
+          this._counts[key]++;
+          visible++;
+        }
+      }
+      let running = 0;
+      for (let k = 0; k < keyCount; k++) {
+        this._cursor[k] = running;
+        running += this._counts[k];
+      }
+      this.instances.ensure(visible * INSTANCE_FLOATS);
+      const inst = this.instances.cpu;
+      for (let i = 0; i < visible; i++) {
+        const a = archetypes[this._visArch[i]];
+        const r = this._visRow[i];
+        const slot = this._cursor[this._visKey[i]]++;
+        const o = slot * INSTANCE_FLOATS;
+        const W = a.columns.get(LocalToWorld.id);
+        for (let m = 0; m < 16; m++) inst[o + m] = W[r * 16 + m];
+        const mat = this.materials[a.columns.get(MeshRef.id)[r * 2 + M_MATERIAL]] ?? this.materials[0];
+        const C = a.columns.get(InstanceColor.id);
+        if (C) {
+          inst[o + 16] = C[r * 4];
+          inst[o + 17] = C[r * 4 + 1];
+          inst[o + 18] = C[r * 4 + 2];
+          inst[o + 19] = mat.alpha;
+          inst[o + 22] = C[r * 4 + 3];
+        } else {
+          inst[o + 16] = mat.color[0];
+          inst[o + 17] = mat.color[1];
+          inst[o + 18] = mat.color[2];
+          inst[o + 19] = mat.alpha;
+          inst[o + 22] = mat.emissive;
+        }
+        inst[o + 20] = mat.metallic;
+        inst[o + 21] = mat.roughness;
+        inst[o + 23] = 0;
+        inst[o + 24] = mat.noiseScale;
+        inst[o + 25] = mat.noiseStrength;
+        inst[o + 26] = mat.bump;
+        inst[o + 27] = mat.oxide;
+      }
+      this.instances.flush(visible * INSTANCE_FLOATS);
+      this._rebuildFrameBindGroup();
+      const enc = this.device.createCommandEncoder({ label: "axion-frame" });
+      let shadowDraws = 0;
+      if (shadowCasters > 0) {
+        for (const light of shadowLights) {
+          if (light.slot < 0) continue;
+          const batches2 = this._shadowBatches.filter((b) => shadowLights[b.light] === light);
+          for (let face = 0; face < 6; face++) {
+            const layer = light.slot * 6 + face;
+            const pass = enc.beginRenderPass({
+              label: `axion-shadow-${layer}`,
+              colorAttachments: [],
+              depthStencilAttachment: {
+                view: this._shadowFaceViews[layer],
+                depthClearValue: 1,
+                depthLoadOp: "clear",
+                depthStoreOp: "store"
+              }
+            });
+            pass.setPipeline(this._shadowPipeline);
+            pass.setBindGroup(0, this.shadowBindGroup, [layer * FACE_SLOT_BYTES]);
+            pass.setVertexBuffer(0, this.vertexArena.buffer);
+            pass.setIndexBuffer(this.indexArena.buffer, "uint32");
+            for (const b of batches2) {
+              const m = this.meshes[b.mesh];
+              if (!m) continue;
+              pass.drawIndexed(m.indexCount, b.count, m.firstIndex, m.baseVertex, b.first);
+              shadowDraws++;
+            }
+            pass.end();
+          }
+        }
+      }
+      const geo = enc.beginRenderPass({
+        label: "axion-geometry",
+        colorAttachments: [
+          {
+            view: t.colorView,
+            clearValue: { r: this.clearColor[0], g: this.clearColor[1], b: this.clearColor[2], a: this.clearColor[3] },
+            loadOp: "clear",
+            storeOp: "store"
+          },
+          { view: t.surfaceView, clearValue: { r: 0, g: 0, b: 1, a: 0 }, loadOp: "clear", storeOp: "store" },
+          { view: t.albedoView, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" }
+        ],
+        depthStencilAttachment: {
+          view: t.depthView,
+          depthClearValue: 0,
+          // reverse-Z
+          depthLoadOp: "clear",
+          depthStoreOp: "store"
+        }
+      });
+      geo.setBindGroup(0, this.frameBindGroup);
+      geo.setVertexBuffer(0, this.vertexArena.buffer);
+      geo.setIndexBuffer(this.indexArena.buffer, "uint32");
+      let draws = 0, tris = 0, batches = 0, currentPipeline = null;
+      for (let phase = 0; phase < 2; phase++) {
+        for (let k = 0; k < keyCount; k++) {
+          const count = this._counts[k];
+          const start = this._cursor[k] - count;
+          if (count === 0) continue;
+          const material = this.materials[k % matCount] ?? this.materials[0];
+          if ((material.transparent ? 1 : 0) !== phase) continue;
+          const m = this.meshes[k / matCount | 0];
+          if (!m) continue;
+          const pipeline = this._pipelineFor(material);
+          if (pipeline !== currentPipeline) {
+            geo.setPipeline(pipeline);
+            currentPipeline = pipeline;
+          }
+          geo.drawIndexed(m.indexCount, count, m.firstIndex, m.baseVertex, start);
+          draws++;
+          batches++;
+          tris += m.indexCount / 3 * count;
+        }
+      }
+      geo.end();
+      const fullscreen = (label, view, pipeline, bindGroup, load = "clear") => {
+        const pass = enc.beginRenderPass({
+          label,
+          colorAttachments: [{
+            view,
+            loadOp: load,
+            storeOp: "store",
+            clearValue: { r: 0, g: 0, b: 0, a: 1 }
+          }]
+        });
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.draw(3);
+        pass.end();
+      };
+      fullscreen("axion-ao", t.aoView, this._aoPipeline, this.aoBindGroup);
+      fullscreen("axion-ao-blur", t.aoBlurView, this._aoBlurPipeline, this.aoBlurBindGroup);
+      fullscreen("axion-resolve", t.hdrView, this._resolvePipeline, this.resolveBindGroup);
+      if (t.bloom.length > 0 && this.bloom.strength > 0) {
+        fullscreen("axion-bloom-prefilter", t.bloomViews[0], this._bloomPrefilterPipeline, this.bloomFromHdr);
+        for (let i = 1; i < t.bloom.length; i++) {
+          fullscreen(`axion-bloom-down-${i}`, t.bloomViews[i], this._bloomDownPipeline, this.bloomBindGroups[i - 1]);
+        }
+        for (let i = t.bloom.length - 1; i > 0; i--) {
+          fullscreen(
+            `axion-bloom-up-${i}`,
+            t.bloomViews[i - 1],
+            this._bloomUpPipeline,
+            this.bloomBindGroups[i],
+            "load"
+          );
+        }
+      }
+      const final = enc.beginRenderPass({
+        label: "axion-final",
+        colorAttachments: [{
+          view: this.context.getCurrentTexture().createView(),
+          loadOp: "clear",
+          storeOp: "store",
+          clearValue: { r: 0, g: 0, b: 0, a: 1 }
+        }]
+      });
+      final.setPipeline(this._finalPipeline);
+      final.setBindGroup(0, this.finalBindGroup);
+      final.draw(3);
+      final.end();
+      this.device.queue.submit([enc.finish()]);
+      const bloomPasses = t.bloom.length > 0 && this.bloom.strength > 0 ? t.bloom.length * 2 - 1 : 0;
+      this.stats.drawCalls = draws + shadowDraws + 3 + bloomPasses + 1;
+      this.stats.batches = batches;
+      this.stats.instances = visible;
+      this.stats.culled = culled;
+      this.stats.triangles = tris;
+      this.stats.shadowDraws = shadowDraws;
+      this.stats.shadowCasters = shadowCasters;
+      this.stats.shadowLights = shadowCasters > 0 ? shadowLights.filter((l) => l.slot >= 0).length : 0;
+      this.stats.cpuMs = performance.now() - t0;
+    }
+    destroy() {
+      this.vertexArena.destroy();
+      this.indexArena.destroy();
+      this.instances.destroy();
+      this.shadowModels.destroy();
+      this.cameraBuffer.destroy();
+      this.lightBuffer.destroy();
+      this.faceBuffer.destroy();
+      this._shadowTexture?.destroy();
+      for (const tex of this._targets?.all ?? []) tex.destroy();
+    }
+  };
+
+  // src/render/camera.js
+  var Camera = class {
+    constructor({ fov = 60, near = 0.1, aspect = 1 } = {}) {
+      this.fov = fov * Math.PI / 180;
+      this.near = near;
+      this.aspect = aspect;
+      this.position = f32(3);
+      this.target = f32(3);
+      this.up = f32([0, 1, 0]);
+      this.view = f32(16);
+      this.invView = f32(16);
+      this.projection = f32(16);
+      this.viewProj = f32(16);
+      this.update();
+    }
+    setAspect(a) {
+      if (a !== this.aspect) {
+        this.aspect = a;
+      }
+      return this;
+    }
+    setOrthographic(size) {
+      this._ortho = size;
+      return this;
+    }
+    update() {
+      if (this._ortho) {
+        const h = this._ortho, w = h * this.aspect;
+        m4ortho(this.projection, 0, -w, w, -h, h, this.near, this.near + 4e3);
+      } else {
+        m4perspectiveReverseZ(this.projection, 0, this.fov, this.aspect, this.near);
+      }
+      m4lookAt(this.view, 0, this.position, 0, this.target, 0, this.up, 0);
+      m4mul(this.viewProj, 0, this.projection, 0, this.view, 0);
+      m4invert(this.invView, 0, this.view, 0);
+      return this;
+    }
+  };
+  var OrbitControls = class {
+    constructor(camera, element, {
+      distance = 10,
+      minDistance = 0.5,
+      maxDistance = 500,
+      azimuth = 0.7,
+      polar = 1.1,
+      damping = 12,
+      autoRotate = 0
+    } = {}) {
+      this.camera = camera;
+      this.el = element;
+      this.distance = distance;
+      this.minDistance = minDistance;
+      this.maxDistance = maxDistance;
+      this.azimuth = azimuth;
+      this.polar = polar;
+      this.damping = damping;
+      this.autoRotate = autoRotate;
+      this._tAz = azimuth;
+      this._tPolar = polar;
+      this._tDist = distance;
+      this._panX = 0;
+      this._panY = 0;
+      this._panZ = 0;
+      this._dragging = 0;
+      this._lastX = 0;
+      this._lastY = 0;
+      this._onDown = (e) => {
+        this._dragging = e.button === 2 || e.shiftKey ? 2 : 1;
+        this._lastX = e.clientX;
+        this._lastY = e.clientY;
+        element.setPointerCapture?.(e.pointerId);
+      };
+      this._onUp = (e) => {
+        this._dragging = 0;
+        element.releasePointerCapture?.(e.pointerId);
+      };
+      this._onMove = (e) => {
+        if (!this._dragging) return;
+        const dx = e.clientX - this._lastX, dy = e.clientY - this._lastY;
+        this._lastX = e.clientX;
+        this._lastY = e.clientY;
+        if (this._dragging === 1) {
+          this._tAz -= dx * 5e-3;
+          this._tPolar = Math.min(Math.PI - 0.05, Math.max(0.05, this._tPolar - dy * 5e-3));
+        } else {
+          const s = this._tDist * 15e-4;
+          const sa = Math.sin(this._tAz), ca = Math.cos(this._tAz);
+          this._panX -= (ca * dx - 0 * dy) * s;
+          this._panZ -= sa * dx * s;
+          this._panY += dy * s;
+        }
+      };
+      this._onWheel = (e) => {
+        e.preventDefault();
+        this._tDist = Math.min(
+          this.maxDistance,
+          Math.max(this.minDistance, this._tDist * Math.exp(e.deltaY * 1e-3))
+        );
+      };
+      this._onContext = (e) => e.preventDefault();
+      element.addEventListener("pointerdown", this._onDown);
+      element.addEventListener("pointerup", this._onUp);
+      element.addEventListener("pointercancel", this._onUp);
+      element.addEventListener("pointermove", this._onMove);
+      element.addEventListener("wheel", this._onWheel, { passive: false });
+      element.addEventListener("contextmenu", this._onContext);
+    }
+    update(dt) {
+      this._tAz += this.autoRotate * dt;
+      const k = 1 - Math.exp(-this.damping * dt);
+      this.azimuth += (this._tAz - this.azimuth) * k;
+      this.polar += (this._tPolar - this.polar) * k;
+      this.distance += (this._tDist - this.distance) * k;
+      const c = this.camera;
+      c.target[0] = this._panX;
+      c.target[1] = this._panY;
+      c.target[2] = this._panZ;
+      const sp = Math.sin(this.polar);
+      c.position[0] = c.target[0] + this.distance * sp * Math.cos(this.azimuth);
+      c.position[1] = c.target[1] + this.distance * Math.cos(this.polar);
+      c.position[2] = c.target[2] + this.distance * sp * Math.sin(this.azimuth);
+      c.update();
+    }
+    dispose() {
+      const el = this.el;
+      el.removeEventListener("pointerdown", this._onDown);
+      el.removeEventListener("pointerup", this._onUp);
+      el.removeEventListener("pointercancel", this._onUp);
+      el.removeEventListener("pointermove", this._onMove);
+      el.removeEventListener("wheel", this._onWheel);
+      el.removeEventListener("contextmenu", this._onContext);
+    }
+  };
+  var FlyControls = class {
+    constructor(camera, element, {
+      speed = 9,
+      boost = 3,
+      sensitivity = 22e-4,
+      damping = 14,
+      yaw = 0,
+      pitch = -0.15,
+      position = [0, 4, 18]
+    } = {}) {
+      this.camera = camera;
+      this.el = element;
+      this.speed = speed;
+      this.boost = boost;
+      this.sensitivity = sensitivity;
+      this.damping = damping;
+      this.yaw = yaw;
+      this.pitch = pitch;
+      this.enabled = false;
+      this.locked = false;
+      this.position = new Float32Array(position);
+      this._velocity = new Float32Array(3);
+      this._keys = /* @__PURE__ */ new Set();
+      this._onDown = () => {
+        if (this.enabled) element.requestPointerLock?.();
+      };
+      this._onLockChange = () => {
+        this.locked = document.pointerLockElement === element;
+      };
+      this._onMove = (e) => {
+        if (!this.enabled || !this.locked) return;
+        this.yaw -= e.movementX * this.sensitivity;
+        const limit = Math.PI / 2 - 0.01;
+        this.pitch = Math.max(-limit, Math.min(limit, this.pitch - e.movementY * this.sensitivity));
+      };
+      this._onKeyDown = (e) => {
+        if (!this.enabled) return;
+        this._keys.add(e.code);
+        if (e.code === "Space") e.preventDefault();
+      };
+      this._onKeyUp = (e) => this._keys.delete(e.code);
+      element.addEventListener("mousedown", this._onDown);
+      document.addEventListener("pointerlockchange", this._onLockChange);
+      document.addEventListener("mousemove", this._onMove);
+      window.addEventListener("keydown", this._onKeyDown);
+      window.addEventListener("keyup", this._onKeyUp);
+    }
+    /** Enter or leave fly mode. Leaving releases the pointer. */
+    setEnabled(on) {
+      this.enabled = on;
+      if (!on) {
+        this._keys.clear();
+        this._velocity.fill(0);
+        if (document.pointerLockElement === this.el) document.exitPointerLock?.();
+      }
+      return this;
+    }
+    /** Adopt wherever another controller left the camera, so toggling is seamless. */
+    syncFromCamera() {
+      const c = this.camera;
+      this.position.set(c.position.subarray(0, 3));
+      const dx = c.target[0] - c.position[0];
+      const dy = c.target[1] - c.position[1];
+      const dz = c.target[2] - c.position[2];
+      this.yaw = Math.atan2(-dx, -dz);
+      this.pitch = Math.atan2(dy, Math.hypot(dx, dz));
+      return this;
+    }
+    update(dt) {
+      if (!this.enabled) return;
+      const cp = Math.cos(this.pitch), sp = Math.sin(this.pitch);
+      const cy = Math.cos(this.yaw), sy = Math.sin(this.yaw);
+      const fx = -sy * cp, fy = sp, fz = -cy * cp;
+      const rx = cy, ry = 0, rz = -sy;
+      const k = this._keys;
+      let mx = 0, my = 0, mz = 0;
+      if (k.has("KeyW")) {
+        mx += fx;
+        my += fy;
+        mz += fz;
+      }
+      if (k.has("KeyS")) {
+        mx -= fx;
+        my -= fy;
+        mz -= fz;
+      }
+      if (k.has("KeyD")) {
+        mx += rx;
+        my += ry;
+        mz += rz;
+      }
+      if (k.has("KeyA")) {
+        mx -= rx;
+        my -= ry;
+        mz -= rz;
+      }
+      if (k.has("Space")) my += 1;
+      if (k.has("ShiftLeft") || k.has("ShiftRight")) my -= 1;
+      const len = Math.hypot(mx, my, mz);
+      const speed = this.speed * (k.has("ControlLeft") ? this.boost : 1);
+      if (len > 1e-5) {
+        mx = mx / len * speed;
+        my = my / len * speed;
+        mz = mz / len * speed;
+      } else {
+        mx = 0;
+        my = 0;
+        mz = 0;
+      }
+      const damp = 1 - Math.exp(-this.damping * dt);
+      this._velocity[0] += (mx - this._velocity[0]) * damp;
+      this._velocity[1] += (my - this._velocity[1]) * damp;
+      this._velocity[2] += (mz - this._velocity[2]) * damp;
+      this.position[0] += this._velocity[0] * dt;
+      this.position[1] += this._velocity[1] * dt;
+      this.position[2] += this._velocity[2] * dt;
+      const c = this.camera;
+      c.position.set(this.position);
+      c.target[0] = this.position[0] + fx;
+      c.target[1] = this.position[1] + fy;
+      c.target[2] = this.position[2] + fz;
+      c.update();
+    }
+    dispose() {
+      this.el.removeEventListener("mousedown", this._onDown);
+      document.removeEventListener("pointerlockchange", this._onLockChange);
+      document.removeEventListener("mousemove", this._onMove);
+      window.removeEventListener("keydown", this._onKeyDown);
+      window.removeEventListener("keyup", this._onKeyUp);
+    }
+  };
+
+  // src/systems/transform.js
+  function motionSystem(world, dt) {
+    const q = scratch.q[0];
+    for (const a of world.query([Transform, Motion, Dynamic])) {
+      const T = a.columns.get(Transform.id);
+      const M = a.columns.get(Motion.id);
+      const n = a.count;
+      for (let r = 0; r < n; r++) {
+        const t = r * 10, m = r * 6;
+        T[t + T_POS] += M[m] * dt;
+        T[t + T_POS + 1] += M[m + 1] * dt;
+        T[t + T_POS + 2] += M[m + 2] * dt;
+        const ax = M[m + 3], ay = M[m + 4], az = M[m + 5];
+        const speed = Math.hypot(ax, ay, az);
+        if (speed > 1e-6) {
+          const inv = 1 / speed;
+          q[0] = ax * inv;
+          q[1] = ay * inv;
+          q[2] = az * inv;
+          qFromAxisAngle(q, 0, q, 0, speed * dt);
+          qmul(T, t + T_ROT, q, 0, T, t + T_ROT);
+          qnormalize(T, t + T_ROT, T, t + T_ROT);
+        }
+      }
+    }
+  }
+  function transformSystem(world) {
+    for (const a of world.query([Transform, LocalToWorld, Dynamic])) {
+      const T = a.columns.get(Transform.id);
+      const W = a.columns.get(LocalToWorld.id);
+      const n = a.count;
+      for (let r = 0; r < n; r++) {
+        const t = r * 10;
+        m4compose(W, r * 16, T, t + T_POS, T, t + T_ROT, T, t + T_SCALE);
+      }
+    }
+  }
+  function composeRange(archetype, first, count) {
+    const T = archetype.columns.get(Transform.id);
+    const W = archetype.columns.get(LocalToWorld.id);
+    for (let r = first; r < first + count; r++) {
+      m4compose(W, r * 16, T, r * 10 + T_POS, T, r * 10 + T_ROT, T, r * 10 + T_SCALE);
+    }
+  }
+
+  // src/app.js
+  var App = class _App {
+    static async create(canvas, options = {}) {
+      const gpu = await createDevice(canvas, options);
+      return new _App(canvas, gpu, options);
+    }
+    constructor(canvas, gpu, options = {}) {
+      this.canvas = canvas;
+      this.device = gpu.device;
+      this.info = gpu.info;
+      this.renderer = new Renderer({ ...gpu, canvas }, options);
+      this.world = new World({ initialCapacity: options.initialCapacity ?? 4096 });
+      this.camera = new Camera({ fov: options.fov ?? 60, near: options.near ?? 0.1 });
+      this.controls = options.controls === false ? null : new OrbitControls(this.camera, canvas, options.controls ?? {});
+      this.fly = options.controls === false ? null : new FlyControls(this.camera, canvas, options.fly ?? {});
+      this.cameraMode = "orbit";
+      this.time = 0;
+      this.frame = 0;
+      this.running = false;
+      this.maxDpr = options.maxDpr ?? 2;
+      this.fixedStep = options.fixedStep ?? 0;
+      this._accumulator = 0;
+      this._onFrame = null;
+      this.world.setResource("app", this);
+      this.world.addSystem(motionSystem, { order: 10, name: "motion" });
+      this.world.addSystem(transformSystem, { order: 20, name: "transform" });
+      this._resize();
+    }
+    /* --------------------------------------------------------- resources */
+    /** app.mesh(Axion.box(1,1,1)) or app.mesh('sphere', { radius: 0.4 }) */
+    mesh(geometryOrName, args = {}) {
+      let geo = geometryOrName;
+      if (typeof geometryOrName === "string") {
+        const fn = primitives_exports[geometryOrName];
+        if (!fn) throw new Error(`axion: unknown primitive "${geometryOrName}"`);
+        geo = fn(...Array.isArray(args) ? args : Object.values(args));
+      }
+      return this.renderer.createMesh(geo);
+    }
+    material(desc) {
+      return this.renderer.createMaterial(desc);
+    }
+    /* ------------------------------------------------------------ scene  */
+    /**
+     * Add one object.
+     *   app.add({ mesh, material, position: [0,1,0], rotation: [0,0,0],
+     *             scale: 1, color: [1,0,0], velocity: [0,0,0], spin: [0,1,0],
+     *             dynamic: true })
+     */
+    add(desc = {}) {
+      const dynamic = desc.dynamic ?? !!(desc.velocity || desc.spin);
+      const comps = [Transform, LocalToWorld, Bounds, MeshRef];
+      if (desc.color) comps.push(InstanceColor);
+      if (dynamic) comps.push(Dynamic);
+      if (desc.velocity || desc.spin) comps.push(Motion);
+      if (desc.light) comps.push(PointLight);
+      if (desc.hidden) comps.push(Hidden);
+      const meshId = desc.mesh ?? 0;
+      const meshBounds = this.renderer.meshes[meshId]?.bounds ?? new Float32Array([0, 0, 0, 1]);
+      return this.world.spawn(comps, (cols, row) => {
+        const T = cols.get(Transform.id);
+        const t = row * 10;
+        const p = desc.position ?? [0, 0, 0];
+        T[t] = p[0];
+        T[t + 1] = p[1];
+        T[t + 2] = p[2];
+        if (desc.rotation) {
+          qFromEulerYXZ(T, t + T_ROT, desc.rotation[1] ?? 0, desc.rotation[0] ?? 0, desc.rotation[2] ?? 0);
+        } else qidentity(T, t + T_ROT);
+        const s = desc.scale ?? 1;
+        if (typeof s === "number") {
+          T[t + T_SCALE] = s;
+          T[t + T_SCALE + 1] = s;
+          T[t + T_SCALE + 2] = s;
+        } else {
+          T[t + T_SCALE] = s[0];
+          T[t + T_SCALE + 1] = s[1];
+          T[t + T_SCALE + 2] = s[2];
+        }
+        cols.get(Bounds.id).set(meshBounds, row * 4);
+        const R = cols.get(MeshRef.id);
+        R[row * 2 + M_MESH] = meshId;
+        R[row * 2 + M_MATERIAL] = desc.material ?? this.renderer.defaultMaterial;
+        if (desc.color) {
+          const C = cols.get(InstanceColor.id);
+          C[row * 4] = desc.color[0];
+          C[row * 4 + 1] = desc.color[1];
+          C[row * 4 + 2] = desc.color[2];
+          C[row * 4 + 3] = desc.emissive ?? 0;
+        }
+        if (desc.velocity || desc.spin) {
+          const M = cols.get(Motion.id);
+          const v = desc.velocity ?? [0, 0, 0], w = desc.spin ?? [0, 0, 0];
+          M[row * 6] = v[0];
+          M[row * 6 + 1] = v[1];
+          M[row * 6 + 2] = v[2];
+          M[row * 6 + 3] = w[0];
+          M[row * 6 + 4] = w[1];
+          M[row * 6 + 5] = w[2];
+        }
+        if (desc.light) {
+          const L = cols.get(PointLight.id);
+          const l = desc.light;
+          L[row * 5] = l.color?.[0] ?? 1;
+          L[row * 5 + 1] = l.color?.[1] ?? 1;
+          L[row * 5 + 2] = l.color?.[2] ?? 1;
+          L[row * 5 + 3] = l.intensity ?? 10;
+          L[row * 5 + 4] = l.range ?? 20;
+        }
+        if (!dynamic) {
+          m4compose(cols.get(LocalToWorld.id), row * 16, T, t + T_POS, T, t + T_ROT, T, t + T_SCALE);
+        }
+      });
+    }
+    /**
+     * Add `count` objects in one archetype-contiguous block.
+     * `fill(i, out)` writes into a reusable descriptor — no per-object garbage.
+     */
+    addMany(count, mesh2, material, fill, { dynamic = false, color = true } = {}) {
+      const comps = [Transform, LocalToWorld, Bounds, MeshRef];
+      if (color) comps.push(InstanceColor);
+      if (dynamic) comps.push(Dynamic, Motion);
+      const meshBounds = this.renderer.meshes[mesh2]?.bounds ?? new Float32Array([0, 0, 0, 1]);
+      const out = {
+        position: [0, 0, 0],
+        scale: 1,
+        color: [1, 1, 1],
+        emissive: 0,
+        velocity: [0, 0, 0],
+        spin: [0, 0, 0],
+        rotation: [0, 0, 0]
+      };
+      return this.world.spawnMany(comps, count, (cols, first) => {
+        const T = cols.get(Transform.id);
+        const W = cols.get(LocalToWorld.id);
+        const B = cols.get(Bounds.id);
+        const R = cols.get(MeshRef.id);
+        const C = color ? cols.get(InstanceColor.id) : null;
+        const M = dynamic ? cols.get(Motion.id) : null;
+        for (let i = 0; i < count; i++) {
+          const row = first + i, t = row * 10;
+          out.scale = 1;
+          out.emissive = 0;
+          fill(i, out);
+          T[t] = out.position[0];
+          T[t + 1] = out.position[1];
+          T[t + 2] = out.position[2];
+          qFromEulerYXZ(T, t + T_ROT, out.rotation[1], out.rotation[0], out.rotation[2]);
+          const s = out.scale;
+          if (typeof s === "number") {
+            T[t + 7] = s;
+            T[t + 8] = s;
+            T[t + 9] = s;
+          } else {
+            T[t + 7] = s[0];
+            T[t + 8] = s[1];
+            T[t + 9] = s[2];
+          }
+          B.set(meshBounds, row * 4);
+          R[row * 2 + M_MESH] = mesh2;
+          R[row * 2 + M_MATERIAL] = material;
+          if (C) {
+            C[row * 4] = out.color[0];
+            C[row * 4 + 1] = out.color[1];
+            C[row * 4 + 2] = out.color[2];
+            C[row * 4 + 3] = out.emissive;
+          }
+          if (M) {
+            M[row * 6] = out.velocity[0];
+            M[row * 6 + 1] = out.velocity[1];
+            M[row * 6 + 2] = out.velocity[2];
+            M[row * 6 + 3] = out.spin[0];
+            M[row * 6 + 4] = out.spin[1];
+            M[row * 6 + 5] = out.spin[2];
+          }
+          if (!dynamic) m4compose(W, row * 16, T, t, T, t + T_ROT, T, t + T_SCALE);
+        }
+      });
+    }
+    light(position, { color = [1, 1, 1], intensity = 20, range = 30 } = {}) {
+      return this.world.spawn([Transform, PointLight], (cols, row) => {
+        const T = cols.get(Transform.id);
+        T[row * 10] = position[0];
+        T[row * 10 + 1] = position[1];
+        T[row * 10 + 2] = position[2];
+        qidentity(T, row * 10 + T_ROT);
+        T[row * 10 + 7] = 1;
+        T[row * 10 + 8] = 1;
+        T[row * 10 + 9] = 1;
+        const L = cols.get(PointLight.id);
+        L[row * 5] = color[0];
+        L[row * 5 + 1] = color[1];
+        L[row * 5 + 2] = color[2];
+        L[row * 5 + 3] = intensity;
+        L[row * 5 + 4] = range;
+      });
+    }
+    /* ------------------------------------------------------------ loop   */
+    onFrame(fn) {
+      this._onFrame = fn;
+      return this;
+    }
+    _resize() {
+      if (resizeCanvas(this.canvas, this.maxDpr) || this.camera.aspect === 1) {
+        this.camera.aspect = this.canvas.width / this.canvas.height;
+        this.camera.update();
+      }
+    }
+    start() {
+      if (this.running) return this;
+      this.running = true;
+      let last = performance.now();
+      const tick = (now) => {
+        if (!this.running) return;
+        const dt = Math.min((now - last) / 1e3, 0.1);
+        last = now;
+        this.time += dt;
+        this.frame++;
+        this._resize();
+        if (this.cameraMode === "fly") this.fly?.update(dt);
+        else this.controls?.update(dt);
+        if (this.fixedStep > 0) {
+          this._accumulator += dt;
+          let guard = 8;
+          while (this._accumulator >= this.fixedStep && guard-- > 0) {
+            this.world.step(this.fixedStep, this.profile);
+            this._accumulator -= this.fixedStep;
+          }
+        } else {
+          this.world.step(dt, this.profile);
+        }
+        this._onFrame?.(dt, this);
+        this.renderer.render(this.world, this.camera, this.time);
+        this._raf = requestAnimationFrame(tick);
+      };
+      this._raf = requestAnimationFrame(tick);
+      return this;
+    }
+    /**
+     * Switch between orbit and free-fly. The incoming controller adopts the
+     * camera's current placement, so the view never jumps on a toggle.
+     */
+    setCameraMode(mode) {
+      if (mode === this.cameraMode) return this;
+      this.cameraMode = mode;
+      if (mode === "fly") this.fly?.syncFromCamera().setEnabled(true);
+      else this.fly?.setEnabled(false);
+      return this;
+    }
+    stop() {
+      this.running = false;
+      cancelAnimationFrame(this._raf);
+      return this;
+    }
+    get stats() {
+      return this.renderer.stats;
+    }
+    dispose() {
+      this.stop();
+      this.controls?.dispose();
+      this.fly?.dispose();
+      this.renderer.destroy();
+    }
+  };
+
+  // src/index.js
+  var VERSION = "0.2.0";
+  return __toCommonJS(index_exports);
+})();

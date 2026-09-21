@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<!--
+  Axion on Khan Academy.
+
+  Paste this whole file into a KA "Webpage with HTML/JS" program.
+
+  Two things to know before you do:
+
+  1. Khan Academy enforces a Content Security Policy that only permits scripts
+     from an allow-list of CDNs. jsDelivr is on it for JavaScript (it is NOT
+     for CSS — use cdnjs if you ever need a stylesheet). So the script tag
+     below is the supported shape: one JS file, from jsDelivr, no modules.
+
+  2. Axion is WebGPU-only. KA programs run inside a sandboxed iframe, and
+     whether WebGPU is reachable there depends on the browser and on KA's
+     iframe permissions. The check below tells you in one line instead of
+     leaving you with a black canvas. If it reports no WebGPU, nothing in this
+     file will help — that is a platform limit, not a bug in the engine.
+
+  The URL below is pinned to a release tag. Always pin: @main is served with a
+  short cache and can change under you mid-session.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Axion on KA</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #070a0f; overflow: hidden; }
+      canvas { display: block; width: 100%; height: 100%; }
+      #msg {
+        position: fixed; inset: 0; display: none; place-content: center;
+        padding: 24px; color: #6d8098; background: #070a0f;
+        font: 13px/1.7 ui-monospace, Menlo, monospace; text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="gpu"></canvas>
+    <div id="msg"></div>
+
+    <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.2.0/dist/axion.min.js"></script>
+    <script>
+      (async function () {
+        var canvas = document.getElementById('gpu');
+        var msg = document.getElementById('msg');
+
+        function fail(text) {
+          msg.textContent = text;
+          msg.style.display = 'grid';
+        }
+
+        if (typeof Axion === 'undefined') {
+          return fail('The Axion bundle did not load. Check the jsDelivr URL, ' +
+                      'and that the tag and path exist in the repository.');
+        }
+        if (!navigator.gpu) {
+          return fail('This browser or frame has no WebGPU. Axion needs it. ' +
+                      'Try Chrome or Edge 113+, or Safari 18+.');
+        }
+
+        var app;
+        try {
+          app = await Axion.App.create(canvas, {
+            ambient: [0.05, 0.062, 0.088],
+            fogDensity: 0.0075,
+            shadows: { maxLights: 3, size: 512 },
+            bloom: { threshold: 1.1, strength: 0.45 },
+            controls: { distance: 16, autoRotate: 0.08 }
+          });
+        } catch (err) {
+          return fail('WebGPU is present but the device could not start: ' + err.message);
+        }
+
+        var floor = app.mesh(Axion.plane(1200, 1200, 1, 1));
+        var block = app.mesh(Axion.roundedBox(3, 3, 3, 0.22, 8));
+        var bulb = app.mesh(Axion.icosphere(0.5, 2));
+
+        var slate = app.material({
+          color: [0.03, 0.037, 0.048], metallic: 0.5, roughness: 0.1, castShadow: false
+        });
+        var steel = app.material({
+          color: [0.74, 0.66, 0.55], metallic: 0.95, roughness: 0.3,
+          noiseScale: 1.6, noiseStrength: 0.75, bump: 0.42, oxide: 0.5
+        });
+        // An emitter sits inside its own light, so it must not cast shadows —
+        // it would render into that light's cube map and black out the scene.
+        var emitter = app.material({ color: [1, 1, 1], castShadow: false });
+
+        app.add({ mesh: floor, material: slate, position: [0, -2, 0] });
+        app.add({ mesh: block, material: steel, spin: [0, 0.3, 0], dynamic: true });
+
+        var COUNT = 4;
+        for (var i = 0; i < COUNT; i++) {
+          var a = (i / COUNT) * Math.PI * 2;
+          var p = [Math.cos(a) * 6, 3, Math.sin(a) * 6];
+          var c = [0.6 + 0.4 * Math.cos(a), 0.45 + 0.35 * Math.cos(a + 2.1), 0.7];
+          app.light(p, { color: c, intensity: 260, range: 34 });
+          app.add({ mesh: bulb, material: emitter, position: p, scale: 0.3,
+                    color: c, emissive: 9 });
+        }
+
+        app.start();
+      })();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,171 @@
+<!doctype html><meta charset="utf-8"><canvas id="c" width="420" height="280"></canvas>
+<script type="module">
+import * as AX from '../src/index.js';
+const out = { ok: false, steps: [], errors: [] };
+window.__result = out;
+try {
+  const canvas = document.getElementById('c');
+  const gpu = await AX.createDevice(canvas);
+  out.steps.push('device');
+
+  for (const [name, code] of [['standard', AX.STANDARD_WGSL], ['shadow', AX.SHADOW_WGSL],
+                              ['ao', AX.AO_WGSL], ['aoBlur', AX.AO_BLUR_WGSL],
+                              ['resolve', AX.RESOLVE_WGSL],
+                              ['bloomPrefilter', AX.BLOOM_PREFILTER_WGSL],
+                              ['bloomDown', AX.BLOOM_DOWN_WGSL], ['bloomUp', AX.BLOOM_UP_WGSL],
+                              ['final', AX.FINAL_WGSL]]) {
+    const mod = gpu.device.createShaderModule({ code });
+    const info = await mod.getCompilationInfo();
+    const bad = info.messages.filter((m) => m.type === 'error');
+    for (const m of bad) out.errors.push(`${name}:${m.lineNum}:${m.linePos} ${m.message}`);
+    out.steps.push(`compile ${name}: ${bad.length ? 'FAIL' : 'ok'} (${info.messages.length} msgs)`);
+  }
+
+  gpu.device.pushErrorScope('validation');
+  const app = new AX.App(canvas, gpu, {
+    controls: false,
+    ssr: { intensity: 1, steps: 24, thickness: 0.6, maxDistance: 40 },
+    shadows: { maxLights: 2, size: 256, pcfRadius: 1.6 },
+    ao: { intensity: 1.0, radius: 1.0, power: 1.5 },
+    bloom: { threshold: 1.1, knee: 0.65, strength: 0.45 },
+    
+    ambient: [0.06, 0.075, 0.10], exposure: 1.0, fogDensity: 0.02,
+  });
+  out.steps.push('app');
+
+  const block = app.mesh(AX.roundedBox(2.4, 2.4, 2.4, 0.16, 6));
+  const pillar = app.mesh(AX.roundedBox(0.55, 1.7, 0.55, 0.07, 4));
+  const ball = app.mesh(AX.icosphere(0.5, 2));
+  const floor = app.mesh(AX.plane(900, 900, 1, 1));
+
+  const weathered = app.material({ color: [0.74, 0.66, 0.55], metallic: 0.95, roughness: 0.3,
+    noiseScale: 2.2, noiseStrength: 0.75, bump: 0.42, oxide: 0.55 });
+  const stone = app.material({ color: [0.32, 0.31, 0.30], metallic: 0.0, roughness: 0.82,
+    noiseScale: 5.0, noiseStrength: 0.85, bump: 0.7, oxide: 0.18 });
+  const slate = app.material({ color: [0.03, 0.037, 0.048], metallic: 0.5, roughness: 0.1,
+    castShadow: false });
+  const emit = app.material({ color: [1, 1, 1], castShadow: false });
+
+  app.add({ mesh: floor, material: slate, position: [0, -1.5, 0] });
+  app.add({ mesh: block, material: weathered, position: [0, -0.3, 0], rotation: [0, 0.4, 0] });
+  for (let i = 0; i < 5; i++) {
+    const a = (i / 5) * Math.PI * 2 + 0.4;
+    app.add({ mesh: pillar, material: stone, rotation: [0, a, 0],
+      position: [Math.cos(a) * 3.4, -0.65, Math.sin(a) * 3.4] });
+  }
+  app.add({ mesh: ball, material: weathered, position: [1.4, -1.0, 2.2], scale: 1.0 });
+
+  for (const [x, y, z, r, g, b] of [[3.2, 2.6, 1.0, 1, 0.72, 0.45], [-3.0, 2.2, 2.4, 0.4, 0.7, 1]]) {
+    app.light([x, y, z], { color: [r, g, b], intensity: 190, range: 26 });
+    app.add({ mesh: ball, material: emit, position: [x, y, z], scale: 0.32,
+      color: [r, g, b], emissive: 8 });
+  }
+  out.steps.push('scene');
+
+  app.camera.position[0] = 4.6; app.camera.position[1] = 2.9; app.camera.position[2] = 7.2;
+  app.camera.target[1] = -0.4;
+  app.camera.aspect = 420 / 280;
+  app.camera.update();
+
+  for (let i = 0; i < 3; i++) {
+    app.world.step(1 / 60);
+    app.renderer.render(app.world, app.camera, i / 60);
+  }
+  await gpu.device.queue.onSubmittedWorkDone();
+  out.steps.push('rendered 3 frames');
+
+  // Measured checks: a pass that silently returns a no-op value compiles,
+  // validates and renders perfectly. Only reading the pixels back catches it.
+  const half = (h) => {
+    const sign = (h & 0x8000) ? -1 : 1;
+    const exp = (h >> 10) & 0x1f;
+    const frac = h & 0x3ff;
+    if (exp === 0) return sign * Math.pow(2, -14) * (frac / 1024);
+    if (exp === 31) return frac ? NaN : sign * Infinity;
+    return sign * Math.pow(2, exp - 15) * (1 + frac / 1024);
+  };
+
+  async function readMean(texture, channels) {
+    const w = texture.width, h = texture.height;
+    const bpp = channels * 2;                       // f16 per channel
+    const bytesPerRow = Math.ceil((w * bpp) / 256) * 256;
+    const buf = gpu.device.createBuffer({
+      size: bytesPerRow * h,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const enc = gpu.device.createCommandEncoder();
+    enc.copyTextureToBuffer({ texture }, { buffer: buf, bytesPerRow }, [w, h, 1]);
+    gpu.device.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const view = new Uint16Array(buf.getMappedRange());
+    let sum = 0, n = 0, min = Infinity;
+    for (let y = 0; y < h; y++) {
+      const row = (y * bytesPerRow) / 2;
+      for (let x = 0; x < w; x++) {
+        const o = row + x * channels;
+        const v = channels === 1 ? half(view[o])
+          : 0.2126 * half(view[o]) + 0.7152 * half(view[o + 1]) + 0.0722 * half(view[o + 2]);
+        sum += v; if (v < min) min = v;
+        n++;
+      }
+    }
+    buf.unmap(); buf.destroy();
+    return { mean: sum / n, min };
+  }
+
+  const frame = async () => {
+    app.renderer.render(app.world, app.camera, 1.0);
+    await gpu.device.queue.onSubmittedWorkDone();
+  };
+
+  app.renderer.bloom.strength = 0;
+  app.renderer.ao.intensity = 0;
+  await frame();
+  const aoOff = await readMean(app.renderer._targets.aoBlur, 1);
+  const hdrNoAO = (await readMean(app.renderer._targets.hdr, 4)).mean;
+
+  app.renderer.ao.intensity = 3; app.renderer.ao.radius = 3;
+  await frame();
+  const aoOn = await readMean(app.renderer._targets.aoBlur, 1);
+  const hdrWithAO = (await readMean(app.renderer._targets.hdr, 4)).mean;
+  app.renderer.ao.intensity = 1; app.renderer.ao.radius = 1.6;
+
+  app.renderer.shadows.enabled = false;
+  await frame();
+  const hdrNoShadow = (await readMean(app.renderer._targets.hdr, 4)).mean;
+  app.renderer.shadows.enabled = true;
+  await frame();
+  const hdrWithShadow = (await readMean(app.renderer._targets.hdr, 4)).mean;
+
+  app.renderer.bloom.strength = 0.5;
+  await frame();
+  const bloomMean = (await readMean(app.renderer._targets.bloom[0].tex, 4)).mean;
+
+  const r = (v) => +v.toFixed(4);
+  out.measured = {
+    aoMeanOff: r(aoOff.mean), aoMeanOn: r(aoOn.mean),
+    aoMinOff: r(aoOff.min), aoMinOn: r(aoOn.min),
+    hdrNoAO: r(hdrNoAO), hdrWithAO: r(hdrWithAO),
+    hdrNoShadow: r(hdrNoShadow), hdrWithShadow: r(hdrWithShadow),
+    bloomMean: r(bloomMean),
+  };
+  // Most of a frame is unoccluded, so the mean barely moves. What proves the
+  // pass works is that the darkest pixel actually gets dark.
+  if (!(aoOff.min > 0.98)) out.errors.push(`AO buffer not ~1 when disabled (min ${r(aoOff.min)})`);
+  if (!(aoOn.min < 0.5)) out.errors.push(`AO pass did not occlude (min ${r(aoOn.min)})`);
+  if (!(aoOn.mean < aoOff.mean)) out.errors.push('AO did not darken on average');
+  if (!(hdrWithAO <= hdrNoAO)) out.errors.push('AO did not darken the resolved frame');
+  if (!(hdrWithShadow < hdrNoShadow)) out.errors.push('shadows did not darken the frame');
+  if (!(bloomMean > 0.001)) out.errors.push('bloom chain produced nothing');
+
+  const err = await gpu.device.popErrorScope();
+  if (err) out.errors.push('validation: ' + err.message);
+
+  out.stats = { ...app.renderer.stats };
+  out.ok = out.errors.length === 0;
+  out.done = true;
+} catch (e) {
+  out.errors.push(String(e && e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : e));
+  out.done = true;
+}
+</script>

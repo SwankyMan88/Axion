@@ -1,0 +1,564 @@
+<title>Axion Light Study</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<style>
+  /* Single committed look: an engine viewport is a dark instrument, not a document. */
+  :root {
+    --ground: #070a0f;
+    --panel: rgba(13, 19, 27, 0.84);
+    --panel-solid: #0d131b;
+    --hairline: #1d2836;
+    --ink: #c9d5e2;
+    --ink-dim: #6d8098;
+    --amber: #f2a33c;
+    --teal: #4fb6c6;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    --sans: "Archivo", system-ui, -apple-system, "Segoe UI", sans-serif;
+    color-scheme: dark;
+  }
+
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    overflow: hidden;
+  }
+
+  #stage { position: fixed; inset: 0; }
+  #gpu { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+  #gpu:active { cursor: grabbing; }
+  body.flying #gpu { cursor: crosshair; }
+
+  .chrome { position: fixed; display: flex; flex-direction: column; gap: 10px; pointer-events: none; }
+  .chrome > * { pointer-events: auto; }
+
+  #masthead {
+    top: calc(14px + env(safe-area-inset-top, 0px));
+    left: 14px;
+    max-width: min(330px, calc(100vw - 28px));
+  }
+
+  .wordmark {
+    display: flex; align-items: baseline; gap: 10px;
+    font-weight: 700; font-size: 20px; letter-spacing: -0.01em;
+  }
+  .wordmark b { color: var(--amber); font-weight: 700; }
+  .wordmark span {
+    font-family: var(--mono); font-size: 11px; color: var(--ink-dim);
+    letter-spacing: 0.08em; text-transform: uppercase;
+  }
+  .tagline { margin: 0; font-family: var(--mono); font-size: 11.5px; line-height: 1.6; color: var(--ink-dim); }
+
+  .panel {
+    background: var(--panel);
+    backdrop-filter: blur(14px);
+    border: 1px solid var(--hairline);
+    border-radius: 3px;
+    padding: 12px 13px;
+  }
+
+  .panel h2 {
+    margin: 0 0 9px;
+    font-family: var(--mono); font-size: 10px; font-weight: 700;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-dim);
+  }
+  .panel h2 + .field { margin-top: 0; }
+
+  #telemetry { min-width: 226px; }
+  .readout {
+    display: grid; grid-template-columns: 1fr auto; gap: 2px 12px;
+    font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums;
+  }
+  .readout dt { color: var(--ink-dim); }
+  .readout dd { margin: 0; text-align: right; color: var(--ink); }
+  .readout dd.hot { color: var(--amber); }
+  .readout .rule { grid-column: 1 / -1; height: 1px; background: var(--hairline); margin: 6px 0; }
+
+  #graph {
+    display: block; width: 100%; height: 40px; margin-top: 9px;
+    border: 1px solid var(--hairline); border-radius: 2px; background: #090e15;
+  }
+  .graph-key {
+    display: flex; justify-content: space-between;
+    font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.06em;
+    color: var(--ink-dim); margin-top: 4px; text-transform: uppercase;
+  }
+
+  #console {
+    bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+    right: 14px;
+    width: min(262px, calc(100vw - 28px));
+    max-height: calc(100vh - 28px);
+    overflow-y: auto;
+  }
+
+  .field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px; }
+  .field:last-child { margin-bottom: 0; }
+  .field-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-family: var(--mono); font-size: 11px;
+  }
+  .field-head label { color: var(--ink-dim); letter-spacing: 0.04em; }
+  .field-head output { color: var(--amber); font-variant-numeric: tabular-nums; }
+
+  input[type="range"] {
+    -webkit-appearance: none; appearance: none;
+    width: 100%; height: 3px; background: var(--hairline);
+    border-radius: 2px; outline-offset: 4px;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 13px; height: 13px; border-radius: 50%;
+    background: var(--amber); border: none; cursor: pointer;
+  }
+  input[type="range"]::-moz-range-thumb {
+    width: 13px; height: 13px; border-radius: 50%;
+    background: var(--amber); border: none; cursor: pointer;
+  }
+  input[type="range"]:focus-visible { outline: 2px solid var(--teal); }
+
+  .switches { display: flex; flex-wrap: wrap; gap: 6px; }
+  .switch {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.05em;
+    text-transform: uppercase; padding: 5px 9px; border-radius: 2px; cursor: pointer;
+    background: transparent; color: var(--ink-dim); border: 1px solid var(--hairline);
+  }
+  .switch[aria-pressed="true"] { color: var(--ground); background: var(--amber); border-color: var(--amber); }
+  .switch:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+
+  .divider { height: 1px; background: var(--hairline); margin: 11px 0; }
+  .hint { margin: 10px 0 0; font-family: var(--mono); font-size: 10px; line-height: 1.6; color: var(--ink-dim); }
+  .hint b { color: var(--ink); font-weight: 500; }
+
+  #fallback { position: fixed; inset: 0; display: none; place-content: center; padding: 24px; }
+  #fallback.show { display: grid; }
+  #fallback div { max-width: 46ch; }
+  #fallback h1 { font-size: 22px; margin: 0 0 10px; }
+  #fallback p { font-family: var(--mono); font-size: 12.5px; line-height: 1.7; color: var(--ink-dim); }
+  #fallback code { color: var(--amber); }
+
+  @media (max-width: 760px) {
+    #masthead { max-width: calc(100vw - 28px); }
+    .tagline, #graph, .graph-key { display: none; }
+    #telemetry { min-width: 0; }
+    #console { width: calc(100vw - 28px); max-height: 44vh; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .panel { backdrop-filter: none; background: var(--panel-solid); }
+  }
+</style>
+
+<div id="stage"><canvas id="gpu"></canvas></div>
+
+<div class="chrome" id="masthead">
+  <div class="wordmark">Axion<b>·</b><span>light study</span></div>
+  <p class="tagline">Cube-map shadows, horizon occlusion, screen-space reflections and bloom — six passes over an archetype ECS.</p>
+  <section class="panel" id="telemetry">
+    <h2>Frame telemetry</h2>
+    <dl class="readout">
+      <dt>lights</dt><dd id="r-lights">—</dd>
+      <dt>shadow casters</dt><dd id="r-casters">—</dd>
+      <dt>shadow draws</dt><dd id="r-sdraws">—</dd>
+      <dt>drawn</dt><dd id="r-drawn">—</dd>
+      <dt>triangles</dt><dd id="r-tris">—</dd>
+      <dt>passes</dt><dd id="r-draws">—</dd>
+      <div class="rule"></div>
+      <dt>frame</dt><dd id="r-frame" class="hot">—</dd>
+      <dt>cpu submit</dt><dd id="r-cpu">—</dd>
+      <dt>fps</dt><dd id="r-fps">—</dd>
+    </dl>
+    <canvas id="graph" width="440" height="80"></canvas>
+    <div class="graph-key"><span>frame ms</span><span id="r-peak">peak —</span></div>
+  </section>
+</div>
+
+<div class="chrome" id="console">
+  <section class="panel">
+    <h2>Light ring</h2>
+    <div class="field">
+      <div class="field-head"><label for="lights">count</label><output id="lights-out" for="lights">6</output></div>
+      <input id="lights" type="range" min="1" max="16" step="1" value="6">
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="speed">orbit speed</label><output id="speed-out" for="speed">0.40</output></div>
+      <input id="speed" type="range" min="0" max="1.5" step="0.05" value="0.4">
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="radius">ring radius</label><output id="radius-out" for="radius">9.0 m</output></div>
+      <input id="radius" type="range" min="4" max="18" step="0.5" value="9">
+    </div>
+
+    <div class="divider"></div>
+    <h2>Shadows</h2>
+    <div class="field">
+      <div class="field-head"><label for="shadowlights">shadow casters</label><output id="shadowlights-out" for="shadowlights">4</output></div>
+      <input id="shadowlights" type="range" min="0" max="4" step="1" value="4">
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="softness">softness</label><output id="softness-out" for="softness">1.6</output></div>
+      <input id="softness" type="range" min="0" max="5" step="0.1" value="1.6">
+    </div>
+
+    <div class="divider"></div>
+    <h2>Surface &amp; resolve</h2>
+    <div class="field">
+      <div class="field-head"><label for="wear">weathering</label><output id="wear-out" for="wear">0.55</output></div>
+      <input id="wear" type="range" min="0" max="1" step="0.05" value="0.55">
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="aoi">occlusion</label><output id="aoi-out" for="aoi">1.00</output></div>
+      <input id="aoi" type="range" min="0" max="2.5" step="0.05" value="1">
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="ssr">reflections</label><output id="ssr-out" for="ssr">1.00</output></div>
+      <input id="ssr" type="range" min="0" max="1" step="0.05" value="1">
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="bloom">bloom</label><output id="bloom-out" for="bloom">0.45</output></div>
+      <input id="bloom" type="range" min="0" max="1.5" step="0.05" value="0.45">
+    </div>
+    <div class="field">
+      <div class="field-head"><label>toggles</label></div>
+      <div class="switches">
+        <button class="switch" id="t-fly" type="button" aria-pressed="false">fly</button>
+        <button class="switch" id="t-fxaa" type="button" aria-pressed="true">fxaa</button>
+        <button class="switch" id="t-fog" type="button" aria-pressed="true">fog</button>
+        <button class="switch" id="t-spin" type="button" aria-pressed="true">spin</button>
+      </div>
+    </div>
+    <p class="hint" id="hint">Drag to orbit · wheel to zoom · shift-drag to pan</p>
+  </section>
+</div>
+
+<div id="fallback">
+  <div>
+    <h1>This browser has no WebGPU</h1>
+    <p id="fallback-msg">Axion is WebGPU-only on purpose. Open this page in Chrome or Edge 113+, Safari 18+, or Firefox with <code>dom.webgpu.enabled</code> set.</p>
+  </div>
+</div>
+
+<script type="module">
+import * as AX from './src/index.js';
+
+const canvas = document.getElementById('gpu');
+const fallback = document.getElementById('fallback');
+const el = (id) => document.getElementById(id);
+const fmt = new Intl.NumberFormat('en-US');
+
+let app = null;
+const MESH = {};
+const MAT = {};
+const ring = { count: 6, speed: 0.4, radius: 9, height: 4.2 };
+
+/**
+ * Orbit is a component, not a callback.
+ *
+ * radius, angular speed, phase, height — four floats per entity in one packed
+ * column. Lights and their visible emitters share the component, so a single
+ * loop over one archetype moves both and they can never drift apart.
+ */
+const Orbit = AX.defineComponent('Orbit', 'f32', 4);
+
+function orbitSystem(world) {
+  const t = world.getResource('app').time;
+  for (const a of world.query([AX.Transform, Orbit])) {
+    const T = a.columns.get(AX.Transform.id);
+    const O = a.columns.get(Orbit.id);
+    for (let r = 0; r < a.count; r++) {
+      const o = r * 4;
+      const angle = O[o + 2] + t * O[o + 1];
+      T[r * 10]     = Math.cos(angle) * O[o];
+      // A vertical wobble, phase-shifted per light, so the shadows sweep and
+      // stretch instead of sliding around as one rigid band.
+      T[r * 10 + 1] = O[o + 3] + Math.sin(angle * 2 + O[o + 2]) * 1.6;
+      T[r * 10 + 2] = Math.sin(angle) * O[o];
+    }
+  }
+}
+
+/* ------------------------------------------------------------- scene ---- */
+
+let lightEntities = [];
+
+function buildRing() {
+  for (const e of lightEntities) app.world.destroy(e);
+  lightEntities = [];
+
+  for (let i = 0; i < ring.count; i++) {
+    const phase = (i / ring.count) * Math.PI * 2;
+    const hue = i / Math.max(1, ring.count);
+    const color = [
+      0.58 + 0.42 * Math.cos(hue * 6.283),
+      0.44 + 0.36 * Math.cos(hue * 6.283 + 2.1),
+      0.64 + 0.36 * Math.cos(hue * 6.283 + 4.2),
+    ];
+
+    lightEntities.push(app.world.spawn([AX.Transform, AX.PointLight, Orbit], (cols, row) => {
+      const T = cols.get(AX.Transform.id);
+      T[row * 10 + 6] = 1;
+      T[row * 10 + 7] = 1; T[row * 10 + 8] = 1; T[row * 10 + 9] = 1;
+      const L = cols.get(AX.PointLight.id);
+      L[row * 5] = color[0]; L[row * 5 + 1] = color[1]; L[row * 5 + 2] = color[2];
+      L[row * 5 + 3] = 300;     // intensity
+      L[row * 5 + 4] = 42;      // range — also the shadow map's far plane
+      const O = cols.get(Orbit.id);
+      O[row * 4] = ring.radius; O[row * 4 + 1] = ring.speed;
+      O[row * 4 + 2] = phase; O[row * 4 + 3] = ring.height;
+    }));
+
+    // A visible emitter riding the same orbit. It is excluded from shadow
+    // casting by its material — a bulb sitting inside its own light would
+    // otherwise render into that light's cube map and black out the scene.
+    lightEntities.push(app.world.spawn(
+      [AX.Transform, AX.LocalToWorld, AX.Bounds, AX.MeshRef, AX.InstanceColor, AX.Dynamic, Orbit],
+      (cols, row) => {
+        const T = cols.get(AX.Transform.id);
+        T[row * 10 + 6] = 1;
+        T[row * 10 + 7] = 0.3; T[row * 10 + 8] = 0.3; T[row * 10 + 9] = 0.3;
+        cols.get(AX.Bounds.id).set(app.renderer.meshes[MESH.bulb].bounds, row * 4);
+        const R = cols.get(AX.MeshRef.id);
+        R[row * 2] = MESH.bulb; R[row * 2 + 1] = MAT.bulb;
+        const C = cols.get(AX.InstanceColor.id);
+        C[row * 4] = color[0]; C[row * 4 + 1] = color[1]; C[row * 4 + 2] = color[2];
+        C[row * 4 + 3] = 9;     // emissive — this is what bloom picks up
+        const O = cols.get(Orbit.id);
+        O[row * 4] = ring.radius; O[row * 4 + 1] = ring.speed;
+        O[row * 4 + 2] = phase; O[row * 4 + 3] = ring.height;
+      }));
+  }
+}
+
+function buildScene() {
+  app.add({ mesh: MESH.floor, material: MAT.floor, position: [0, -3.2, 0] });
+
+  // The subject.
+  app.add({
+    mesh: MESH.block, material: MAT.weathered, position: [0, 0, 0],
+    rotation: [0, 0.38, 0], spin: [0, 0.13, 0], dynamic: true,
+  });
+
+  // Companions at different scales: the grain is evaluated in world space, so
+  // a small block shows fine detail and a large one shows coarse — the same
+  // material, reading as the same physical surface at both sizes.
+  app.add({
+    mesh: MESH.block, material: MAT.weathered, position: [-5.6, -2.05, 3.2],
+    scale: 0.44, rotation: [0.2, -0.5, 0.1], spin: [0, -0.2, 0], dynamic: true,
+  });
+  app.add({
+    mesh: MESH.block, material: MAT.polished, position: [5.3, -2.3, -2.5],
+    scale: 0.34, rotation: [0, 0.9, 0], spin: [0.08, 0.26, 0], dynamic: true,
+  });
+
+  // Low pillars: static geometry whose only job is to catch the sweeping
+  // shadows and give the occlusion pass real corners to darken.
+  const ring2 = 7.4;
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * Math.PI * 2 + 0.5;
+    app.add({
+      mesh: MESH.pillar, material: MAT.stone,
+      position: [Math.cos(a) * ring2, -2.35, Math.sin(a) * ring2],
+      rotation: [0, a, 0], scale: [1, 0.8 + (i % 3) * 0.35, 1],
+    });
+  }
+
+  app.add({ mesh: MESH.ball, material: MAT.polished, position: [1.9, -2.35, 4.4], scale: 1.7 });
+  app.add({ mesh: MESH.ball, material: MAT.stone, position: [-2.6, -2.6, -4.2], scale: 1.15 });
+
+  buildRing();
+}
+
+/* -------------------------------------------------------------- graph --- */
+
+const history = new Float32Array(160);
+let historyHead = 0;
+const graph = el('graph');
+const gctx = graph.getContext('2d');
+
+function drawGraph() {
+  const w = graph.width, h = graph.height;
+  gctx.clearRect(0, 0, w, h);
+
+  let peak = 8;
+  for (let i = 0; i < history.length; i++) peak = Math.max(peak, history[i]);
+
+  const budgetY = h - (16.7 / peak) * h;
+  gctx.strokeStyle = 'rgba(109,128,152,0.45)';
+  gctx.setLineDash([3, 4]);
+  gctx.beginPath(); gctx.moveTo(0, budgetY); gctx.lineTo(w, budgetY); gctx.stroke();
+  gctx.setLineDash([]);
+
+  gctx.beginPath();
+  for (let i = 0; i < history.length; i++) {
+    const v = history[(historyHead + i) % history.length];
+    const x = (i / (history.length - 1)) * w;
+    const y = h - (v / peak) * h;
+    if (i === 0) gctx.moveTo(x, y); else gctx.lineTo(x, y);
+  }
+  gctx.strokeStyle = '#f2a33c';
+  gctx.lineWidth = 1.5;
+  gctx.stroke();
+
+  gctx.lineTo(w, h); gctx.lineTo(0, h); gctx.closePath();
+  gctx.fillStyle = 'rgba(242,163,60,0.13)';
+  gctx.fill();
+
+  el('r-peak').textContent = `peak ${peak.toFixed(1)}ms`;
+}
+
+/* --------------------------------------------------------------- boot --- */
+
+async function boot() {
+  try {
+    app = await AX.App.create(canvas, {
+      clearColor: [0.014, 0.018, 0.026, 1],
+      ambient: [0.048, 0.060, 0.086],
+      groundAmbient: 0.26,
+      fogDensity: 0.0075,
+      fogColor: [0.016, 0.021, 0.030],
+      exposure: 1.05,
+      ssr: { intensity: 1.0, steps: 52, thickness: 0.7, maxDistance: 80, fadeDistance: 95 },
+      ao: { intensity: 1.0, radius: 1.9, power: 1.5, fadeDistance: 60 },
+      bloom: { threshold: 1.1, knee: 0.65, strength: 0.45 },
+      shadows: { maxLights: 4, size: 768, pcfRadius: 1.6 },
+      controls: { distance: 21, azimuth: 0.85, polar: 1.18, minDistance: 3, maxDistance: 140, autoRotate: 0.05 },
+      fly: { speed: 10, position: [0, 3, 20] },
+    });
+  } catch (err) {
+    fallback.classList.add('show');
+    if (err && err.message) el('fallback-msg').textContent = err.message;
+    el('masthead').style.display = 'none';
+    el('console').style.display = 'none';
+    return;
+  }
+
+  app.world.addSystem(orbitSystem, { order: 5, name: 'orbit' });
+
+  MESH.block = app.mesh(AX.roundedBox(5.0, 5.0, 5.0, 0.32, 10));
+  MESH.pillar = app.mesh(AX.roundedBox(1.15, 3.4, 1.15, 0.14, 5));
+  MESH.ball = app.mesh(AX.icosphere(0.55, 3));
+  // Large enough that fog swallows its edge long before it is visible —
+  // a finite ground plane is what puts a hard line across the distance.
+  MESH.floor = app.mesh(AX.plane(1600, 1600, 1, 1));
+  MESH.bulb = app.mesh(AX.icosphere(0.5, 2));
+
+  MAT.weathered = app.material({
+    name: 'weathered-steel',
+    color: [0.74, 0.66, 0.55], metallic: 0.95, roughness: 0.3,
+    noiseScale: 1.1, noiseStrength: 0.75, bump: 0.42, oxide: 0.55,
+  });
+  MAT.polished = app.material({
+    name: 'polished-steel',
+    color: [0.85, 0.87, 0.9], metallic: 1.0, roughness: 0.14,
+    noiseScale: 3.2, noiseStrength: 0.2, bump: 0.1, oxide: 0.04,
+  });
+  MAT.stone = app.material({
+    name: 'cast-stone',
+    color: [0.32, 0.31, 0.30], metallic: 0.0, roughness: 0.82,
+    noiseScale: 2.6, noiseStrength: 0.85, bump: 0.7, oxide: 0.18,
+  });
+  MAT.floor = app.material({
+    name: 'wet-slate',
+    color: [0.030, 0.037, 0.048], metallic: 0.5, roughness: 0.1,
+    castShadow: false,     // a flat floor has nothing to cast
+  });
+  MAT.bulb = app.material({
+    name: 'emitter', color: [1, 1, 1], metallic: 0, roughness: 1,
+    castShadow: false,     // see buildRing()
+  });
+
+  buildScene();
+
+  let fpsAccum = 0, fpsFrames = 0, fps = 0, last = performance.now();
+
+  app.onFrame(() => {
+    const now = performance.now();
+    const frameMs = now - last;
+    last = now;
+
+    history[historyHead] = frameMs;
+    historyHead = (historyHead + 1) % history.length;
+
+    fpsAccum += frameMs / 1000; fpsFrames++;
+    if (fpsAccum >= 0.25) { fps = fpsFrames / fpsAccum; fpsAccum = 0; fpsFrames = 0; }
+
+    if (app.frame % 6 === 0) {
+      const s = app.stats;
+      el('r-lights').textContent = `${ring.count} (${s.shadowLights} shadowed)`;
+      el('r-casters').textContent = fmt.format(s.shadowCasters);
+      el('r-sdraws').textContent = fmt.format(s.shadowDraws);
+      el('r-drawn').textContent = fmt.format(s.instances);
+      el('r-tris').textContent = fmt.format(Math.round(s.triangles));
+      el('r-draws').textContent = fmt.format(s.drawCalls);
+      el('r-frame').textContent = `${frameMs.toFixed(1)} ms`;
+      el('r-cpu').textContent = `${s.cpuMs.toFixed(2)} ms`;
+      el('r-fps').textContent = fps.toFixed(0);
+      drawGraph();
+    }
+  });
+
+  app.start();
+}
+
+/* ------------------------------------------------------------ controls -- */
+
+const slider = (id, format, apply) => {
+  const input = el(id), out = el(`${id}-out`);
+  input.addEventListener('input', () => {
+    const v = +input.value;
+    out.textContent = format(v);
+    if (app) apply(v);
+  });
+};
+
+const eachOrbit = (fn) => {
+  for (const a of app.world.query([Orbit])) {
+    const O = a.columns.get(Orbit.id);
+    for (let r = 0; r < a.count; r++) fn(O, r * 4);
+  }
+};
+
+slider('lights', (v) => v, (v) => { ring.count = v; buildRing(); });
+slider('speed', (v) => v.toFixed(2), (v) => { ring.speed = v; eachOrbit((O, o) => { O[o + 1] = v; }); });
+slider('radius', (v) => `${v.toFixed(1)} m`, (v) => { ring.radius = v; eachOrbit((O, o) => { O[o] = v; }); });
+
+slider('shadowlights', (v) => v, (v) => {
+  app.renderer.shadows.maxLights = v;
+  app.renderer.shadows.enabled = v > 0;
+});
+slider('softness', (v) => v.toFixed(1), (v) => { app.renderer.shadows.pcfRadius = v; });
+
+// Materials are plain records the instance writer reads every frame, so
+// editing one here is live — no pipeline rebuild, no shader recompile.
+slider('wear', (v) => v.toFixed(2), (v) => { app.renderer.materials[MAT.weathered].oxide = v; });
+slider('aoi', (v) => v.toFixed(2), (v) => { app.renderer.ao.intensity = v; });
+slider('ssr', (v) => v.toFixed(2), (v) => { app.renderer.ssr.intensity = v; });
+slider('bloom', (v) => v.toFixed(2), (v) => { app.renderer.bloom.strength = v; });
+
+const toggle = (id, fn) => {
+  const b = el(id);
+  b.addEventListener('click', () => {
+    const on = b.getAttribute('aria-pressed') !== 'true';
+    b.setAttribute('aria-pressed', String(on));
+    fn(on);
+  });
+};
+
+toggle('t-fly', (on) => {
+  if (!app) return;
+  app.setCameraMode(on ? 'fly' : 'orbit');
+  document.body.classList.toggle('flying', on);
+  el('hint').innerHTML = on
+    ? 'Click the view to capture the mouse · <b>WASD</b> to move · <b>space</b> and <b>shift</b> for up and down · <b>esc</b> to release'
+    : 'Drag to orbit · wheel to zoom · shift-drag to pan';
+});
+toggle('t-fxaa', (on) => { if (app) app.renderer.fxaa = on; });
+toggle('t-fog', (on) => { if (app) app.renderer.fogDensity = on ? 0.0075 : 0; });
+toggle('t-spin', (on) => {
+  if (!app) return;
+  if (on) app.world.addSystem(AX.motionSystem, { order: 10, name: 'motion' });
+  else app.world.removeSystem(AX.motionSystem);
+});
+
+boot();
+</script>

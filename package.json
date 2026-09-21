@@ -1,0 +1,44 @@
+{
+  "name": "axion",
+  "version": "0.2.0",
+  "description": "A WebGPU, data-oriented 3D engine.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": {
+      "import": "./src/index.js",
+      "default": "./dist/axion.min.js"
+    }
+  },
+  "files": [
+    "src",
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "dev": "node test/serve.mjs",
+    "build": "node build.mjs",
+    "test": "node test/smoke.mjs",
+    "test:gpu": "node test/gpu-validate.mjs",
+    "test:bundle": "node build.mjs && PAGE=test/bundle-check.html node test/gpu-validate.mjs",
+    "prepublishOnly": "node build.mjs"
+  },
+  "license": "MIT",
+  "sideEffects": false,
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "playwright": "^1.49.1"
+  },
+  "unpkg": "dist/axion.min.js",
+  "jsdelivr": "dist/axion.min.js",
+  "keywords": [
+    "webgpu",
+    "3d",
+    "engine",
+    "renderer",
+    "ecs",
+    "wgsl",
+    "pbr"
+  ]
+}

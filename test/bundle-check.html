@@ -1,0 +1,63 @@
+<!doctype html><meta charset="utf-8">
+<!--
+  Proves the CDN build works the way a consumer actually loads it: a plain
+  <script> tag, no modules, everything reached through the global `Axion`.
+  This is the exact shape of a Khan Academy webpage program.
+-->
+<canvas id="c" width="320" height="220"></canvas>
+<script src="../dist/axion.min.js"></script>
+<script>
+(async () => {
+  const out = { ok: false, steps: [], errors: [] };
+  window.__result = out;
+  try {
+    if (typeof Axion !== 'object') throw new Error('global Axion not defined');
+    out.steps.push(`global Axion, version ${Axion.VERSION}`);
+
+    const expected = ['App', 'World', 'Renderer', 'Camera', 'OrbitControls',
+                      'FlyControls', 'defineComponent', 'roundedBox', 'icosphere',
+                      'plane', 'Transform', 'PointLight', 'math'];
+    const missing = expected.filter((k) => !(k in Axion));
+    if (missing.length) throw new Error('missing exports: ' + missing.join(', '));
+    out.steps.push(`${Object.keys(Axion).length} exports present`);
+
+    const canvas = document.getElementById('c');
+    const app = await Axion.App.create(canvas, {
+      controls: false,
+      shadows: { maxLights: 1, size: 256 },
+      ssr: { steps: 8 },
+    });
+    out.steps.push('device + app');
+
+    const box = app.mesh(Axion.roundedBox(2, 2, 2, 0.2, 4));
+    const floor = app.mesh(Axion.plane(200, 200, 1, 1));
+    const metal = app.material({ color: [0.7, 0.6, 0.5], metallic: 0.9, roughness: 0.3,
+      noiseScale: 1.5, oxide: 0.4 });
+    const slate = app.material({ color: [0.04, 0.05, 0.06], metallic: 0.4,
+      roughness: 0.1, castShadow: false });
+    app.add({ mesh: floor, material: slate, position: [0, -1.5, 0] });
+    app.add({ mesh: box, material: metal, spin: [0, 1, 0], dynamic: true });
+    app.light([3, 4, 2], { intensity: 200, range: 30 });
+
+    app.camera.position[1] = 2; app.camera.position[2] = 8;
+    app.camera.aspect = 320 / 220;
+    app.camera.update();
+
+    app.device.pushErrorScope('validation');
+    for (let i = 0; i < 3; i++) {
+      app.world.step(1 / 60);
+      app.renderer.render(app.world, app.camera, i / 60);
+    }
+    await app.device.queue.onSubmittedWorkDone();
+    const err = await app.device.popErrorScope();
+    if (err) out.errors.push('validation: ' + err.message);
+    out.steps.push('rendered 3 frames from the bundle');
+
+    out.stats = { ...app.renderer.stats };
+    out.ok = out.errors.length === 0;
+  } catch (e) {
+    out.errors.push(String(e && e.stack ? e.stack.split('\n').slice(0, 2).join(' | ') : e));
+  }
+  out.done = true;
+})();
+</script>

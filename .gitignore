@@ -1,0 +1,4 @@
+node_modules/
+package-lock.json
+test/frame.png
+.DS_Store

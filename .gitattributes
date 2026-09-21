@@ -1,0 +1,18 @@
+# Normalize everything to LF inside the repository.
+#
+# Git for Windows defaults to core.autocrlf=true, which checks files out with
+# CRLF and converts them back on commit. That is harmless but noisy, and it
+# matters here for one reason: jsDelivr serves the bytes that are in the repo.
+# Pinning LF keeps the CDN build byte-identical to what CI tested.
+* text=auto eol=lf
+
+# Binary files must never be touched.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary
+
+# The built bundles are committed on purpose — jsDelivr serves straight from a
+# GitHub tag, so dist/ has to be in the tag. Marking it generated keeps it out
+# of diffs and language statistics.
+dist/** linguist-generated=true -diff

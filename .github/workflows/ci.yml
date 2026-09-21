@@ -26,6 +26,12 @@ jobs:
       # occlusion occludes, shadows darken and bloom glows.
       - run: npx playwright install --with-deps chromium
       - run: npm run test:gpu
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rendered-frame
+          path: test/frame.png
+          if-no-files-found: warn
 
       # The CDN build must work the way a consumer loads it: a plain script
       # tag and a global.

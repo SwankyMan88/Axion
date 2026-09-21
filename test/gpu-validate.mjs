@@ -38,7 +38,10 @@ await page.waitForFunction(() => window.__result && window.__result.done, null, 
 const result = await page.evaluate(() => window.__result);
 console.log(JSON.stringify(result, null, 2));
 
-await page.locator('#c').screenshot({ path: '/home/claude/axion/test/frame.png' });
+// An output, not a fixture: the frame this run actually rendered, written
+// next to the harness so CI can upload it and you can look at what the
+// software adapter produced.
+await page.locator('#c').screenshot({ path: path.join(ROOT, 'test', 'frame.png') });
 await browser.close();
 server.close();
 process.exit(result && result.ok ? 0 : 1);

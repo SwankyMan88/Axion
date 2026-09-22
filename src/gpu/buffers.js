@@ -10,6 +10,33 @@
 
 const align = (n, a) => Math.ceil(n / a) * a;
 
+/**
+ * Deferred destruction.
+ *
+ * A buffer replaced this frame may still be referenced by command buffers the
+ * GPU has not finished with. Destroying it immediately is a race whose symptom
+ * is a single corrupted frame at unpredictable intervals — the hardest kind of
+ * bug to catch, because it never reproduces on demand. Holding replaced
+ * resources for a few frames costs a few hundred kilobytes and removes the
+ * race entirely.
+ */
+const RETIRE_FRAMES = 3;
+const graveyard = [];
+
+export function retire(resource) {
+  if (resource) graveyard.push({ resource, age: 0 });
+}
+
+/** Call once per frame. */
+export function sweepRetired() {
+  for (let i = graveyard.length - 1; i >= 0; i--) {
+    if (++graveyard[i].age > RETIRE_FRAMES) {
+      graveyard[i].resource.destroy();
+      graveyard.splice(i, 1);
+    }
+  }
+}
+
 export class Arena {
   constructor(device, usage, initialBytes = 1 << 20, label = 'arena') {
     this.device = device;
@@ -48,7 +75,7 @@ export class Arena {
     const enc = this.device.createCommandEncoder({ label: `${this.label}-grow` });
     enc.copyBufferToBuffer(this.buffer, 0, next, 0, this.offset);
     this.device.queue.submit([enc.finish()]);
-    this.buffer.destroy();
+    retire(this.buffer);
     this.buffer = next;
     this.capacity = cap;
   }
@@ -75,8 +102,14 @@ export class DynamicBuffer {
     if (floats <= this.cpu.length) return;
     let n = this.cpu.length;
     while (n < floats) n *= 2;
-    this.cpu = new Float32Array(n);
-    this.buffer.destroy();
+    // Copy the existing contents forward. Callers that accumulate across
+    // several passes before flushing — the shadow caster list does exactly
+    // that — would otherwise silently lose everything written so far and
+    // upload a block of zeroed matrices.
+    const next = new Float32Array(n);
+    next.set(this.cpu);
+    this.cpu = next;
+    retire(this.buffer);
     this.buffer = this.device.createBuffer({
       size: align(this.cpu.byteLength, 256), usage: this.usage, label: this.label,
     });

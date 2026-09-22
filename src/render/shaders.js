@@ -41,16 +41,74 @@ struct Camera {
 
 const PI : f32 = 3.14159265359;
 
+/**
+ * Clamp a radiance value to something every later pass can survive.
+ *
+ * One NaN or Inf pixel in the HDR target is invisible on its own, but the
+ * bloom pyramid averages it into every texel it touches on the way down and
+ * back up, and the frame comes out with a solid black RECTANGLE where the
+ * poisoned mip texels land. The check is done on the bits, not with x != x,
+ * because shader compilers running fast-math may fold that comparison to
+ * false. Negative radiance is clamped too: pow() of a negative is NaN.
+ */
+fn sanitize(c : vec3<f32>) -> vec3<f32> {
+  let bits = bitcast<vec3<u32>>(c) & vec3<u32>(0x7f800000u);
+  let bad = bits == vec3<u32>(0x7f800000u);
+  return select(clamp(c, vec3<f32>(0.0), vec3<f32>(60000.0)), vec3<f32>(0.0), bad);
+}
+
+/**
+ * Normalize that cannot produce NaN.
+ *
+ * A zero-length vector out of normalize() poisons every subsequent operation,
+ * and a NaN fragment reads as a black hole in the frame. Bump mapping can
+ * cancel a normal exactly, so this is not theoretical.
+ */
+fn safeNormalize(v : vec3<f32>, fallback : vec3<f32>) -> vec3<f32> {
+  let l2 = dot(v, v);
+  if (l2 < 1e-12) { return fallback; }
+  return v * inverseSqrt(l2);
+}
+
+/**
+ * Interleaved 4x4 sample rotation.
+ *
+ * Per-pixel white noise cannot be removed by a small blur — that is what
+ * leaves the dithered crust on distant ground. Sixteen rotations laid out on a
+ * repeating 4x4 tile can: any four consecutive pixels cover every residue, so
+ * a 4x4 box blur averages exactly one complete set of directions and the noise
+ * integrates away instead of smearing.
+ */
+fn interleavedIndex(pixel : vec2<f32>) -> i32 {
+  let p = vec2<i32>(pixel);
+  return (p.x & 3) + ((p.y & 3) << 2);
+}
+
+/**
+ * sign() that never returns 0.
+ *
+ * WGSL's sign(0.0) is 0. The octahedral fold multiplies by the sign of each
+ * component, so a normal with an exactly-zero component in the lower
+ * hemisphere had that axis erased — and a floor seen by a camera tilted
+ * upward is precisely that case. Its normal came back tilted by the camera's
+ * own pitch, which at grazing angles bent reflections upward hard enough to
+ * crush them into a thin band, and where the component flickered around zero
+ * from pixel to pixel it produced horizontal stripes.
+ */
+fn signNotZero(v : vec2<f32>) -> vec2<f32> {
+  return select(vec2<f32>(-1.0), vec2<f32>(1.0), v >= vec2<f32>(0.0));
+}
+
 fn octEncode(n : vec3<f32>) -> vec2<f32> {
   let d = n / (abs(n.x) + abs(n.y) + abs(n.z) + 1e-6);
   if (d.z >= 0.0) { return d.xy; }
-  return (vec2<f32>(1.0) - abs(d.yx)) * vec2<f32>(sign(d.x), sign(d.y));
+  return (vec2<f32>(1.0) - abs(d.yx)) * signNotZero(d.xy);
 }
 
 fn octDecode(e : vec2<f32>) -> vec3<f32> {
   var n = vec3<f32>(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
   if (n.z < 0.0) {
-    let t = (vec2<f32>(1.0) - abs(n.yx)) * vec2<f32>(sign(n.x), sign(n.y));
+    let t = (vec2<f32>(1.0) - abs(n.yx)) * signNotZero(n.xy);
     n = vec3<f32>(t.x, t.y, n.z);
   }
   return normalize(n);
@@ -86,6 +144,19 @@ fn sampleEnvironment(dir : vec3<f32>, roughness : f32, ambient : vec3<f32>) -> v
 
   let avg = (sky + horizon + ground) / 3.0;
   return mix(env, avg, roughness * roughness);
+}
+
+/**
+ * The full-resolution pixel containing a UV: floor(uv * size), clamped.
+ *
+ * This must match the rasterizer's pixel grid exactly. Scaling by (size - 1)
+ * instead — an easy slip — shifts the lookup by up to a whole pixel, worst in
+ * the middle of the screen, so a depth test and the colour fetched for the
+ * same "hit" can come from two different pixels.
+ */
+fn pixelOf(uv : vec2<f32>) -> vec2<i32> {
+  let size = vec2<i32>(camera.screen.xy);
+  return clamp(vec2<i32>(floor(uv * camera.screen.xy)), vec2<i32>(0), size - vec2<i32>(1));
 }
 
 /** Fullscreen triangle from the vertex index alone — no vertex buffer. */
@@ -139,6 +210,22 @@ fn faceIndex(v : vec3<f32>) -> i32 {
 }
 `;
 
+const MATERIAL_WGSL = /* wgsl */`
+/* Material textures: group 1, identical layout in the geometry and the
+   alpha-tested shadow pass. Untextured materials bind 1x1 defaults. */
+struct MaterialParams {
+  alphaCutoff : f32,   // 0 = opaque; otherwise discard below this alpha
+  normalScale : f32,
+  hasNormalMap : f32,
+  pad : f32,
+};
+@group(1) @binding(0) var matSampler : sampler;
+@group(1) @binding(1) var baseColorTex : texture_2d<f32>;
+@group(1) @binding(2) var metalRoughTex : texture_2d<f32>;   // glTF: G = roughness, B = metallic
+@group(1) @binding(3) var normalTex : texture_2d<f32>;
+@group(1) @binding(4) var<uniform> material : MaterialParams;
+`;
+
 /* ------------------------------------------------------------- shadow ---- */
 
 export const SHADOW_WGSL = /* wgsl */`
@@ -153,6 +240,30 @@ struct Face {
 fn vs(@builtin(instance_index) ii : u32,
       @location(0) position : vec3<f32>) -> @builtin(position) vec4<f32> {
   return face.viewProj * (models[ii] * vec4<f32>(position, 1.0));
+}
+
+/* Alpha-tested casters: leaves, chains, grilles. Without this they cast solid
+   rectangular shadows the shape of their cards. */
+${MATERIAL_WGSL}
+
+struct MaskOut {
+  @builtin(position) pos : vec4<f32>,
+  @location(0) uv : vec2<f32>,
+};
+
+@vertex
+fn vsMask(@builtin(instance_index) ii : u32,
+          @location(0) position : vec3<f32>,
+          @location(2) uv : vec2<f32>) -> MaskOut {
+  var o : MaskOut;
+  o.pos = face.viewProj * (models[ii] * vec4<f32>(position, 1.0));
+  o.uv = uv;
+  return o;
+}
+
+@fragment
+fn fsMask(in : MaskOut) {
+  if (textureSample(baseColorTex, matSampler, in.uv).a < material.alphaCutoff) { discard; }
 }
 `;
 
@@ -180,7 +291,7 @@ struct Light {
 @group(0) @binding(2) var<storage, read> lights : array<Light>;
 @group(0) @binding(3) var shadowMaps : texture_depth_2d_array;
 @group(0) @binding(4) var shadowSampler : sampler_comparison;
-
+${MATERIAL_WGSL}
 struct VSOut {
   @builtin(position) clip : vec4<f32>,
   @location(0) worldPos   : vec3<f32>,
@@ -338,11 +449,45 @@ fn fresnelSchlick(cosTheta : f32, f0 : vec3<f32>) -> vec3<f32> {
 }
 
 @fragment
-fn fs(in : VSOut) -> GBuffer {
-  var albedo = in.color.rgb;
-  var metallic = clamp(in.pbr.x, 0.0, 1.0);
-  var roughness = clamp(in.pbr.y, 0.04, 1.0);
-  var N = normalize(in.normal);
+fn fs(in : VSOut, @builtin(front_facing) front : bool) -> GBuffer {
+  // Everything that needs derivatives happens first, in uniform control flow:
+  // texture sampling with implicit mip selection, and the surface frame for
+  // normal mapping. After a discard or a branch, neither is well defined.
+  let base = textureSample(baseColorTex, matSampler, in.uv);
+  let mr = textureSample(metalRoughTex, matSampler, in.uv);
+  let nmap = textureSample(normalTex, matSampler, in.uv).xyz * 2.0 - 1.0;
+  let dp1 = dpdx(in.worldPos);
+  let dp2 = dpdy(in.worldPos);
+  let duv1 = dpdx(in.uv);
+  let duv2 = dpdy(in.uv);
+
+  let alpha = in.color.a * base.a;
+  if (material.alphaCutoff > 0.0 && alpha < material.alphaCutoff) { discard; }
+
+  var albedo = in.color.rgb * base.rgb;
+  var metallic = clamp(in.pbr.x * mr.b, 0.0, 1.0);
+  var roughness = clamp(in.pbr.y * mr.g, 0.04, 1.0);
+
+  // A double-sided surface seen from behind must be lit from behind.
+  var N = safeNormalize(in.normal, vec3<f32>(0.0, 1.0, 0.0));
+  if (!front) { N = -N; }
+
+  if (material.hasNormalMap > 0.5) {
+    /*
+     * Cotangent frame from screen-space derivatives (Schueler). The tangent
+     * basis is reconstructed per pixel from how position and UV change across
+     * the screen, so meshes need no tangent attribute and the vertex format
+     * stays 32 bytes. glTF normal maps are +Y up in image space while V grows
+     * downward, hence the flipped green channel.
+     */
+    let dp2perp = cross(dp2, N);
+    let dp1perp = cross(N, dp1);
+    let T = dp2perp * duv1.x + dp1perp * duv2.x;
+    let B = dp2perp * duv1.y + dp1perp * duv2.y;
+    let scale = inverseSqrt(max(max(dot(T, T), dot(B, B)), 1e-20));
+    let ts = vec3<f32>(nmap.xy * material.normalScale * vec2<f32>(1.0, -1.0), nmap.z);
+    N = safeNormalize(T * scale * ts.x + B * scale * ts.y + N * ts.z, N);
+  }
 
   let noiseScale = in.surf.x;
   if (noiseScale > 0.0) {
@@ -356,7 +501,11 @@ fn fs(in : VSOut) -> GBuffer {
     let dy = fbm(p + vec3<f32>(0.0, e, 0.0)) - h;
     let dz = fbm(p + vec3<f32>(0.0, 0.0, e)) - h;
     let grad = vec3<f32>(dx, dy, dz) * noiseScale;
-    N = normalize(N - (grad - N * dot(grad, N)) * in.surf.z);
+    // Project the gradient onto the tangent plane and bend the normal by it.
+    // A strong bump can cancel the normal exactly, so this cannot use a bare
+    // normalize: one NaN here becomes a black fragment on screen.
+    let tangentGrad = grad - N * dot(grad, N);
+    N = safeNormalize(N - tangentGrad * in.surf.z, N);
 
     // Weathering: a second, coarser field decides where the finish is gone.
     let wear = smoothstep(0.42, 0.72, fbm(p * 0.27));
@@ -414,7 +563,7 @@ fn fs(in : VSOut) -> GBuffer {
 
   var out : GBuffer;
   // Ambient is deferred to the resolve pass so occlusion can modulate it.
-  out.color = vec4<f32>(Lo + albedo * in.pbr.z, in.color.a);
+  out.color = vec4<f32>(sanitize(Lo + albedo * in.pbr.z), alpha);
   let viewN = normalize((camera.view * vec4<f32>(N, 0.0)).xyz);
   let oct = octEncode(viewN);
   out.surface = vec4<f32>(oct.x, oct.y, roughness, metallic);
@@ -433,14 +582,12 @@ ${COMMON}
 @group(0) @binding(2) var depthTex : texture_depth_2d;
 @group(0) @binding(3) var surfaceTex : texture_2d<f32>;
 
+fn loadDepth(uv : vec2<f32>) -> f32 {
+  return textureLoad(depthTex, pixelOf(uv), 0);
+}
+
 @vertex
 fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
-
-fn loadDepth(uv : vec2<f32>) -> f32 {
-  let c = vec2<i32>(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) *
-                    vec2<f32>(camera.screen.x - 1.0, camera.screen.y - 1.0));
-  return textureLoad(depthTex, c, 0);
-}
 
 /**
  * Horizon-based ambient occlusion.
@@ -471,7 +618,7 @@ fn fs(in : FSOut) -> @location(0) f32 {
   //
   // Fading out is honest: no occlusion beats invented occlusion.
   let dist = -P.z;
-  let distanceFade = 1.0 - smoothstep(camera.fade.x * 0.65, camera.fade.x, dist);
+  let distanceFade = 1.0 - smoothstep(camera.fade.x * 0.35, camera.fade.x, dist);
   if (distanceFade <= 0.001) { return 1.0; }
   let grazeFade = smoothstep(0.12, 0.38, abs(dot(N, normalize(-P))));
   if (grazeFade <= 0.001) { return 1.0; }
@@ -481,20 +628,25 @@ fn fs(in : FSOut) -> @location(0) f32 {
   // sampled with a metre-wide kernel measured in pixels.
   let radiusUV = clamp(radius * camera.proj.x / max(-P.z, 1e-3) * 0.5, 0.004, 0.22);
 
-  let pix = in.uv * camera.screen.xy;
-  let rot = fract(52.9829189 * fract(0.06711056 * pix.x + 0.00583715 * pix.y)) * 6.2831853;
-
-  var occlusion = 0.0;
+  // in.clip.xy is this pass's own pixel coordinate, which is what the 4x4 tile
+  // has to be keyed on: the AO pass runs at half resolution, so keying off the
+  // full-res coordinate would only ever visit the even residues and half the
+  // rotations would never be used.
   let SLICES = 6;
   let STEPS = 5;
+  let tile = interleavedIndex(in.clip.xy);
+  let rot = f32(tile) * (PI / f32(SLICES)) / 16.0;
+  let radialOffset = (f32(tile & 3) + 0.5) * 0.25;
+
+  var occlusion = 0.0;
 
   for (var s = 0; s < SLICES; s = s + 1) {
-    let theta = rot + f32(s) * (3.14159265 / f32(SLICES));
+    let theta = rot + f32(s) * (PI / f32(SLICES));
     let dir = vec2<f32>(cos(theta), sin(theta));
 
     var best = 0.0;
     for (var t = 1; t <= STEPS; t = t + 1) {
-      let frac = f32(t) / f32(STEPS);
+      let frac = (f32(t) - 1.0 + radialOffset) / f32(STEPS);
       let uv = in.uv + dir * radiusUV * frac;
       if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { break; }
 
@@ -527,14 +679,12 @@ ${COMMON}
 @group(0) @binding(2) var aoTex : texture_2d<f32>;
 @group(0) @binding(3) var depthTex : texture_depth_2d;
 
+fn loadDepth(uv : vec2<f32>) -> f32 {
+  return textureLoad(depthTex, pixelOf(uv), 0);
+}
+
 @vertex
 fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
-
-fn loadDepth(uv : vec2<f32>) -> f32 {
-  let c = vec2<i32>(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) *
-                    vec2<f32>(camera.screen.x - 1.0, camera.screen.y - 1.0));
-  return textureLoad(depthTex, c, 0);
-}
 
 /**
  * Depth-aware box blur. Weighting each tap by how close its depth is to the
@@ -549,8 +699,12 @@ fn fs(in : FSOut) -> @location(0) f32 {
 
   var sum = 0.0;
   var weight = 0.0;
-  for (var y = -2; y <= 2; y = y + 1) {
-    for (var x = -2; x <= 2; x = x + 1) {
+  // Exactly four pixels on each axis, matching the 4x4 rotation tile. Any four
+  // consecutive pixels contain one of every rotation, so this kernel averages
+  // one whole set of sample directions — a 5x5 would double-count some and
+  // leave a residual pattern behind.
+  for (var y = -1; y <= 2; y = y + 1) {
+    for (var x = -1; x <= 2; x = x + 1) {
       let uv = in.uv + vec2<f32>(f32(x), f32(y)) * texel;
       let z = linearDepth(loadDepth(uv), camera.proj.z);
       let w = exp(-abs(z - centerZ) * 2.0);
@@ -575,14 +729,12 @@ ${COMMON}
 @group(0) @binding(5) var depthTex : texture_depth_2d;
 @group(0) @binding(6) var aoTex : texture_2d<f32>;
 
+fn loadDepth(uv : vec2<f32>) -> f32 {
+  return textureLoad(depthTex, pixelOf(uv), 0);
+}
+
 @vertex
 fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
-
-fn loadDepth(uv : vec2<f32>) -> f32 {
-  let c = vec2<i32>(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) *
-                    vec2<f32>(camera.screen.x - 1.0, camera.screen.y - 1.0));
-  return textureLoad(depthTex, c, 0);
-}
 
 fn viewToUV(p : vec3<f32>) -> vec2<f32> {
   let dist = max(-p.z, 1e-5);
@@ -604,66 +756,127 @@ struct Reflection {
  * than the depth buffer can justify — that rejection is what keeps thin
  * geometry from smearing a false reflection across the floor.
  */
-fn traceSSR(origin : vec3<f32>, dir : vec3<f32>, jitter : f32) -> Reflection {
+/**
+ * Screen-space reflection, marched in screen space.
+ *
+ * The ray is projected to the screen once, then walked at roughly one pixel
+ * per step while 1/z is interpolated linearly along that line — 1/z being the
+ * only depth quantity that varies linearly across a screen-space line, which
+ * is what makes the march independent of camera orientation.
+ *
+ * Three rules keep a reflection ray from finding its own surface, which is
+ * the failure that shows up as black seams at contact lines, a dark band at
+ * the horizon, and reflections that shrink as the camera nears the ground:
+ *
+ *   1. The origin is lifted off the surface along its normal, so the pixel it
+ *      starts on is unambiguously *behind* the ray, never level with it.
+ *   2. Steps are never shorter than a pixel. Sub-pixel steps re-sample the
+ *      origin pixel, and at grazing angles its depth matches the ray to within
+ *      precision — a guaranteed false hit.
+ *   3. A hit is an *overlap*: the depth range the ray covered during the step
+ *      must intersect a thin slab behind the visible surface. A threshold on
+ *      "how far behind" alone accepts hits too early along grazing rays, which
+ *      compresses the reflection toward its contact point.
+ */
+fn traceSSR(P : vec3<f32>, N : vec3<f32>, R : vec3<f32>, jitter : f32) -> Reflection {
   var result : Reflection;
   result.color = vec3<f32>(0.0);
   result.hit = 0.0;
 
-  let steps = i32(camera.ssr.y);
-  let maxDist = camera.ssr.w;
-  var stepLen = maxDist / f32(steps) * 0.22;
+  let near = camera.proj.z;
 
-  var t = stepLen * (0.5 + jitter);
+  // Rule 1. The lift grows with distance because depth precision does.
+  let lift = max(0.01, -P.z * 0.0025);
+  let O = P + N * lift;
+  if (O.z > -near) { return result; }
+
+  // Clip to the near plane: past it the ray is behind the eye and projecting
+  // it would fold the line back on itself.
+  var Q = O + R * camera.ssr.w;
+  if (Q.z > -near) {
+    if (abs(R.z) < 1e-6) { return result; }
+    let tClip = (-near - O.z) / R.z;
+    if (tClip <= 0.0) { return result; }
+    Q = O + R * tClip;
+  }
+
+  let pxStart = viewToUV(O) * camera.screen.xy;
+  let pxEnd = viewToUV(Q) * camera.screen.xy;
+  let delta = pxEnd - pxStart;
+  let span = max(abs(delta.x), abs(delta.y));
+  if (span < 1.0) { return result; }
+
+  // Rule 2. One step per pixel, never fewer pixels than steps.
+  let stepCount = min(span, camera.ssr.y);
+  let invStep = 1.0 / stepCount;
+
+  let invZStart = 1.0 / O.z;
+  let invZEnd = 1.0 / Q.z;
+
+  // The first sample lands a full step out, jittered within that step.
   var prevT = 0.0;
+  var prevRayZ = O.z;
+  var t = invStep * (1.0 + jitter);
   var hitT = -1.0;
+  var hitPx = vec2<i32>(0);
 
-  for (var i = 0; i < steps; i = i + 1) {
-    let p = origin + dir * t;
-    if (-p.z < camera.proj.z) { break; }
+  for (var i = 0; i < i32(stepCount); i = i + 1) {
+    if (t > 1.0) { break; }
 
-    let uv = viewToUV(p);
+    let uv = (pxStart + delta * t) * camera.screen.zw;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { break; }
 
-    let sceneZ = -linearDepth(loadDepth(uv), camera.proj.z);
-    let diff = sceneZ - p.z;          // positive: the ray is behind geometry
+    let rayZ = 1.0 / mix(invZStart, invZEnd, t);
+    let sceneZ = -linearDepth(loadDepth(uv), near);
 
-    // Thickness scales with distance: one depth sample stands for a bigger
-    // slab of world the further away it is.
-    if (diff > 0.0 && diff < camera.ssr.z * max(1.0, -p.z * 0.45)) {
+    // Rule 3. View z is negative: larger is nearer the eye. The ray spans
+    // [rayFar, rayNear] over this step; the surface occupies a slab from its
+    // visible face (sceneZ) back to sceneZ - thickness.
+    let rayNear = max(prevRayZ, rayZ);
+    let rayFar = min(prevRayZ, rayZ);
+    let thickness = camera.ssr.z + (-sceneZ) * 0.02;
+    if (rayFar <= sceneZ && rayNear >= sceneZ - thickness) {
       hitT = t;
+      hitPx = pixelOf(uv);
       break;
     }
-    if (diff > 0.0) { break; }        // behind, but too deep to be this surface
 
     prevT = t;
-    stepLen = stepLen * 1.14;
-    t = t + stepLen;
-    if (t > maxDist) { break; }
+    prevRayZ = rayZ;
+    t = t + invStep;
   }
 
   if (hitT < 0.0) { return result; }
 
+  // Refine the crossing between the last clear step and the hit. The lower
+  // bound is the last point known to be in front of everything, so the search
+  // cannot drift back to the origin the way an unbounded one can.
   var lo = prevT;
   var hi = hitT;
-  for (var i = 0; i < 6; i = i + 1) {
+  for (var i = 0; i < 5; i = i + 1) {
     let mid = (lo + hi) * 0.5;
-    let p = origin + dir * mid;
-    let sceneZ = -linearDepth(loadDepth(viewToUV(p)), camera.proj.z);
-    if (sceneZ - p.z > 0.0) { hi = mid; } else { lo = mid; }
+    let uv = (pxStart + delta * mid) * camera.screen.zw;
+    let rayZ = 1.0 / mix(invZStart, invZEnd, mid);
+    if (-linearDepth(loadDepth(uv), near) >= rayZ) {
+      hi = mid;
+      hitPx = pixelOf(uv);   // only ever a pixel that passed the depth test
+    } else {
+      lo = mid;
+    }
   }
+  let hitUV = (vec2<f32>(hitPx) + 0.5) * camera.screen.zw;
 
-  let p = origin + dir * hi;
-  let uv = viewToUV(p);
+  // Fade where the march has no information: at the edge of the screen and at
+  // the very end of the ray.
+  let edge = min(min(hitUV.x, 1.0 - hitUV.x), min(hitUV.y, 1.0 - hitUV.y));
+  let edgeFade = smoothstep(0.0, 0.1, edge);
+  let endFade = 1.0 - smoothstep(0.8, 1.0, hi);
 
-  // Fade at the screen edges, at the end of the ray, and when the ray points
-  // back at the camera — the three places SSR has no information.
-  let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-  let edgeFade = smoothstep(0.0, 0.12, edge);
-  let distFade = 1.0 - smoothstep(maxDist * 0.6, maxDist, hi);
-  let faceFade = clamp(1.0 - dir.z * 1.4, 0.0, 1.0);
-
-  result.color = textureSampleLevel(sceneColor, texSampler, uv, 0.0).rgb;
-  result.hit = edgeFade * distFade * faceFade;
+  // textureLoad, not a filtered sample: a bilinear fetch at a sub-pixel hit
+  // blends in the neighbour behind the occluder, and at a contact line that
+  // neighbour is the dark floor — which is exactly what drew a black seam.
+  result.color = textureLoad(sceneColor, hitPx, 0).rgb;
+  result.hit = edgeFade * endFade;
   return result;
 }
 
@@ -701,8 +914,10 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   let ambient = mix(ground, camera.ambient.rgb, up) * albedo * (1.0 - metallic * 0.6) * ao;
   hdr = hdr + ambient;
 
-  let pix = in.uv * camera.screen.xy;
-  let jitter = fract(52.9829189 * fract(0.06711056 * pix.x + 0.00583715 * pix.y));
+  // Same 4x4 tile as the occlusion pass: sixteen fixed step phases rather than
+  // per-pixel white noise, so what undersampling remains is a faint regular
+  // pattern instead of stipple.
+  let jitter = f32(interleavedIndex(in.clip.xy)) / 16.0;
 
   let nDotV = max(dot(N, V), 1e-4);
   // Metals tint their reflection with their own albedo — f0 is the albedo, not
@@ -716,14 +931,14 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   // most of the depth buffer per step, so it hits or misses essentially at
   // random. Fade to the analytic environment instead of stippling.
   let viewDist = -P.z;
-  let ssrFade = 1.0 - smoothstep(camera.fade.y * 0.6, camera.fade.y, viewDist);
+  let ssrFade = 1.0 - smoothstep(camera.fade.y * 0.4, camera.fade.y, viewDist);
   let weight = clamp(1.0 - roughness * 1.35, 0.0, 1.0) * camera.ssr.x * ssrFade;
 
   let Rworld = normalize((camera.invView * vec4<f32>(R, 0.0)).xyz);
   var reflected = sampleEnvironment(Rworld, roughness, camera.ambient.rgb);
 
   if (weight > 0.001) {
-    let ssr = traceSSR(P, R, jitter);
+    let ssr = traceSSR(P, N, R, jitter);
     reflected = mix(reflected, ssr.color, ssr.hit * weight);
   }
 
@@ -740,7 +955,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   let fogTarget = mix(camera.fog.rgb, aerial, camera.fog.a);
   hdr = mix(hdr, fogTarget, fogAmount);
 
-  return vec4<f32>(hdr, 1.0);
+  return vec4<f32>(sanitize(hdr), 1.0);
 }
 `;
 
@@ -757,20 +972,22 @@ ${COMMON}
 fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
 
 /** Thirteen-tap downsample (Jimenez). Stable under motion; no pulsing fireflies. */
+fn tap(uv : vec2<f32>) -> vec3<f32> { return sanitize(textureSampleLevel(src, texSampler, uv, 0.0).rgb); }
+
 fn downsample13(uv : vec2<f32>, texel : vec2<f32>) -> vec3<f32> {
-  let a = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>(-2.0,  2.0), 0.0).rgb;
-  let b = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 0.0,  2.0), 0.0).rgb;
-  let c = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 2.0,  2.0), 0.0).rgb;
-  let d = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>(-2.0,  0.0), 0.0).rgb;
-  let e = textureSampleLevel(src, texSampler, uv, 0.0).rgb;
-  let f = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 2.0,  0.0), 0.0).rgb;
-  let g = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>(-2.0, -2.0), 0.0).rgb;
-  let h = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 0.0, -2.0), 0.0).rgb;
-  let i = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 2.0, -2.0), 0.0).rgb;
-  let j = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>(-1.0,  1.0), 0.0).rgb;
-  let k = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 1.0,  1.0), 0.0).rgb;
-  let l = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>(-1.0, -1.0), 0.0).rgb;
-  let m = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 1.0, -1.0), 0.0).rgb;
+  let a = tap(uv + texel * vec2<f32>(-2.0,  2.0));
+  let b = tap(uv + texel * vec2<f32>( 0.0,  2.0));
+  let c = tap(uv + texel * vec2<f32>( 2.0,  2.0));
+  let d = tap(uv + texel * vec2<f32>(-2.0,  0.0));
+  let e = tap(uv);
+  let f = tap(uv + texel * vec2<f32>( 2.0,  0.0));
+  let g = tap(uv + texel * vec2<f32>(-2.0, -2.0));
+  let h = tap(uv + texel * vec2<f32>( 0.0, -2.0));
+  let i = tap(uv + texel * vec2<f32>( 2.0, -2.0));
+  let j = tap(uv + texel * vec2<f32>(-1.0,  1.0));
+  let k = tap(uv + texel * vec2<f32>( 1.0,  1.0));
+  let l = tap(uv + texel * vec2<f32>(-1.0, -1.0));
+  let m = tap(uv + texel * vec2<f32>( 1.0, -1.0));
 
   return e * 0.125 + (a + c + g + i) * 0.03125 + (b + d + f + h) * 0.0625 +
          (j + k + l + m) * 0.125;
@@ -858,14 +1075,19 @@ fn luma(c : vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722))
 
 /** Graded pixel: HDR + bloom, tonemapped and gamma-encoded. FXAA runs on this. */
 fn gradeAt(uv : vec2<f32>) -> vec3<f32> {
-  let hdr = textureSampleLevel(hdrTex, texSampler, uv, 0.0).rgb;
-  let bloom = textureSampleLevel(bloomTex, texSampler, uv, 0.0).rgb;
+  let hdr = sanitize(textureSampleLevel(hdrTex, texSampler, uv, 0.0).rgb);
+  let bloom = sanitize(textureSampleLevel(bloomTex, texSampler, uv, 0.0).rgb);
   return pow(tonemapACES((hdr + bloom * camera.bloom.z) * camera.params.y), vec3<f32>(1.0 / 2.2));
 }
 
 @fragment
 fn fs(in : FSOut) -> @location(0) vec4<f32> {
   var color = gradeAt(in.uv);
+
+  // Last line of defence. Anything upstream that produced a NaN would show up
+  // here as a black fragment, and a black fragment on screen is a far worse
+  // failure than a slightly wrong colour.
+  color = select(color, vec3<f32>(0.0), color != color);
 
   // FXAA (console variant): one diagonal blend along the detected edge. Cheap,
   // and it is the reason this pipeline can skip MSAA and still keep its depth

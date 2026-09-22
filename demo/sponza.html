@@ -1,0 +1,559 @@
+<title>Axion Sponza</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<style>
+  /* Single committed look: an engine viewport is a dark instrument, not a document. */
+  :root {
+    --ground: #070a0f;
+    --panel: rgba(13, 19, 27, 0.84);
+    --panel-solid: #0d131b;
+    --hairline: #1d2836;
+    --ink: #c9d5e2;
+    --ink-dim: #6d8098;
+    --amber: #f2a33c;
+    --teal: #4fb6c6;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    --sans: "Archivo", system-ui, -apple-system, "Segoe UI", sans-serif;
+    color-scheme: dark;
+  }
+
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    overflow: hidden;
+  }
+
+  #stage { position: fixed; inset: 0; }
+  #gpu { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+  #gpu:active { cursor: grabbing; }
+  body.flying #gpu { cursor: crosshair; }
+
+  .chrome { position: fixed; display: flex; flex-direction: column; gap: 10px; pointer-events: none; }
+  .chrome > * { pointer-events: auto; }
+
+  #masthead {
+    top: calc(14px + env(safe-area-inset-top, 0px));
+    left: 14px;
+    max-width: min(330px, calc(100vw - 28px));
+  }
+
+  .wordmark {
+    display: flex; align-items: baseline; gap: 10px;
+    font-weight: 700; font-size: 20px; letter-spacing: -0.01em;
+  }
+  .wordmark b { color: var(--amber); font-weight: 700; }
+  .wordmark span {
+    font-family: var(--mono); font-size: 11px; color: var(--ink-dim);
+    letter-spacing: 0.08em; text-transform: uppercase;
+  }
+  .tagline { margin: 0; font-family: var(--mono); font-size: 11.5px; line-height: 1.6; color: var(--ink-dim); }
+
+  .panel {
+    background: var(--panel);
+    backdrop-filter: blur(14px);
+    border: 1px solid var(--hairline);
+    border-radius: 3px;
+    padding: 12px 13px;
+  }
+
+  .panel h2 {
+    margin: 0 0 9px;
+    font-family: var(--mono); font-size: 10px; font-weight: 700;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-dim);
+  }
+  .panel h2 + .field { margin-top: 0; }
+
+  #telemetry { min-width: 226px; }
+  .readout {
+    display: grid; grid-template-columns: 1fr auto; gap: 2px 12px;
+    font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums;
+  }
+  .readout dt { color: var(--ink-dim); }
+  .readout dd { margin: 0; text-align: right; color: var(--ink); }
+  .readout dd.hot { color: var(--amber); }
+  .readout .rule { grid-column: 1 / -1; height: 1px; background: var(--hairline); margin: 6px 0; }
+
+  #graph {
+    display: block; width: 100%; height: 40px; margin-top: 9px;
+    border: 1px solid var(--hairline); border-radius: 2px; background: #090e15;
+  }
+  .graph-key {
+    display: flex; justify-content: space-between;
+    font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.06em;
+    color: var(--ink-dim); margin-top: 4px; text-transform: uppercase;
+  }
+
+  #console {
+    bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+    right: 14px;
+    width: min(262px, calc(100vw - 28px));
+    max-height: calc(100vh - 28px);
+    overflow-y: auto;
+  }
+
+  .field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px; }
+  .field:last-child { margin-bottom: 0; }
+  .field-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-family: var(--mono); font-size: 11px;
+  }
+  .field-head label { color: var(--ink-dim); letter-spacing: 0.04em; }
+  .field-head output { color: var(--amber); font-variant-numeric: tabular-nums; }
+
+  input[type="range"] {
+    -webkit-appearance: none; appearance: none;
+    width: 100%; height: 3px; background: var(--hairline);
+    border-radius: 2px; outline-offset: 4px;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 13px; height: 13px; border-radius: 50%;
+    background: var(--amber); border: none; cursor: pointer;
+  }
+  input[type="range"]::-moz-range-thumb {
+    width: 13px; height: 13px; border-radius: 50%;
+    background: var(--amber); border: none; cursor: pointer;
+  }
+  input[type="range"]:focus-visible { outline: 2px solid var(--teal); }
+
+  .switches { display: flex; flex-wrap: wrap; gap: 6px; }
+  .switch {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.05em;
+    text-transform: uppercase; padding: 5px 9px; border-radius: 2px; cursor: pointer;
+    background: transparent; color: var(--ink-dim); border: 1px solid var(--hairline);
+  }
+  .switch[aria-pressed="true"] { color: var(--ground); background: var(--amber); border-color: var(--amber); }
+  .switch:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+
+  .divider { height: 1px; background: var(--hairline); margin: 11px 0; }
+  .hint { margin: 10px 0 0; font-family: var(--mono); font-size: 10px; line-height: 1.6; color: var(--ink-dim); }
+  .hint b { color: var(--ink); font-weight: 500; }
+
+  #trap {
+    top: calc(14px + env(safe-area-inset-top, 0px));
+    right: 14px;
+    width: min(262px, calc(100vw - 28px));
+  }
+  #trap canvas {
+    display: block; width: 100%; aspect-ratio: 1; image-rendering: pixelated;
+    border: 1px solid var(--hairline); border-radius: 2px; background: #000;
+  }
+  #trap p { margin: 9px 0 0; font-family: var(--mono); font-size: 11px; line-height: 1.6; color: var(--ink-dim); }
+  #trap p b { color: var(--ink); font-weight: 500; }
+  #trap .verdict { color: var(--amber); }
+  #trap button { margin-top: 10px; }
+
+  #fallback { position: fixed; inset: 0; display: none; place-content: center; padding: 24px; }
+  #fallback.show { display: grid; }
+  #fallback div { max-width: 46ch; }
+  #fallback h1 { font-size: 22px; margin: 0 0 10px; }
+  #fallback p { font-family: var(--mono); font-size: 12.5px; line-height: 1.7; color: var(--ink-dim); }
+  #fallback code { color: var(--amber); }
+
+  @media (max-width: 760px) {
+    #masthead { max-width: calc(100vw - 28px); }
+    .tagline, #graph, .graph-key { display: none; }
+    #telemetry { min-width: 0; }
+    #console { width: calc(100vw - 28px); max-height: 44vh; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .panel { backdrop-filter: none; background: var(--panel-solid); }
+  }
+</style>
+<style>
+  /* Loading veil: a real progress readout, not a spinner. */
+  #loading {
+    position: fixed; inset: 0; display: grid; place-content: center;
+    background: var(--ground); z-index: 5; padding: 24px;
+  }
+  #loading[hidden] { display: none; }
+  #loading .panel { width: min(320px, calc(100vw - 32px)); }
+  .bar { height: 3px; background: var(--hairline); border-radius: 2px; overflow: hidden; margin-top: 10px; }
+  .bar i { display: block; height: 100%; width: 0%; background: var(--amber); transition: width 120ms linear; }
+  #load-stage { font-family: var(--mono); font-size: 11.5px; color: var(--ink-dim); margin: 0; }
+  #load-stage b { color: var(--ink); font-weight: 500; }
+
+  #crosshair {
+    position: fixed; left: 50%; top: 50%; width: 6px; height: 6px; margin: -3px 0 0 -3px;
+    border-radius: 50%; border: 1px solid rgba(201, 213, 226, 0.55); pointer-events: none;
+  }
+  body:not(.flying) #crosshair { display: none; }
+  #lockhint {
+    position: fixed; left: 50%; bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+    transform: translateX(-50%); pointer-events: none;
+    font-family: var(--mono); font-size: 11px; color: var(--ink);
+    background: var(--panel); border: 1px solid var(--hairline); border-radius: 3px; padding: 7px 11px;
+  }
+  body.locked #lockhint { display: none; }
+  @media (max-width: 760px) { #lockhint { bottom: auto; top: 50%; } }
+</style>
+
+<div id="stage"><canvas id="gpu"></canvas></div>
+<div id="crosshair"></div>
+<div id="lockhint">Click to fly · <b>WASD</b> move · mouse look · <b>space</b>/<b>shift</b> up and down · <b>ctrl</b> faster · <b>esc</b> release</div>
+
+<div id="loading">
+  <section class="panel">
+    <h2>Loading Sponza</h2>
+    <p id="load-stage">fetching model…</p>
+    <div class="bar"><i id="load-bar"></i></div>
+  </section>
+</div>
+
+<div class="chrome" id="masthead">
+  <div class="wordmark">Axion<b>·</b><span>sponza · <span id="ver">—</span></span></div>
+  <p class="tagline">Crytek Sponza, 262k triangles and 69 textures, loaded from glTF and lit by moving shadowed lights. Fly through it.</p>
+  <section class="panel" id="telemetry">
+    <h2>Frame telemetry</h2>
+    <dl class="readout">
+      <dt>source</dt><dd id="r-source">—</dd>
+      <dt>triangles drawn</dt><dd id="r-tris">—</dd>
+      <dt>primitives drawn</dt><dd id="r-drawn">—</dd>
+      <dt>culled</dt><dd id="r-culled">—</dd>
+      <dt>shadow draws</dt><dd id="r-sdraws">—</dd>
+      <dt>passes</dt><dd id="r-draws">—</dd>
+      <div class="rule"></div>
+      <dt>frame</dt><dd id="r-frame" class="hot">—</dd>
+      <dt>cpu submit</dt><dd id="r-cpu">—</dd>
+      <dt>fps</dt><dd id="r-fps">—</dd>
+    </dl>
+    <canvas id="graph" width="440" height="80"></canvas>
+    <div class="graph-key"><span>frame ms</span><span id="r-peak">peak —</span></div>
+  </section>
+</div>
+
+<div class="chrome" id="console">
+  <section class="panel">
+    <h2>Lights</h2>
+    <div class="field">
+      <div class="field-head"><label for="torches">torches</label><output id="torches-out" for="torches">3</output></div>
+      <input id="torches" type="range" min="0" max="6" step="1" value="3">
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="speed">torch speed</label><output id="speed-out" for="speed">0.25</output></div>
+      <input id="speed" type="range" min="0" max="1" step="0.05" value="0.25">
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="sky">skylight</label><output id="sky-out" for="sky">1.00</output></div>
+      <input id="sky" type="range" min="0" max="2" step="0.05" value="1">
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="exposure">exposure</label><output id="exposure-out" for="exposure">1.10</output></div>
+      <input id="exposure" type="range" min="0.3" max="2.5" step="0.05" value="1.1">
+    </div>
+
+    <div class="divider"></div>
+    <h2>Resolve</h2>
+    <div class="field">
+      <div class="field-head"><label for="aoi">occlusion</label><output id="aoi-out" for="aoi">1.00</output></div>
+      <input id="aoi" type="range" min="0" max="2.5" step="0.05" value="1">
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="bloom">bloom</label><output id="bloom-out" for="bloom">0.35</output></div>
+      <input id="bloom" type="range" min="0" max="1.5" step="0.05" value="0.35">
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="softness">shadow softness</label><output id="softness-out" for="softness">1.4</output></div>
+      <input id="softness" type="range" min="0" max="5" step="0.1" value="1.4">
+    </div>
+    <div class="field">
+      <div class="field-head"><label>toggles</label></div>
+      <div class="switches">
+        <button class="switch" id="t-shadows" type="button" aria-pressed="true">shadows</button>
+        <button class="switch" id="t-ssr" type="button" aria-pressed="true">reflect</button>
+        <button class="switch" id="t-fxaa" type="button" aria-pressed="true">fxaa</button>
+        <button class="switch" id="t-trap" type="button" aria-pressed="false" title="Pause on the first frame with a black region in the center">trap</button>
+      </div>
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="flyspeed">fly speed</label><output id="flyspeed-out" for="flyspeed">4.0 m/s</output></div>
+      <input id="flyspeed" type="range" min="1" max="15" step="0.5" value="4">
+    </div>
+  </section>
+</div>
+
+<div class="chrome" id="trap" hidden>
+  <section class="panel">
+    <h2>Caught frame</h2>
+    <canvas id="trap-shot" width="192" height="192"></canvas>
+    <p id="trap-info"></p>
+    <p class="verdict" id="trap-verdict"></p>
+    <button class="switch" id="trap-resume" type="button" aria-pressed="false">resume</button>
+  </section>
+</div>
+
+<div id="fallback">
+  <div>
+    <h1>This browser has no WebGPU</h1>
+    <p id="fallback-msg">Axion is WebGPU-only on purpose. Open this page in Chrome or Edge 113+, Safari 18+, or Firefox with <code>dom.webgpu.enabled</code> set.</p>
+  </div>
+</div>
+
+<script type="module">
+import * as AX from './src/index.js';
+
+const el = (id) => document.getElementById(id);
+const canvas = el('gpu');
+const fmt = new Intl.NumberFormat('en-US');
+el('ver').textContent = `v${AX.VERSION}`;
+
+let app = null, trap = null;
+
+/* Full-resolution originals if they have been fetched locally
+   (npm run fetch:sponza), otherwise the packed build shipped with the page. */
+const SOURCES = [
+  { url: './assets/sponza/Sponza.gltf', label: 'full res' },
+];
+// The packed single-script build (assets/sponza.js), the same file Khan
+// Academy loads from jsDelivr. A script tag, not fetch, so it works anywhere
+// scripts do.
+const PACKED = ['../assets/sponza.js', './assets/sponza.js'];
+
+const loadScript = (url) => new Promise((ok, fail) => {
+  const s = document.createElement('script');
+  s.src = url; s.onload = ok; s.onerror = fail;
+  document.head.appendChild(s);
+});
+
+async function pickSource() {
+  for (const s of SOURCES) {
+    try {
+      const r = await fetch(s.url, { method: 'HEAD' });
+      if (r.ok) return s;
+    } catch { /* try the next */ }
+  }
+  for (const url of PACKED) {
+    if (globalThis.AxionAssets?.sponza) break;
+    try { await loadScript(url); } catch { /* try the next */ }
+  }
+  if (globalThis.AxionAssets?.sponza) return { url: globalThis.AxionAssets.sponza, label: 'packed 1024px webp' };
+  throw new Error('Sponza assets not found next to this page.');
+}
+
+/* ---------------------------------------------------------- lights ----- */
+
+// Torches travel the length of the nave, weaving between the columns, so the
+// shadows of the arcade sweep across the floor as they pass.
+const Torch = AX.defineComponent('Torch', 'f32', 3);   // phase, lane, height
+const lights = { count: 3, speed: 0.25, sky: 1 };
+let torchEntities = [], skyLight = null;
+
+function torchSystem(world) {
+  const t = world.getResource('app').time * lights.speed;
+  for (const a of world.query([AX.Transform, Torch])) {
+    const T = a.columns.get(AX.Transform.id), O = a.columns.get(Torch.id);
+    for (let r = 0; r < a.count; r++) {
+      const phase = O[r * 3], lane = O[r * 3 + 1], h = O[r * 3 + 2];
+      const u = t + phase;
+      T[r * 10]     = Math.sin(u) * 11.5;                 // along the nave
+      T[r * 10 + 1] = h + Math.sin(u * 2.3) * 0.25;
+      T[r * 10 + 2] = lane + Math.sin(u * 1.7) * 0.6;
+    }
+  }
+}
+
+const TORCH_COLORS = [[1.0, 0.62, 0.32], [0.45, 0.62, 1.0], [1.0, 0.42, 0.62],
+                      [0.55, 1.0, 0.6], [1.0, 0.85, 0.5], [0.7, 0.5, 1.0]];
+
+function buildTorches(bulbMesh, bulbMaterial) {
+  for (const e of torchEntities) app.world.destroy(e);
+  torchEntities = [];
+  for (let i = 0; i < lights.count; i++) {
+    const c = TORCH_COLORS[i % TORCH_COLORS.length];
+    const phase = (i / Math.max(1, lights.count)) * Math.PI * 2;
+    const lane = [-0.2, -2.6, 2.4, -1.4, 1.2, 0][i % 6];
+    const height = 1.4 + (i % 3) * 0.9;
+    torchEntities.push(app.world.spawn([AX.Transform, AX.PointLight, Torch], (cols, row) => {
+      const T = cols.get(AX.Transform.id);
+      T[row * 10 + 6] = 1; T[row * 10 + 7] = T[row * 10 + 8] = T[row * 10 + 9] = 1;
+      cols.get(AX.PointLight.id).set([c[0], c[1], c[2], 55, 16], row * 5);
+      cols.get(Torch.id).set([phase, lane, height], row * 3);
+    }));
+    // The flame itself. It sits inside its own light, so it must not cast.
+    torchEntities.push(app.world.spawn(
+      [AX.Transform, AX.LocalToWorld, AX.Bounds, AX.MeshRef, AX.InstanceColor, AX.Dynamic, Torch],
+      (cols, row) => {
+        const T = cols.get(AX.Transform.id);
+        T[row * 10 + 6] = 1; T[row * 10 + 7] = T[row * 10 + 8] = T[row * 10 + 9] = 0.12;
+        cols.get(AX.Bounds.id).set(app.renderer.meshes[bulbMesh].bounds, row * 4);
+        const R = cols.get(AX.MeshRef.id); R[row * 2] = bulbMesh; R[row * 2 + 1] = bulbMaterial;
+        cols.get(AX.InstanceColor.id).set([c[0], c[1], c[2], 14], row * 4);
+        cols.get(Torch.id).set([phase, lane, height], row * 3);
+      }));
+  }
+}
+
+function setSky(v) {
+  const hit = skyLight && app.world.get(skyLight, AX.PointLight);
+  if (hit) hit.array[hit.offset + 3] = 1400 * v;
+}
+
+/* ----------------------------------------------------------- graph ----- */
+
+const history = new Float32Array(160);
+let historyHead = 0;
+const gctx = el('graph').getContext('2d');
+function drawGraph() {
+  const g = el('graph'), w = g.width, h = g.height;
+  gctx.clearRect(0, 0, w, h);
+  let peak = 8;
+  for (const v of history) peak = Math.max(peak, v);
+  const budgetY = h - (16.7 / peak) * h;
+  gctx.strokeStyle = 'rgba(109,128,152,0.45)'; gctx.setLineDash([3, 4]);
+  gctx.beginPath(); gctx.moveTo(0, budgetY); gctx.lineTo(w, budgetY); gctx.stroke(); gctx.setLineDash([]);
+  gctx.beginPath();
+  for (let i = 0; i < history.length; i++) {
+    const v = history[(historyHead + i) % history.length];
+    const x = (i / (history.length - 1)) * w, y = h - (v / peak) * h;
+    if (i === 0) gctx.moveTo(x, y); else gctx.lineTo(x, y);
+  }
+  gctx.strokeStyle = '#f2a33c'; gctx.lineWidth = 1.5; gctx.stroke();
+  gctx.lineTo(w, h); gctx.lineTo(0, h); gctx.closePath();
+  gctx.fillStyle = 'rgba(242,163,60,0.13)'; gctx.fill();
+  el('r-peak').textContent = `peak ${peak.toFixed(1)}ms`;
+}
+
+/* ------------------------------------------------------------ trap ----- */
+
+function showCatch(report) {
+  const shot = el('trap-shot');
+  shot.width = report.w; shot.height = report.h;
+  shot.getContext('2d').putImageData(new ImageData(report.rgba, report.w, report.h), 0, 0);
+  const pct = (n) => `${((n / report.area) * 100).toFixed(1)}%`;
+  const v = (a) => a.map((n) => n.toFixed(2)).join(', ');
+  el('trap-info').innerHTML =
+    `frame <b>${report.frame}</b> · t <b>${report.time.toFixed(3)}s</b><br>` +
+    `camera <b>${v(report.camera)}</b><br>` +
+    `black: final <b>${pct(report.finalBlack)}</b> · hdr <b>${pct(report.hdrBlack)}</b>`;
+  el('trap-verdict').textContent = report.stage === 'hdr'
+    ? 'Black is already in the HDR resolve: geometry, reflections, occlusion or resolve.'
+    : 'HDR was fine: the black appears in bloom, tonemap or FXAA.';
+  el('trap').hidden = false;
+  el('t-trap').setAttribute('aria-pressed', 'false');
+  console.warn('[axion] frame trap caught a black region', report);
+}
+
+/* ------------------------------------------------------------ boot ----- */
+
+async function boot() {
+  try {
+    app = await AX.App.create(canvas, {
+      clearColor: [0.05, 0.06, 0.08, 1],
+      ambient: [0.10, 0.105, 0.12],
+      groundAmbient: 0.45,
+      fogDensity: 0.0,
+      exposure: 1.1,
+      ssr: { intensity: 1, steps: 48, maxDistance: 40, fadeDistance: 60, thickness: 0.35 },
+      ao: { intensity: 1.0, radius: 0.9, power: 1.4, fadeDistance: 35 },
+      bloom: { threshold: 1.2, knee: 0.6, strength: 0.35 },
+      shadows: { maxLights: 4, size: 1024, pcfRadius: 1.4, near: 0.1 },
+      fly: { speed: 4, position: [10.5, 1.7, -0.3] },
+      canvasUsage: GPUTextureUsage.COPY_SRC,
+    });
+  } catch (err) {
+    el('fallback').classList.add('show');
+    if (err?.message) el('fallback-msg').textContent = err.message;
+    for (const id of ['masthead', 'console', 'loading', 'lockhint']) el(id).style.display = 'none';
+    return;
+  }
+
+  let source;
+  try {
+    source = await pickSource();
+    const loaded = await AX.loadGLTF(app, source.url, {
+      onProgress: (stage, done, total) => {
+        el('load-stage').innerHTML = stage === 'textures'
+          ? `decoding textures <b>${done}</b> / ${total}` : 'building geometry…';
+        el('load-bar').style.width = `${stage === 'textures' ? 10 + (done / total) * 90 : done ? 10 : 3}%`;
+      },
+    });
+    el('r-source').textContent = source.label;
+    console.info('[axion] sponza', loaded);
+  } catch (err) {
+    el('load-stage').textContent = `Could not load Sponza: ${err.message}`;
+    return;
+  }
+
+  // A skylight through the open roof: far away and bright, so its cube map
+  // throws the arcade's shadows across the courtyard floor.
+  skyLight = app.light([1.5, 26, 0.6], { color: [1.0, 0.94, 0.86], intensity: 1400, range: 70 });
+
+  const bulb = app.mesh(AX.icosphere(0.5, 1));
+  const flame = app.material({ name: 'flame', color: [1, 1, 1], roughness: 1, castShadow: false });
+  buildTorches(bulb, flame);
+  app.world.addSystem(torchSystem, { order: 5, name: 'torches' });
+
+  // Fly mode from the start, looking down the nave.
+  app.setCameraMode('fly');
+  // setCameraMode adopts wherever the camera already is — at boot, the origin —
+  // so place the flyer after switching, not before.
+  app.fly.position.set([10.5, 1.7, -0.3]);
+  app.fly.yaw = Math.PI / 2;      // facing -x, down the nave
+  app.fly.pitch = 0.02;
+  document.body.classList.add('flying');
+  document.addEventListener('pointerlockchange', () => {
+    document.body.classList.toggle('locked', document.pointerLockElement === canvas);
+  });
+
+  trap = AX.createFrameTrap(app, { onCatch: showCatch });
+  app.onAfterRender(() => trap.capture());
+
+  let fpsAccum = 0, fpsFrames = 0, fps = 0, last = performance.now();
+  app.onFrame(() => {
+    const now = performance.now(), frameMs = now - last;
+    last = now;
+    history[historyHead] = frameMs; historyHead = (historyHead + 1) % history.length;
+    fpsAccum += frameMs / 1000; fpsFrames++;
+    if (fpsAccum >= 0.25) { fps = fpsFrames / fpsAccum; fpsAccum = 0; fpsFrames = 0; }
+    if (app.frame % 6 === 0) {
+      const s = app.stats;
+      el('r-tris').textContent = fmt.format(Math.round(s.triangles));
+      el('r-drawn').textContent = fmt.format(s.instances);
+      el('r-culled').textContent = fmt.format(s.culled);
+      el('r-sdraws').textContent = fmt.format(s.shadowDraws);
+      el('r-draws').textContent = fmt.format(s.drawCalls);
+      el('r-frame').textContent = `${frameMs.toFixed(1)} ms`;
+      el('r-cpu').textContent = `${s.cpuMs.toFixed(2)} ms`;
+      el('r-fps').textContent = fps.toFixed(0);
+      drawGraph();
+    }
+  });
+
+  el('loading').hidden = true;
+  app.start();
+
+  /* -------------------------------------------------------- controls --- */
+  const slider = (id, format, apply) => {
+    const input = el(id), out = el(`${id}-out`);
+    input.addEventListener('input', () => { const v = +input.value; out.textContent = format(v); apply(v); });
+  };
+  slider('torches', (v) => v, (v) => { lights.count = v; buildTorches(bulb, flame); });
+  slider('speed', (v) => v.toFixed(2), (v) => { lights.speed = v; });
+  slider('sky', (v) => v.toFixed(2), setSky);
+  slider('exposure', (v) => v.toFixed(2), (v) => { app.renderer.exposure = v; });
+  slider('aoi', (v) => v.toFixed(2), (v) => { app.renderer.ao.intensity = v; });
+  slider('bloom', (v) => v.toFixed(2), (v) => { app.renderer.bloom.strength = v; });
+  slider('softness', (v) => v.toFixed(1), (v) => { app.renderer.shadows.pcfRadius = v; });
+  slider('flyspeed', (v) => `${v.toFixed(1)} m/s`, (v) => { app.fly.speed = v; });
+
+  const toggle = (id, fn) => {
+    const b = el(id);
+    b.addEventListener('click', () => {
+      const on = b.getAttribute('aria-pressed') !== 'true';
+      b.setAttribute('aria-pressed', String(on)); fn(on);
+    });
+  };
+  toggle('t-shadows', (on) => { app.renderer.shadows.enabled = on; });
+  toggle('t-ssr', (on) => { app.renderer.ssr.intensity = on ? 1 : 0; });
+  toggle('t-fxaa', (on) => { app.renderer.fxaa = on; });
+  toggle('t-trap', (on) => { trap.enabled = on; });
+  el('trap-resume').addEventListener('click', () => {
+    el('trap').hidden = true; trap.enabled = true;
+    el('t-trap').setAttribute('aria-pressed', 'true'); app.start();
+  });
+}
+
+boot();
+</script>

@@ -9,7 +9,7 @@
  *   app.start();
  */
 
-export const VERSION = '0.2.0';
+export const VERSION = '0.4.1';
 
 export { App } from './app.js';
 export { World, defineComponent, entityIndex, entityGen, NULL_ENTITY } from './core/ecs.js';
@@ -25,3 +25,7 @@ export { createDevice, resizeCanvas, UnsupportedError } from './gpu/device.js';
 export { Arena, DynamicBuffer } from './gpu/buffers.js';
 export { box, roundedBox, sphere, icosphere, plane, torus, VERTEX_STRIDE_BYTES } from './geometry/primitives.js';
 export { motionSystem, transformSystem, composeRange } from './systems/transform.js';
+export { createFrameTrap } from './debug/frame-trap.js';
+export { loadGLTF, parseGLTF, parseGLB, readAccessor } from './loaders/gltf.js';
+export { unpackAsset, base64ToBytes } from './loaders/packed.js';
+export { textureFromImage, generateMips, solidTexture } from './gpu/textures.js';

@@ -1,0 +1,69 @@
+<!doctype html><meta charset="utf-8">
+<!-- The frame trap must fire on a black frame, name the right stage, and stay
+     silent on ordinary frames. A diagnostic that cries wolf is worse than none. -->
+<canvas id="c" width="320" height="224" style="width:320px;height:224px"></canvas>
+<script type="module">
+import * as AX from '../src/index.js';
+const out = { ok: false, steps: [], errors: [], measured: {} };
+window.__result = out;
+try {
+  const canvas = document.getElementById('c');
+  const gpu = await AX.createDevice(canvas, { canvasUsage: GPUTextureUsage.COPY_SRC });
+  const app = new AX.App(canvas, gpu, {
+    controls: false, ambient: [0.05, 0.06, 0.08], bloom: { strength: 0.45 },
+    shadows: { maxLights: 1, size: 128 }, ssr: { steps: 16 },
+  });
+  const floor = app.mesh(AX.plane(200, 200, 1, 1)), cube = app.mesh(AX.roundedBox(2, 2, 2, 0.15, 3));
+  const slate = app.material({ color: [0.06, 0.07, 0.08], metallic: 0.4, roughness: 0.2, castShadow: false });
+  const steel = app.material({ color: [0.7, 0.6, 0.5], metallic: 0.9, roughness: 0.35 });
+  app.add({ mesh: floor, material: slate, position: [0, -1, 0] });
+  app.add({ mesh: cube, material: steel });
+  const light = app.light([2, 3, 3], { intensity: 200, range: 30 });
+  app.camera.aspect = canvas.width / canvas.height;
+  app.camera.position.set([0, 1.5, 6]); app.camera.target.set([0, 0, 0]); app.camera.update();
+
+  const catches = [];
+  const trap = AX.createFrameTrap(app, { warmup: 5, onCatch: (r) => catches.push(r) });
+  const frame = async () => {
+    app.frame++;
+    app.renderer.render(app.world, app.camera, 0);
+    trap.capture();                       // same task as the render, as in the app loop
+    await gpu.device.queue.onSubmittedWorkDone();
+    await trap.settle();
+  };
+
+  // 1. Ordinary frames: must not fire.
+  trap.enabled = true;
+  for (let i = 0; i < 20; i++) await frame();
+  out.measured.falseAlarms = catches.length;
+  if (catches.length) out.errors.push(`trap fired on ${catches.length} ordinary frame(s)`);
+  out.steps.push('20 ordinary frames');
+
+  // 2. Black introduced after the HDR resolve (exposure 0 blanks the tonemap).
+  app.renderer.exposure = 0;
+  await frame();
+  app.renderer.exposure = 1;
+  const post = catches[catches.length - 1];
+  out.measured.postCatch = post && { stage: post.stage, finalBlack: post.finalBlack, hdrBlack: post.hdrBlack, area: post.area };
+  if (!post) out.errors.push('trap missed a black frame made by the tonemap');
+  else if (post.stage !== 'post') out.errors.push(`tonemap blackout reported as stage "${post.stage}"`);
+  out.steps.push('post-stage black frame');
+
+  // 3. Black already present in the HDR target: no light, no ambient.
+  const before = catches.length;
+  trap.enabled = true;
+  for (let i = 0; i < 8; i++) await frame();
+  app.renderer.ambient = [0, 0, 0];
+  app.world.destroy(light);
+  await frame();
+  const hdr = catches.length > before ? catches[catches.length - 1] : null;
+  out.measured.hdrCatch = hdr && { stage: hdr.stage, finalBlack: hdr.finalBlack, hdrBlack: hdr.hdrBlack, area: hdr.area };
+  if (!hdr) out.errors.push('trap missed a frame that was black in the HDR target');
+  else if (hdr.stage !== 'hdr') out.errors.push(`HDR blackout reported as stage "${hdr.stage}"`);
+  out.steps.push('hdr-stage black frame');
+
+  trap.destroy();
+  out.ok = out.errors.length === 0;
+} catch (e) { out.errors.push(String(e.stack || e)); }
+out.done = true;
+</script>

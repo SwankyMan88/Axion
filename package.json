@@ -1,6 +1,6 @@
 {
   "name": "axion",
-  "version": "0.2.0",
+  "version": "0.4.1",
   "description": "A WebGPU, data-oriented 3D engine.",
   "type": "module",
   "main": "src/index.js",
@@ -20,15 +20,20 @@
     "dev": "node test/serve.mjs",
     "build": "node build.mjs",
     "test": "node test/smoke.mjs",
-    "test:gpu": "node test/gpu-validate.mjs",
-    "test:bundle": "node build.mjs && PAGE=test/bundle-check.html node test/gpu-validate.mjs",
-    "prepublishOnly": "node build.mjs"
+    "test:gpu": "node test/gpu-validate.mjs && node test/gpu-validate.mjs test/regressions.html && node test/gpu-validate.mjs test/trap-check.html && node test/gpu-validate.mjs test/robustness.html",
+    "test:bundle": "node build.mjs && node test/gpu-validate.mjs test/bundle-check.html",
+    "prepublishOnly": "node build.mjs",
+    "fetch:sponza": "node scripts/fetch-sponza.mjs",
+    "test:sponza": "node test/gpu-validate.mjs test/sponza-check.html",
+    "pack:sponza": "node scripts/pack-sponza.mjs",
+    "test:sponza-packed": "node test/gpu-validate.mjs test/sponza-packed-check.html"
   },
   "license": "MIT",
   "sideEffects": false,
   "devDependencies": {
     "esbuild": "^0.28.2",
-    "playwright": "^1.49.1"
+    "playwright": "^1.49.1",
+    "sharp": "^0.35.4"
   },
   "unpkg": "dist/axion.min.js",
   "jsdelivr": "dist/axion.min.js",

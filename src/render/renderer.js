@@ -1,4 +1,5 @@
-import { Arena, DynamicBuffer } from '../gpu/buffers.js';
+import { Arena, DynamicBuffer, retire, sweepRetired } from '../gpu/buffers.js';
+import { solidTexture } from '../gpu/textures.js';
 import {
   STANDARD_WGSL, SHADOW_WGSL, AO_WGSL, AO_BLUR_WGSL, RESOLVE_WGSL,
   BLOOM_PREFILTER_WGSL, BLOOM_DOWN_WGSL, BLOOM_UP_WGSL, FINAL_WGSL, CUBE_FACES,
@@ -61,7 +62,8 @@ export class Renderer {
     this.ssr = {
       intensity: options.ssr?.intensity ?? 1.0,
       steps: options.ssr?.steps ?? 48,
-      thickness: options.ssr?.thickness ?? 0.7,
+      /** World-space depth a surface is assumed to have behind its visible face. */
+      thickness: options.ssr?.thickness ?? 0.5,
       maxDistance: options.ssr?.maxDistance ?? 70,
       fadeDistance: options.ssr?.fadeDistance ?? 90,
     };
@@ -124,14 +126,6 @@ export class Renderer {
     });
     this.lightData = new Float32Array(MAX_LIGHTS * LIGHT_FLOATS);
 
-    const faceSlots = this.shadows.maxLights * 6;
-    this.faceBuffer = device.createBuffer({
-      size: Math.max(FACE_SLOT_BYTES, faceSlots * FACE_SLOT_BYTES),
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      label: 'axion-shadow-faces',
-    });
-    this.faceData = new Float32Array((faceSlots || 1) * (FACE_SLOT_BYTES / 4));
-
     this.meshes = [];
     this.materials = [];
     this._pipelines = new Map();
@@ -162,6 +156,8 @@ export class Renderer {
     this._sVisMesh = new Uint32Array(4096);
     this._frustum = new Float32Array(24);
     this._shadowBatches = [];
+    /** entity -> cube map slot, held across frames so shadows do not blink. */
+    this._shadowSlots = new Map();
 
     this._targets = null;
     this._targetSize = [0, 0];
@@ -190,9 +186,35 @@ export class Renderer {
         { binding: 4, visibility: FRAG, sampler: { type: 'comparison' } },
       ],
     });
-    this._geometryLayout = d.createPipelineLayout({
-      bindGroupLayouts: [this._frameLayout], label: 'axion-geometry-layout',
+    // Group 1: one bind group per material. Same layout in the geometry pass
+    // and the alpha-tested shadow pass.
+    this._materialLayout = d.createBindGroupLayout({
+      label: 'axion-material',
+      entries: [
+        { binding: 0, visibility: FRAG, sampler: { type: 'filtering' } },
+        { binding: 1, visibility: FRAG, texture: { sampleType: 'float' } },
+        { binding: 2, visibility: FRAG, texture: { sampleType: 'float' } },
+        { binding: 3, visibility: FRAG, texture: { sampleType: 'float' } },
+        { binding: 4, visibility: FRAG, buffer: { type: 'uniform' } },
+      ],
     });
+    this._geometryLayout = d.createPipelineLayout({
+      bindGroupLayouts: [this._frameLayout, this._materialLayout], label: 'axion-geometry-layout',
+    });
+
+    // Tiling, trilinear, anisotropic: what authored textures expect. Without
+    // anisotropy a floor seen at a grazing angle turns to mush a few metres out.
+    this._materialSampler = d.createSampler({
+      label: 'axion-material',
+      addressModeU: 'repeat', addressModeV: 'repeat',
+      magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
+      maxAnisotropy: 8,
+    });
+    this._defaultTextures = {
+      white: solidTexture(d, [255, 255, 255, 255], { srgb: true, label: 'axion-white' }),
+      data: solidTexture(d, [255, 255, 255, 255], { label: 'axion-white-linear' }),
+      normal: solidTexture(d, [128, 128, 255, 255], { label: 'axion-flat-normal' }),
+    };
 
     this._shadowLayout = d.createBindGroupLayout({
       label: 'axion-shadow',
@@ -266,6 +288,27 @@ export class Renderer {
       depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
     });
 
+    // Alpha-tested casters need their texture to know where they are solid.
+    // Cards like leaves are usually single planes seen from both sides, so no
+    // face is culled here.
+    this._shadowMaskPipeline = this.device.createRenderPipeline({
+      label: 'axion-shadow-mask',
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this._shadowLayout, this._materialLayout] }),
+      vertex: {
+        module: m.shadow, entryPoint: 'vsMask',
+        buffers: [{
+          arrayStride: VERTEX_STRIDE_BYTES,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: 'float32x3' },
+            { shaderLocation: 2, offset: 24, format: 'float32x2' },
+          ],
+        }],
+      },
+      fragment: { module: m.shadow, entryPoint: 'fsMask', targets: [] },
+      primitive: { topology: 'triangle-list', cullMode: 'none' },
+      depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
+    });
+
     this._aoPipeline = this._fullscreenPipeline('axion-ao', this._aoLayout, m.ao, AO_FORMAT);
     this._aoBlurPipeline = this._fullscreenPipeline('axion-ao-blur', this._aoBlurLayout, m.aoBlur, AO_FORMAT);
     this._resolvePipeline = this._fullscreenPipeline('axion-resolve', this._resolveLayout, m.resolve, HDR_FORMAT);
@@ -278,10 +321,31 @@ export class Renderer {
     this._finalPipeline = this._fullscreenPipeline('axion-final', this._finalLayout, m.final, this.format);
   }
 
+  /**
+   * (Re)allocate the shadow atlas and the per-face uniform slots.
+   *
+   * `shadows.maxLights` and `shadows.size` are plain writable fields, so they
+   * can change at any time — including mid-session from a UI slider. Anything
+   * derived from them has to be rebuilt here rather than assumed fixed at
+   * construction, or a raised limit indexes past the end of the atlas.
+   */
   _buildShadowTarget() {
     const layers = Math.max(6, this.shadows.maxLights * 6);
     const size = this.shadows.size;
-    this._shadowTexture?.destroy();
+    this._shadowBuiltFor = { maxLights: this.shadows.maxLights, size };
+
+    const faceBytes = Math.max(FACE_SLOT_BYTES, layers * FACE_SLOT_BYTES);
+    if (!this.faceBuffer || this.faceBuffer.size < faceBytes) {
+      retire(this.faceBuffer);
+      this.faceBuffer = this.device.createBuffer({
+        size: faceBytes,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        label: 'axion-shadow-faces',
+      });
+      this.faceData = new Float32Array(faceBytes / 4);
+      this._boundShadowBuffer = null;   // force the bind group to be rebuilt
+    }
+    retire(this._shadowTexture);
     this._shadowTexture = this.device.createTexture({
       size: [size, size, layers],
       format: 'depth32float',
@@ -296,6 +360,14 @@ export class Renderer {
       }));
     }
     this._boundInstanceBuffer = null;   // frame bind group references the array
+  }
+
+  _ensureShadowCapacity() {
+    const built = this._shadowBuiltFor;
+    if (built && built.maxLights === this.shadows.maxLights && built.size === this.shadows.size) return;
+    this._buildShadowTarget();
+    this._rebuildFrameBindGroup();
+    this._rebuildShadowBindGroup();
   }
 
   /* ------------------------------------------------------------ registry */
@@ -328,12 +400,42 @@ export class Renderer {
     color = [1, 1, 1], alpha = 1, metallic = 0, roughness = 0.6, emissive = 0,
     transparent = false, doubleSided = false, castShadow = true,
     noiseScale = 0, noiseStrength = 0.6, bump = 0.5, oxide = 0,
+    // Textures, as GPUTextures. Base colour must be an sRGB format; the
+    // metallic-roughness (G = roughness, B = metallic) and normal maps linear.
+    baseColorTexture = null, metallicRoughnessTexture = null, normalTexture = null,
+    normalScale = 1,
+    // 'OPAQUE' or 'MASK'. MASK discards below alphaCutoff, in both the
+    // geometry pass and the shadow pass.
+    alphaMode = 'OPAQUE', alphaCutoff = 0.5,
     name = `material${this.materials.length}`,
   } = {}) {
     const id = this.materials.length;
+    const masked = alphaMode === 'MASK';
+
+    const params = this.device.createBuffer({
+      label: `axion-material-${name}`, size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(params, 0, new Float32Array([
+      masked ? alphaCutoff : 0, normalScale, normalTexture ? 1 : 0, 0,
+    ]));
+    const d = this._defaultTextures;
+    const bindGroup = this.device.createBindGroup({
+      layout: this._materialLayout,
+      label: `axion-material-${name}`,
+      entries: [
+        { binding: 0, resource: this._materialSampler },
+        { binding: 1, resource: (baseColorTexture ?? d.white).createView() },
+        { binding: 2, resource: (metallicRoughnessTexture ?? d.data).createView() },
+        { binding: 3, resource: (normalTexture ?? d.normal).createView() },
+        { binding: 4, resource: { buffer: params } },
+      ],
+    });
+
     this.materials.push({
       id, name, color, alpha, metallic, roughness, emissive, transparent,
       doubleSided, castShadow, noiseScale, noiseStrength, bump, oxide,
+      masked, bindGroup, params,
     });
     return id;
   }
@@ -425,7 +527,7 @@ export class Renderer {
     const { width, height } = this.canvas;
     if (this._targetSize[0] === width && this._targetSize[1] === height) return;
 
-    for (const t of this._targets?.all ?? []) t.destroy();
+    for (const t of this._targets?.all ?? []) retire(t);
 
     // COPY_SRC costs nothing and makes every intermediate target readable —
     // which is how you prove a pass does what it claims rather than assuming.
@@ -549,7 +651,10 @@ export class Renderer {
     if (lights.length === 0) return 0;
 
     const archetypes = world.query([LocalToWorld, MeshRef, Bounds], [Hidden]);
-    const meshCount = Math.max(1, this.meshes.length);
+    // Keyed by (mesh, material), not mesh alone: an alpha-tested material needs
+    // its own pipeline and texture in the depth pass.
+    const matCount = Math.max(1, this.materials.length);
+    const meshCount = Math.max(1, this.meshes.length) * matCount;
     if (!this._sCounts || this._sCounts.length < meshCount + 1) {
       this._sCounts = new Uint32Array(meshCount + 1);
       this._sCursor = new Uint32Array(meshCount + 1);
@@ -591,12 +696,14 @@ export class Renderer {
           const dx = cx - L.x, dy = cy - L.y, dz = cz - L.z;
           const distSq = dx * dx + dy * dy + dz * dz;
           if (distSq > (L.range + radius) * (L.range + radius)) continue;
-          // A caster that encloses the light cannot occlude it. Without this,
-          // the glowing bulb drawn at a light's own position renders into that
-          // light's cube map and shadows the entire scene from it.
-          if (distSq < radius * radius) continue;
+          // A small caster that encloses the light is its bulb: drawn into the
+          // light's own cube map it would shadow the whole scene. Only small
+          // ones, though — a wall or a whole building also "encloses" a light
+          // inside its bounding sphere, and skipping those made shadows blink
+          // on and off as lights crossed the sphere boundary.
+          if (distSq < radius * radius && radius < Math.min(1, 0.1 * L.range)) continue;
 
-          const mesh = R[r * 2 + M_MESH];
+          const mesh = R[r * 2 + M_MESH] * matCount + R[r * 2 + M_MATERIAL];
           this._sVisArch[visible] = ai;
           this._sVisRow[visible] = r;
           this._sVisMesh[visible] = mesh;
@@ -610,7 +717,10 @@ export class Renderer {
       for (let k = 0; k < meshCount; k++) {
         this._sCursor[k] = running;
         if (this._sCounts[k] > 0) {
-          batches.push({ light: li, mesh: k, first: running, count: this._sCounts[k] });
+          batches.push({
+            light: li, mesh: (k / matCount) | 0, material: k % matCount,
+            first: running, count: this._sCounts[k],
+          });
         }
         running += this._sCounts[k];
       }
@@ -634,7 +744,9 @@ export class Renderer {
 
   render(world, camera, time = 0) {
     const t0 = performance.now();
+    sweepRetired();
     this._ensureTargets();
+    this._ensureShadowCapacity();
     const { width, height } = this.canvas;
     const t = this._targets;
 
@@ -646,6 +758,7 @@ export class Renderer {
       for (let r = 0; r < a.count && lightList.length < MAX_LIGHTS; r++) {
         const tOff = r * 10 + T_POS, l = r * 5;
         lightList.push({
+          entity: a.entities[r],
           x: T[tOff], y: T[tOff + 1], z: T[tOff + 2],
           r: L[l], g: L[l + 1], b: L[l + 2],
           intensity: L[l + 3], range: L[l + 4], slot: -1,
@@ -658,15 +771,52 @@ export class Renderer {
       // Rank by how much of the view each light can plausibly affect: bright,
       // near lights keep their maps, distant dim ones lose theirs first.
       const ex = camera.position[0], ey = camera.position[1], ez = camera.position[2];
-      shadowLights = lightList
+      const ranked = lightList
         .map((l) => {
           const d = Math.hypot(l.x - ex, l.y - ey, l.z - ez);
           return { l, score: l.intensity / (1 + d * d * 0.01) };
         })
-        .sort((a, b) => b.score - a.score)
-        .slice(0, this.shadows.maxLights)
-        .map((e) => e.l);
-      shadowLights.forEach((l, i) => { l.slot = i; });
+        .sort((a, b) => b.score - a.score);
+
+      /*
+       * Assignment is sticky, and it has to be.
+       *
+       * Equally bright lights orbiting at the same radius score within a
+       * rounding error of each other, so a plain "top N by score" reshuffles
+       * the winners every frame and shadows visibly blink in and out. A light
+       * therefore keeps the map it already holds while it stays anywhere near
+       * the cut, and only loses it to a light that is clearly ahead.
+       */
+      const max = this.shadows.maxLights;
+      const margin = Math.min(ranked.length, max + 2);
+      const next = new Map();
+      const taken = new Set();
+
+      for (let i = 0; i < margin && next.size < max; i++) {
+        const l = ranked[i].l;
+        const held = this._shadowSlots.get(l.entity);
+        if (held !== undefined && !taken.has(held)) {
+          next.set(l.entity, held);
+          taken.add(held);
+        }
+      }
+      const free = [];
+      for (let sIdx = max - 1; sIdx >= 0; sIdx--) if (!taken.has(sIdx)) free.push(sIdx);
+      for (const { l } of ranked) {
+        if (next.size >= max) break;
+        if (next.has(l.entity)) continue;
+        const slot = free.pop();
+        if (slot === undefined) break;
+        next.set(l.entity, slot);
+      }
+
+      this._shadowSlots = next;
+      for (const l of lightList) {
+        const slot = next.get(l.entity);
+        if (slot !== undefined) { l.slot = slot; shadowLights.push(l); }
+      }
+    } else {
+      this._shadowSlots.clear();
     }
 
     const shadowCasters = this.shadows.enabled
@@ -822,8 +972,9 @@ export class Renderer {
 
     /* ---- 1. shadow cube faces ---- */
     if (shadowCasters > 0) {
+      const maxSlot = (this._shadowFaceViews.length / 6) | 0;
       for (const light of shadowLights) {
-        if (light.slot < 0) continue;
+        if (light.slot < 0 || light.slot >= maxSlot) continue;
         const batches = this._shadowBatches.filter((b) => shadowLights[b.light] === light);
         for (let face = 0; face < 6; face++) {
           const layer = light.slot * 6 + face;
@@ -836,13 +987,17 @@ export class Renderer {
               depthLoadOp: 'clear', depthStoreOp: 'store',
             },
           });
-          pass.setPipeline(this._shadowPipeline);
           pass.setBindGroup(0, this.shadowBindGroup, [layer * FACE_SLOT_BYTES]);
           pass.setVertexBuffer(0, this.vertexArena.buffer);
           pass.setIndexBuffer(this.indexArena.buffer, 'uint32');
+          let bound = null;
           for (const b of batches) {
             const m = this.meshes[b.mesh];
             if (!m) continue;
+            const mat = this.materials[b.material];
+            const pipeline = mat?.masked ? this._shadowMaskPipeline : this._shadowPipeline;
+            if (pipeline !== bound) { pass.setPipeline(pipeline); bound = pipeline; }
+            if (mat?.masked) pass.setBindGroup(1, mat.bindGroup);
             pass.drawIndexed(m.indexCount, b.count, m.firstIndex, m.baseVertex, b.first);
             shadowDraws++;
           }
@@ -874,7 +1029,7 @@ export class Renderer {
     geo.setVertexBuffer(0, this.vertexArena.buffer);
     geo.setIndexBuffer(this.indexArena.buffer, 'uint32');
 
-    let draws = 0, tris = 0, batches = 0, currentPipeline = null;
+    let draws = 0, tris = 0, batches = 0, currentPipeline = null, currentMaterial = null;
     for (let phase = 0; phase < 2; phase++) {
       for (let k = 0; k < keyCount; k++) {
         const count = this._counts[k];
@@ -887,6 +1042,7 @@ export class Renderer {
 
         const pipeline = this._pipelineFor(material);
         if (pipeline !== currentPipeline) { geo.setPipeline(pipeline); currentPipeline = pipeline; }
+        if (material !== currentMaterial) { geo.setBindGroup(1, material.bindGroup); currentMaterial = material; }
         geo.drawIndexed(m.indexCount, count, m.firstIndex, m.baseVertex, start);
         draws++; batches++;
         tris += (m.indexCount / 3) * count;

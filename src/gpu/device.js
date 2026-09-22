@@ -13,6 +13,7 @@ export async function createDevice(canvas, {
   powerPreference = 'high-performance',
   requiredFeatures = [],
   alphaMode = 'opaque',
+  canvasUsage = 0,       // extra GPUTextureUsage bits for the swapchain, e.g. COPY_SRC
 } = {}) {
   if (typeof navigator === 'undefined' || !navigator.gpu) {
     throw new UnsupportedError(
@@ -34,7 +35,10 @@ export async function createDevice(canvas, {
 
   const context = canvas.getContext('webgpu');
   const format = navigator.gpu.getPreferredCanvasFormat();
-  context.configure({ device, format, alphaMode });
+  context.configure({
+    device, format, alphaMode,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | canvasUsage,
+  });
 
   const info = {
     vendor: adapter.info?.vendor ?? 'unknown',

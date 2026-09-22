@@ -1,0 +1,189 @@
+<!doctype html><meta charset="utf-8">
+<!--
+  Regression checks for rendering artifacts, measured by reading pixels back.
+
+  Each check here exists because a bug looked fine in every other test: the
+  shaders compiled, the pipelines validated, the frame rendered. Only reading
+  the output and asking a physical question of it found the problem.
+-->
+<canvas id="c" width="460" height="320"></canvas>
+<script type="module">
+import * as AX from '../src/index.js';
+
+const out = { ok: false, steps: [], errors: [], measured: {} };
+window.__result = out;
+
+const half = (h) => {
+  const sign = (h & 0x8000) ? -1 : 1;
+  const exp = (h >> 10) & 0x1f;
+  const frac = h & 0x3ff;
+  if (exp === 0) return sign * Math.pow(2, -14) * (frac / 1024);
+  if (exp === 31) return frac ? NaN : sign * Infinity;
+  return sign * Math.pow(2, exp - 15) * (1 + frac / 1024);
+};
+
+/** Read an rgba16float target back: per-pixel luma, max, and non-finite count. */
+async function readTarget(device, texture) {
+  const w = texture.width, h = texture.height;
+  const bytesPerRow = Math.ceil((w * 8) / 256) * 256;
+  const buf = device.createBuffer({
+    size: bytesPerRow * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  const enc = device.createCommandEncoder();
+  enc.copyTextureToBuffer({ texture }, { buffer: buf, bytesPerRow }, [w, h, 1]);
+  device.queue.submit([enc.finish()]);
+  await buf.mapAsync(GPUMapMode.READ);
+  const raw = new Uint16Array(buf.getMappedRange());
+  const luma = new Float32Array(w * h);
+  let nonFinite = 0, max = 0;
+  for (let y = 0; y < h; y++) {
+    const row = (y * bytesPerRow) / 2;
+    for (let x = 0; x < w; x++) {
+      const o = row + x * 4;
+      const r = half(raw[o]), g = half(raw[o + 1]), b = half(raw[o + 2]);
+      if (!Number.isFinite(r) || !Number.isFinite(g) || !Number.isFinite(b)) {
+        nonFinite++; luma[y * w + x] = NaN; continue;
+      }
+      const l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      luma[y * w + x] = l;
+      if (l > max) max = l;
+    }
+  }
+  buf.unmap(); buf.destroy();
+  return { w, h, luma, nonFinite, max };
+}
+
+try {
+  const canvas = document.getElementById('c');
+  const gpu = await AX.createDevice(canvas);
+  gpu.device.pushErrorScope('validation');
+
+  /* ------------------------------------------------ 1. fireflies ------ */
+  /*
+   * A near-mirror surface lit by a bright point light produces a GGX peak far
+   * above what rgba16float can hold (max 65504). The overflow becomes Inf,
+   * Inf turns into NaN in the tonemapper and the bloom knee, and the bloom
+   * pyramid then spreads that single pixel into a block — a black rectangle
+   * that appears for one frame whenever a highlight lines up exactly.
+   */
+  {
+    const app = new AX.App(canvas, gpu, {
+      controls: false, fogDensity: 0, ambient: [0.02, 0.025, 0.035],
+      ao: { intensity: 0 }, bloom: { strength: 0.5 },
+      shadows: { enabled: false }, ssr: { steps: 32 },
+    });
+    const floor = app.mesh(AX.plane(200, 200, 1, 1));
+    const mirror = app.material({ color: [0.9, 0.9, 0.92], metallic: 1, roughness: 0.04, castShadow: false });
+    const slate = app.material({ color: [0.03, 0.037, 0.048], metallic: 0.5, roughness: 0.1, castShadow: false });
+
+    let worst = { nonFinite: 0, max: 0, where: '' };
+    for (const [matName, mat] of [['mirror', mirror], ['slate', slate]]) {
+      const floorEnt = app.add({ mesh: floor, material: mat, position: [0, 0, 0] });
+      const light = app.light([0, 1.2, -4], { intensity: 300, range: 40 });
+      for (const camY of [0.08, 0.2, 0.45, 1.0]) {
+        app.camera.aspect = canvas.width / canvas.height;
+        app.camera.position.set([0, camY, 6]);
+        app.camera.target.set([0, 0, -2]);
+        app.camera.update();
+        app.renderer.render(app.world, app.camera, 0);
+        await gpu.device.queue.onSubmittedWorkDone();
+
+        const t = app.renderer._targets;
+        for (const [name, tex] of [['scene', t.color], ['hdr', t.hdr], ['bloom', t.bloom[0].tex]]) {
+          const r = await readTarget(gpu.device, tex);
+          if (r.nonFinite > worst.nonFinite) {
+            worst = { nonFinite: r.nonFinite, max: r.max, where: `${matName} y=${camY} ${name}` };
+          }
+          if (r.max > worst.max && worst.nonFinite === 0) worst.max = r.max;
+        }
+      }
+      app.world.destroy(floorEnt);
+      app.world.destroy(light);
+    }
+    out.measured.fireflies = worst;
+    if (worst.nonFinite > 0) {
+      out.errors.push(`non-finite HDR values (${worst.nonFinite} px in ${worst.where}) — ` +
+                      'these become NaN in bloom and render as a black block');
+    }
+    app.renderer.destroy();
+    out.steps.push('fireflies checked');
+  }
+
+  /* --------------------------------------------- 2. mirror proportions */
+  /*
+   * A vertical pole standing on a horizontal mirror, seen by a camera looking
+   * horizontally, has a reflection exactly as tall on screen as the pole
+   * itself — the image of the top is as far below the horizon line as the
+   * top is above it. So the ratio of reflected to direct height is a physical
+   * invariant, and a squashed reflection shows up as a ratio well below 1.
+   */
+  {
+    const app = new AX.App(canvas, gpu, {
+      controls: false, fogDensity: 0, ambient: [0.01, 0.012, 0.016], fxaa: false,
+      ao: { intensity: 0 }, bloom: { strength: 0 }, shadows: { enabled: false },
+      ssr: { intensity: 1, steps: 96, maxDistance: 60, fadeDistance: 400 },
+    });
+    const floor = app.mesh(AX.plane(400, 400, 1, 1));
+    const pole = app.mesh(AX.box(0.7, 3, 0.7));
+    const mirror = app.material({ color: [0.95, 0.95, 0.95], metallic: 1, roughness: 0.04, castShadow: false });
+    const glow = app.material({ color: [1, 1, 1], metallic: 0, roughness: 1, castShadow: false });
+    app.add({ mesh: floor, material: mirror, position: [0, 0, 0] });
+    app.add({ mesh: pole, material: glow, position: [0, 1.5, 0], color: [1, 1, 1], emissive: 6 });
+
+    // The invariant, generalized to a tilted camera: project the pole's top
+    // and its mirror image with the real camera matrix, and compare the rows
+    // actually lit against the rows geometry says should be lit. A level
+    // camera alone hides normal-encoding errors, because the floor's normal
+    // then sits exactly on the boundary where those errors vanish.
+    const rowOf = (m, x, y, z, h) => {
+      const cy = m[1] * x + m[5] * y + m[9] * z + m[13];
+      const cw = m[3] * x + m[7] * y + m[11] * z + m[15];
+      return (0.5 - (cy / cw) * 0.5) * h;
+    };
+    const ratios = [];
+    for (const [camY, lookY] of [[0.2, 0.2], [0.5, 0.5], [1.2, 1.2], [2.2, 2.2],
+                                 [0.3, 1.8], [0.3, 3.0], [1.5, 0.4], [2.2, 0.0]]) {
+      app.camera.aspect = canvas.width / canvas.height;
+      app.camera.position.set([0, camY, 9]);
+      app.camera.target.set([0, lookY, 0]);
+      app.camera.update();
+      app.renderer.render(app.world, app.camera, 0);
+      await gpu.device.queue.onSubmittedWorkDone();
+
+      const r = await readTarget(gpu.device, app.renderer._targets.hdr);
+      const m = app.camera.viewProj;
+      // The pole's front face is at z = 0.35; measure where it meets the floor.
+      const contactRow = Math.round(rowOf(m, 0, 0, 0.35, r.h));
+      const expectedDown = Math.min(r.h - 1, rowOf(m, 0, -3, 0.35, r.h)) - contactRow;
+
+      const x = r.w >> 1;
+      const bright = (y) => r.luma[y * r.w + x] > 1.0;
+      let direct = 0, reflected = 0;
+      for (let y = contactRow - 2; y >= 0 && bright(y); y--) direct++;
+      for (let y = contactRow + 2; y < r.h && bright(y); y++) reflected++;
+      const expected = Math.max(1, Math.round(expectedDown) - 2);
+      ratios.push({ camY, lookY, direct, reflected, expected,
+                    ratio: +(reflected / expected).toFixed(3) });
+    }
+    out.measured.mirror = ratios;
+    for (const q of ratios) {
+      const tag = `camY=${q.camY} lookY=${q.lookY}`;
+      if (q.direct < 10) {
+        out.errors.push(`mirror check: pole not found at ${tag}`);
+      } else if (q.ratio < 0.85 || q.ratio > 1.15) {
+        out.errors.push(`reflection wrong size at ${tag}: ` +
+                        `${q.reflected}px reflected vs ${q.expected}px expected (ratio ${q.ratio})`);
+      }
+    }
+    app.renderer.destroy();
+    out.steps.push('mirror proportions checked');
+  }
+
+  const err = await gpu.device.popErrorScope();
+  if (err) out.errors.push('validation: ' + err.message);
+  out.ok = out.errors.length === 0;
+} catch (e) {
+  out.errors.push(String(e && e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : e));
+}
+out.done = true;
+</script>

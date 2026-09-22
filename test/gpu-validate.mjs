@@ -29,12 +29,18 @@ const browser = await chromium.launch({
   args: ['--no-sandbox', '--enable-unsafe-webgpu', '--enable-features=Vulkan',
          '--use-angle=swiftshader', '--use-vulkan=swiftshader', '--ignore-gpu-blocklist'],
 });
-const page = await browser.newPage({ viewport: { width: 460, height: 320 } });
+const [vw, vh] = (process.env.AXION_VIEWPORT || '480x340').split('x').map(Number);
+const page = await browser.newPage({ viewport: { width: vw, height: vh } });
 page.on('pageerror', (e) => console.log('[pageerror]', e.message));
 page.on('console', (m) => { if (m.type() === 'error') console.log('[console]', m.text()); });
 
-await page.goto('http://localhost:8099/' + (process.env.PAGE || 'test/gpu-validate.html'), { waitUntil: 'load' });
-await page.waitForFunction(() => window.__result && window.__result.done, null, { timeout: 150000 });
+// Page to run: first CLI argument, then $PAGE, then the default suite. The
+// argument form is what package.json uses, since `PAGE=x cmd` does not work in
+// Windows shells.
+const target = process.argv[2] || process.env.PAGE || 'test/gpu-validate.html';
+await page.goto('http://localhost:8099/' + target, { waitUntil: 'load' });
+await page.waitForFunction(() => window.__result && window.__result.done, null,
+  { timeout: Number(process.env.AXION_TIMEOUT_MS || 150000) });
 const result = await page.evaluate(() => window.__result);
 console.log(JSON.stringify(result, null, 2));
 

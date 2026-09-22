@@ -158,10 +158,18 @@ export class FlyControls {
     this._velocity = new Float32Array(3);
     this._keys = new Set();
 
-    this._onDown = () => { if (this.enabled) element.requestPointerLock?.(); };
+    // Pointer lock where the host allows it; sandboxed iframes (Khan Academy,
+    // artifact viewers) often don't, so a held left button drags the view too.
+    this._dragging = false;
+    this._onDown = (e) => {
+      if (!this.enabled) return;
+      if (e.button === 0) this._dragging = true;
+      try { element.requestPointerLock?.()?.catch?.(() => {}); } catch { /* refused */ }
+    };
+    this._onUp = () => { this._dragging = false; };
     this._onLockChange = () => { this.locked = document.pointerLockElement === element; };
     this._onMove = (e) => {
-      if (!this.enabled || !this.locked) return;
+      if (!this.enabled || !(this.locked || (this._dragging && (e.buttons & 1)))) return;
       this.yaw -= e.movementX * this.sensitivity;
       // Stop just short of vertical: an exactly-vertical forward vector makes
       // the up vector ambiguous and the view rolls unpredictably.
@@ -176,6 +184,7 @@ export class FlyControls {
     this._onKeyUp = (e) => this._keys.delete(e.code);
 
     element.addEventListener('mousedown', this._onDown);
+    window.addEventListener('mouseup', this._onUp);
     document.addEventListener('pointerlockchange', this._onLockChange);
     document.addEventListener('mousemove', this._onMove);
     window.addEventListener('keydown', this._onKeyDown);
@@ -246,6 +255,7 @@ export class FlyControls {
 
   dispose() {
     this.el.removeEventListener('mousedown', this._onDown);
+    window.removeEventListener('mouseup', this._onUp);
     document.removeEventListener('pointerlockchange', this._onLockChange);
     document.removeEventListener('mousemove', this._onMove);
     window.removeEventListener('keydown', this._onKeyDown);

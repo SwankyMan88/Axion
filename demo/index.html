@@ -131,6 +131,20 @@
   .hint { margin: 10px 0 0; font-family: var(--mono); font-size: 10px; line-height: 1.6; color: var(--ink-dim); }
   .hint b { color: var(--ink); font-weight: 500; }
 
+  #trap {
+    top: calc(14px + env(safe-area-inset-top, 0px));
+    right: 14px;
+    width: min(262px, calc(100vw - 28px));
+  }
+  #trap canvas {
+    display: block; width: 100%; aspect-ratio: 1; image-rendering: pixelated;
+    border: 1px solid var(--hairline); border-radius: 2px; background: #000;
+  }
+  #trap p { margin: 9px 0 0; font-family: var(--mono); font-size: 11px; line-height: 1.6; color: var(--ink-dim); }
+  #trap p b { color: var(--ink); font-weight: 500; }
+  #trap .verdict { color: var(--amber); }
+  #trap button { margin-top: 10px; }
+
   #fallback { position: fixed; inset: 0; display: none; place-content: center; padding: 24px; }
   #fallback.show { display: grid; }
   #fallback div { max-width: 46ch; }
@@ -152,7 +166,7 @@
 <div id="stage"><canvas id="gpu"></canvas></div>
 
 <div class="chrome" id="masthead">
-  <div class="wordmark">Axion<b>·</b><span>light study</span></div>
+  <div class="wordmark">Axion<b>·</b><span>light study · <span id="ver">—</span></span></div>
   <p class="tagline">Cube-map shadows, horizon occlusion, screen-space reflections and bloom — six passes over an archetype ECS.</p>
   <section class="panel" id="telemetry">
     <h2>Frame telemetry</h2>
@@ -177,8 +191,8 @@
   <section class="panel">
     <h2>Light ring</h2>
     <div class="field">
-      <div class="field-head"><label for="lights">count</label><output id="lights-out" for="lights">6</output></div>
-      <input id="lights" type="range" min="1" max="16" step="1" value="6">
+      <div class="field-head"><label for="lights">count</label><output id="lights-out" for="lights">4</output></div>
+      <input id="lights" type="range" min="1" max="16" step="1" value="4">
     </div>
     <div class="field">
       <div class="field-head"><label for="speed">orbit speed</label><output id="speed-out" for="speed">0.40</output></div>
@@ -225,9 +239,20 @@
         <button class="switch" id="t-fxaa" type="button" aria-pressed="true">fxaa</button>
         <button class="switch" id="t-fog" type="button" aria-pressed="true">fog</button>
         <button class="switch" id="t-spin" type="button" aria-pressed="true">spin</button>
+        <button class="switch" id="t-trap" type="button" aria-pressed="false" title="Pause on the first frame with a black region in the center">trap</button>
       </div>
     </div>
     <p class="hint" id="hint">Drag to orbit · wheel to zoom · shift-drag to pan</p>
+  </section>
+</div>
+
+<div class="chrome" id="trap" hidden>
+  <section class="panel">
+    <h2>Caught frame</h2>
+    <canvas id="trap-shot" width="192" height="192"></canvas>
+    <p id="trap-info"></p>
+    <p class="verdict" id="trap-verdict"></p>
+    <button class="switch" id="trap-resume" type="button" aria-pressed="false">resume</button>
   </section>
 </div>
 
@@ -242,14 +267,17 @@
 import * as AX from './src/index.js';
 
 const canvas = document.getElementById('gpu');
+// The engine version actually loaded, so "is this the new build?" is never a guess.
+document.getElementById('ver').textContent = `v${AX.VERSION}`;
 const fallback = document.getElementById('fallback');
 const el = (id) => document.getElementById(id);
 const fmt = new Intl.NumberFormat('en-US');
 
 let app = null;
+let trap = null;
 const MESH = {};
 const MAT = {};
-const ring = { count: 6, speed: 0.4, radius: 9, height: 4.2 };
+const ring = { count: 4, speed: 0.4, radius: 9, height: 4.2 };
 
 /**
  * Orbit is a component, not a callback.
@@ -422,6 +450,7 @@ async function boot() {
       bloom: { threshold: 1.1, knee: 0.65, strength: 0.45 },
       shadows: { maxLights: 4, size: 768, pcfRadius: 1.6 },
       controls: { distance: 21, azimuth: 0.85, polar: 1.18, minDistance: 3, maxDistance: 140, autoRotate: 0.05 },
+      canvasUsage: GPUTextureUsage.COPY_SRC,   // lets the frame trap read what was presented
       fly: { speed: 10, position: [0, 3, 20] },
     });
   } catch (err) {
@@ -497,7 +526,32 @@ async function boot() {
     }
   });
 
+  trap = AX.createFrameTrap(app, { onCatch: showCatch });
+  app.onAfterRender(() => trap.capture());
   app.start();
+}
+
+/* ------------------------------------------------------------ frame trap -- */
+
+// The trap lives in the engine (src/debug/frame-trap.js); this only shows
+// what it caught.
+function showCatch(report) {
+  const shot = el('trap-shot');
+  shot.width = report.w; shot.height = report.h;
+  shot.getContext('2d').putImageData(new ImageData(report.rgba, report.w, report.h), 0, 0);
+
+  const pct = (n) => `${((n / report.area) * 100).toFixed(1)}%`;
+  const v = (a) => a.map((n) => n.toFixed(2)).join(', ');
+  el('trap-info').innerHTML =
+    `frame <b>${report.frame}</b> · t <b>${report.time.toFixed(3)}s</b><br>` +
+    `camera <b>${v(report.camera)}</b><br>` +
+    `black: final <b>${pct(report.finalBlack)}</b> · hdr <b>${pct(report.hdrBlack)}</b>`;
+  el('trap-verdict').textContent = report.stage === 'hdr'
+    ? 'Black is already in the HDR resolve: geometry, reflections, occlusion or resolve.'
+    : 'HDR was fine: the black appears in bloom, tonemap or FXAA.';
+  el('trap').hidden = false;
+  el('t-trap').setAttribute('aria-pressed', 'false');
+  console.warn('[axion] frame trap caught a black region', report);
 }
 
 /* ------------------------------------------------------------ controls -- */
@@ -551,6 +605,13 @@ toggle('t-fly', (on) => {
   el('hint').innerHTML = on
     ? 'Click the view to capture the mouse · <b>WASD</b> to move · <b>space</b> and <b>shift</b> for up and down · <b>esc</b> to release'
     : 'Drag to orbit · wheel to zoom · shift-drag to pan';
+});
+toggle('t-trap', (on) => { if (trap) trap.enabled = on; });
+el('trap-resume').addEventListener('click', () => {
+  el('trap').hidden = true;
+  if (trap) trap.enabled = true;          // re-arm, with a fresh baseline
+  el('t-trap').setAttribute('aria-pressed', 'true');
+  app?.start();
 });
 toggle('t-fxaa', (on) => { if (app) app.renderer.fxaa = on; });
 toggle('t-fog', (on) => { if (app) app.renderer.fogDensity = on ? 0.0075 : 0; });

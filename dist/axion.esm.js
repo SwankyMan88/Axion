@@ -1,4 +1,4 @@
-/*! Axion 0.2.0 — WebGPU, data-oriented 3D engine. MIT. */
+/*! Axion 0.4.1 — WebGPU, data-oriented 3D engine. MIT. */
 var __defProp = Object.defineProperty;
 var __export = (target, all) => {
   for (var name in all)
@@ -11,7 +11,9 @@ var UnsupportedError = class extends Error {
 async function createDevice(canvas, {
   powerPreference = "high-performance",
   requiredFeatures = [],
-  alphaMode = "opaque"
+  alphaMode = "opaque",
+  canvasUsage = 0
+  // extra GPUTextureUsage bits for the swapchain, e.g. COPY_SRC
 } = {}) {
   if (typeof navigator === "undefined" || !navigator.gpu) {
     throw new UnsupportedError(
@@ -32,7 +34,12 @@ async function createDevice(canvas, {
   });
   const context = canvas.getContext("webgpu");
   const format = navigator.gpu.getPreferredCanvasFormat();
-  context.configure({ device, format, alphaMode });
+  context.configure({
+    device,
+    format,
+    alphaMode,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | canvasUsage
+  });
   const info = {
     vendor: adapter.info?.vendor ?? "unknown",
     architecture: adapter.info?.architecture ?? "unknown",
@@ -59,6 +66,19 @@ function resizeCanvas(canvas, maxDpr = 2) {
 
 // src/gpu/buffers.js
 var align = (n, a) => Math.ceil(n / a) * a;
+var RETIRE_FRAMES = 3;
+var graveyard = [];
+function retire(resource) {
+  if (resource) graveyard.push({ resource, age: 0 });
+}
+function sweepRetired() {
+  for (let i = graveyard.length - 1; i >= 0; i--) {
+    if (++graveyard[i].age > RETIRE_FRAMES) {
+      graveyard[i].resource.destroy();
+      graveyard.splice(i, 1);
+    }
+  }
+}
 var Arena = class {
   constructor(device, usage, initialBytes = 1 << 20, label = "arena") {
     this.device = device;
@@ -98,7 +118,7 @@ var Arena = class {
     const enc = this.device.createCommandEncoder({ label: `${this.label}-grow` });
     enc.copyBufferToBuffer(this.buffer, 0, next, 0, this.offset);
     this.device.queue.submit([enc.finish()]);
-    this.buffer.destroy();
+    retire(this.buffer);
     this.buffer = next;
     this.capacity = cap;
   }
@@ -122,8 +142,10 @@ var DynamicBuffer = class {
     if (floats <= this.cpu.length) return;
     let n = this.cpu.length;
     while (n < floats) n *= 2;
-    this.cpu = new Float32Array(n);
-    this.buffer.destroy();
+    const next = new Float32Array(n);
+    next.set(this.cpu);
+    this.cpu = next;
+    retire(this.buffer);
     this.buffer = this.device.createBuffer({
       size: align(this.cpu.byteLength, 256),
       usage: this.usage,
@@ -145,6 +167,106 @@ var DynamicBuffer = class {
     this.buffer.destroy();
   }
 };
+
+// src/gpu/textures.js
+var MIP_WGSL = (
+  /* wgsl */
+  `
+@group(0) @binding(0) var srcSampler : sampler;
+@group(0) @binding(1) var src : texture_2d<f32>;
+
+struct Out { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> Out {
+  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  var o : Out;
+  o.pos = vec4<f32>(p[vi], 0.0, 1.0);
+  o.uv = vec2<f32>(p[vi].x * 0.5 + 0.5, 0.5 - p[vi].y * 0.5);
+  return o;
+}
+
+@fragment
+fn fs(i : Out) -> @location(0) vec4<f32> {
+  return textureSampleLevel(src, srcSampler, i.uv, 0.0);
+}
+`
+);
+var mipState = /* @__PURE__ */ new WeakMap();
+function mipPipeline(device, format) {
+  let st = mipState.get(device);
+  if (!st) {
+    st = {
+      module: device.createShaderModule({ code: MIP_WGSL, label: "axion-mip" }),
+      sampler: device.createSampler({ minFilter: "linear", magFilter: "linear" }),
+      pipelines: /* @__PURE__ */ new Map()
+    };
+    mipState.set(device, st);
+  }
+  let p = st.pipelines.get(format);
+  if (!p) {
+    p = device.createRenderPipeline({
+      label: `axion-mip-${format}`,
+      layout: "auto",
+      vertex: { module: st.module, entryPoint: "vs" },
+      fragment: { module: st.module, entryPoint: "fs", targets: [{ format }] },
+      primitive: { topology: "triangle-list" }
+    });
+    st.pipelines.set(format, p);
+  }
+  return { pipeline: p, sampler: st.sampler };
+}
+var mipLevelsFor = (w, h) => Math.floor(Math.log2(Math.max(w, h))) + 1;
+function generateMips(device, texture) {
+  const { pipeline, sampler } = mipPipeline(device, texture.format);
+  const enc = device.createCommandEncoder({ label: "axion-mips" });
+  for (let level = 1; level < texture.mipLevelCount; level++) {
+    const bind = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: sampler },
+        { binding: 1, resource: texture.createView({ baseMipLevel: level - 1, mipLevelCount: 1 }) }
+      ]
+    });
+    const pass = enc.beginRenderPass({
+      colorAttachments: [{
+        view: texture.createView({ baseMipLevel: level, mipLevelCount: 1 }),
+        loadOp: "clear",
+        storeOp: "store",
+        clearValue: { r: 0, g: 0, b: 0, a: 0 }
+      }]
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bind);
+    pass.draw(3);
+    pass.end();
+  }
+  device.queue.submit([enc.finish()]);
+}
+function textureFromImage(device, image, { srgb = true, mips = true, label = "axion-texture" } = {}) {
+  const format = srgb ? "rgba8unorm-srgb" : "rgba8unorm";
+  const w = image.width, h = image.height;
+  const texture = device.createTexture({
+    label,
+    format,
+    size: [w, h],
+    mipLevelCount: mips ? mipLevelsFor(w, h) : 1,
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT
+  });
+  device.queue.copyExternalImageToTexture({ source: image }, { texture }, [w, h]);
+  if (mips && texture.mipLevelCount > 1) generateMips(device, texture);
+  return texture;
+}
+function solidTexture(device, rgba, { srgb = false, label = "axion-solid" } = {}) {
+  const texture = device.createTexture({
+    label,
+    size: [1, 1],
+    format: srgb ? "rgba8unorm-srgb" : "rgba8unorm",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+  });
+  device.queue.writeTexture({ texture }, new Uint8Array(rgba), { bytesPerRow: 4 }, [1, 1]);
+  return texture;
+}
 
 // src/render/shaders.js
 var COMMON = (
@@ -169,16 +291,74 @@ struct Camera {
 
 const PI : f32 = 3.14159265359;
 
+/**
+ * Clamp a radiance value to something every later pass can survive.
+ *
+ * One NaN or Inf pixel in the HDR target is invisible on its own, but the
+ * bloom pyramid averages it into every texel it touches on the way down and
+ * back up, and the frame comes out with a solid black RECTANGLE where the
+ * poisoned mip texels land. The check is done on the bits, not with x != x,
+ * because shader compilers running fast-math may fold that comparison to
+ * false. Negative radiance is clamped too: pow() of a negative is NaN.
+ */
+fn sanitize(c : vec3<f32>) -> vec3<f32> {
+  let bits = bitcast<vec3<u32>>(c) & vec3<u32>(0x7f800000u);
+  let bad = bits == vec3<u32>(0x7f800000u);
+  return select(clamp(c, vec3<f32>(0.0), vec3<f32>(60000.0)), vec3<f32>(0.0), bad);
+}
+
+/**
+ * Normalize that cannot produce NaN.
+ *
+ * A zero-length vector out of normalize() poisons every subsequent operation,
+ * and a NaN fragment reads as a black hole in the frame. Bump mapping can
+ * cancel a normal exactly, so this is not theoretical.
+ */
+fn safeNormalize(v : vec3<f32>, fallback : vec3<f32>) -> vec3<f32> {
+  let l2 = dot(v, v);
+  if (l2 < 1e-12) { return fallback; }
+  return v * inverseSqrt(l2);
+}
+
+/**
+ * Interleaved 4x4 sample rotation.
+ *
+ * Per-pixel white noise cannot be removed by a small blur \u2014 that is what
+ * leaves the dithered crust on distant ground. Sixteen rotations laid out on a
+ * repeating 4x4 tile can: any four consecutive pixels cover every residue, so
+ * a 4x4 box blur averages exactly one complete set of directions and the noise
+ * integrates away instead of smearing.
+ */
+fn interleavedIndex(pixel : vec2<f32>) -> i32 {
+  let p = vec2<i32>(pixel);
+  return (p.x & 3) + ((p.y & 3) << 2);
+}
+
+/**
+ * sign() that never returns 0.
+ *
+ * WGSL's sign(0.0) is 0. The octahedral fold multiplies by the sign of each
+ * component, so a normal with an exactly-zero component in the lower
+ * hemisphere had that axis erased \u2014 and a floor seen by a camera tilted
+ * upward is precisely that case. Its normal came back tilted by the camera's
+ * own pitch, which at grazing angles bent reflections upward hard enough to
+ * crush them into a thin band, and where the component flickered around zero
+ * from pixel to pixel it produced horizontal stripes.
+ */
+fn signNotZero(v : vec2<f32>) -> vec2<f32> {
+  return select(vec2<f32>(-1.0), vec2<f32>(1.0), v >= vec2<f32>(0.0));
+}
+
 fn octEncode(n : vec3<f32>) -> vec2<f32> {
   let d = n / (abs(n.x) + abs(n.y) + abs(n.z) + 1e-6);
   if (d.z >= 0.0) { return d.xy; }
-  return (vec2<f32>(1.0) - abs(d.yx)) * vec2<f32>(sign(d.x), sign(d.y));
+  return (vec2<f32>(1.0) - abs(d.yx)) * signNotZero(d.xy);
 }
 
 fn octDecode(e : vec2<f32>) -> vec3<f32> {
   var n = vec3<f32>(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
   if (n.z < 0.0) {
-    let t = (vec2<f32>(1.0) - abs(n.yx)) * vec2<f32>(sign(n.x), sign(n.y));
+    let t = (vec2<f32>(1.0) - abs(n.yx)) * signNotZero(n.xy);
     n = vec3<f32>(t.x, t.y, n.z);
   }
   return normalize(n);
@@ -214,6 +394,19 @@ fn sampleEnvironment(dir : vec3<f32>, roughness : f32, ambient : vec3<f32>) -> v
 
   let avg = (sky + horizon + ground) / 3.0;
   return mix(env, avg, roughness * roughness);
+}
+
+/**
+ * The full-resolution pixel containing a UV: floor(uv * size), clamped.
+ *
+ * This must match the rasterizer's pixel grid exactly. Scaling by (size - 1)
+ * instead \u2014 an easy slip \u2014 shifts the lookup by up to a whole pixel, worst in
+ * the middle of the screen, so a depth test and the colour fetched for the
+ * same "hit" can come from two different pixels.
+ */
+fn pixelOf(uv : vec2<f32>) -> vec2<i32> {
+  let size = vec2<i32>(camera.screen.xy);
+  return clamp(vec2<i32>(floor(uv * camera.screen.xy)), vec2<i32>(0), size - vec2<i32>(1));
 }
 
 /** Fullscreen triangle from the vertex index alone \u2014 no vertex buffer. */
@@ -261,6 +454,24 @@ fn faceIndex(v : vec3<f32>) -> i32 {
 }
 `
 );
+var MATERIAL_WGSL = (
+  /* wgsl */
+  `
+/* Material textures: group 1, identical layout in the geometry and the
+   alpha-tested shadow pass. Untextured materials bind 1x1 defaults. */
+struct MaterialParams {
+  alphaCutoff : f32,   // 0 = opaque; otherwise discard below this alpha
+  normalScale : f32,
+  hasNormalMap : f32,
+  pad : f32,
+};
+@group(1) @binding(0) var matSampler : sampler;
+@group(1) @binding(1) var baseColorTex : texture_2d<f32>;
+@group(1) @binding(2) var metalRoughTex : texture_2d<f32>;   // glTF: G = roughness, B = metallic
+@group(1) @binding(3) var normalTex : texture_2d<f32>;
+@group(1) @binding(4) var<uniform> material : MaterialParams;
+`
+);
 var SHADOW_WGSL = (
   /* wgsl */
   `
@@ -275,6 +486,30 @@ struct Face {
 fn vs(@builtin(instance_index) ii : u32,
       @location(0) position : vec3<f32>) -> @builtin(position) vec4<f32> {
   return face.viewProj * (models[ii] * vec4<f32>(position, 1.0));
+}
+
+/* Alpha-tested casters: leaves, chains, grilles. Without this they cast solid
+   rectangular shadows the shape of their cards. */
+${MATERIAL_WGSL}
+
+struct MaskOut {
+  @builtin(position) pos : vec4<f32>,
+  @location(0) uv : vec2<f32>,
+};
+
+@vertex
+fn vsMask(@builtin(instance_index) ii : u32,
+          @location(0) position : vec3<f32>,
+          @location(2) uv : vec2<f32>) -> MaskOut {
+  var o : MaskOut;
+  o.pos = face.viewProj * (models[ii] * vec4<f32>(position, 1.0));
+  o.uv = uv;
+  return o;
+}
+
+@fragment
+fn fsMask(in : MaskOut) {
+  if (textureSample(baseColorTex, matSampler, in.uv).a < material.alphaCutoff) { discard; }
 }
 `
 );
@@ -302,7 +537,7 @@ struct Light {
 @group(0) @binding(2) var<storage, read> lights : array<Light>;
 @group(0) @binding(3) var shadowMaps : texture_depth_2d_array;
 @group(0) @binding(4) var shadowSampler : sampler_comparison;
-
+${MATERIAL_WGSL}
 struct VSOut {
   @builtin(position) clip : vec4<f32>,
   @location(0) worldPos   : vec3<f32>,
@@ -460,11 +695,45 @@ fn fresnelSchlick(cosTheta : f32, f0 : vec3<f32>) -> vec3<f32> {
 }
 
 @fragment
-fn fs(in : VSOut) -> GBuffer {
-  var albedo = in.color.rgb;
-  var metallic = clamp(in.pbr.x, 0.0, 1.0);
-  var roughness = clamp(in.pbr.y, 0.04, 1.0);
-  var N = normalize(in.normal);
+fn fs(in : VSOut, @builtin(front_facing) front : bool) -> GBuffer {
+  // Everything that needs derivatives happens first, in uniform control flow:
+  // texture sampling with implicit mip selection, and the surface frame for
+  // normal mapping. After a discard or a branch, neither is well defined.
+  let base = textureSample(baseColorTex, matSampler, in.uv);
+  let mr = textureSample(metalRoughTex, matSampler, in.uv);
+  let nmap = textureSample(normalTex, matSampler, in.uv).xyz * 2.0 - 1.0;
+  let dp1 = dpdx(in.worldPos);
+  let dp2 = dpdy(in.worldPos);
+  let duv1 = dpdx(in.uv);
+  let duv2 = dpdy(in.uv);
+
+  let alpha = in.color.a * base.a;
+  if (material.alphaCutoff > 0.0 && alpha < material.alphaCutoff) { discard; }
+
+  var albedo = in.color.rgb * base.rgb;
+  var metallic = clamp(in.pbr.x * mr.b, 0.0, 1.0);
+  var roughness = clamp(in.pbr.y * mr.g, 0.04, 1.0);
+
+  // A double-sided surface seen from behind must be lit from behind.
+  var N = safeNormalize(in.normal, vec3<f32>(0.0, 1.0, 0.0));
+  if (!front) { N = -N; }
+
+  if (material.hasNormalMap > 0.5) {
+    /*
+     * Cotangent frame from screen-space derivatives (Schueler). The tangent
+     * basis is reconstructed per pixel from how position and UV change across
+     * the screen, so meshes need no tangent attribute and the vertex format
+     * stays 32 bytes. glTF normal maps are +Y up in image space while V grows
+     * downward, hence the flipped green channel.
+     */
+    let dp2perp = cross(dp2, N);
+    let dp1perp = cross(N, dp1);
+    let T = dp2perp * duv1.x + dp1perp * duv2.x;
+    let B = dp2perp * duv1.y + dp1perp * duv2.y;
+    let scale = inverseSqrt(max(max(dot(T, T), dot(B, B)), 1e-20));
+    let ts = vec3<f32>(nmap.xy * material.normalScale * vec2<f32>(1.0, -1.0), nmap.z);
+    N = safeNormalize(T * scale * ts.x + B * scale * ts.y + N * ts.z, N);
+  }
 
   let noiseScale = in.surf.x;
   if (noiseScale > 0.0) {
@@ -478,7 +747,11 @@ fn fs(in : VSOut) -> GBuffer {
     let dy = fbm(p + vec3<f32>(0.0, e, 0.0)) - h;
     let dz = fbm(p + vec3<f32>(0.0, 0.0, e)) - h;
     let grad = vec3<f32>(dx, dy, dz) * noiseScale;
-    N = normalize(N - (grad - N * dot(grad, N)) * in.surf.z);
+    // Project the gradient onto the tangent plane and bend the normal by it.
+    // A strong bump can cancel the normal exactly, so this cannot use a bare
+    // normalize: one NaN here becomes a black fragment on screen.
+    let tangentGrad = grad - N * dot(grad, N);
+    N = safeNormalize(N - tangentGrad * in.surf.z, N);
 
     // Weathering: a second, coarser field decides where the finish is gone.
     let wear = smoothstep(0.42, 0.72, fbm(p * 0.27));
@@ -536,7 +809,7 @@ fn fs(in : VSOut) -> GBuffer {
 
   var out : GBuffer;
   // Ambient is deferred to the resolve pass so occlusion can modulate it.
-  out.color = vec4<f32>(Lo + albedo * in.pbr.z, in.color.a);
+  out.color = vec4<f32>(sanitize(Lo + albedo * in.pbr.z), alpha);
   let viewN = normalize((camera.view * vec4<f32>(N, 0.0)).xyz);
   let oct = octEncode(viewN);
   out.surface = vec4<f32>(oct.x, oct.y, roughness, metallic);
@@ -555,14 +828,12 @@ ${COMMON}
 @group(0) @binding(2) var depthTex : texture_depth_2d;
 @group(0) @binding(3) var surfaceTex : texture_2d<f32>;
 
+fn loadDepth(uv : vec2<f32>) -> f32 {
+  return textureLoad(depthTex, pixelOf(uv), 0);
+}
+
 @vertex
 fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
-
-fn loadDepth(uv : vec2<f32>) -> f32 {
-  let c = vec2<i32>(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) *
-                    vec2<f32>(camera.screen.x - 1.0, camera.screen.y - 1.0));
-  return textureLoad(depthTex, c, 0);
-}
 
 /**
  * Horizon-based ambient occlusion.
@@ -593,7 +864,7 @@ fn fs(in : FSOut) -> @location(0) f32 {
   //
   // Fading out is honest: no occlusion beats invented occlusion.
   let dist = -P.z;
-  let distanceFade = 1.0 - smoothstep(camera.fade.x * 0.65, camera.fade.x, dist);
+  let distanceFade = 1.0 - smoothstep(camera.fade.x * 0.35, camera.fade.x, dist);
   if (distanceFade <= 0.001) { return 1.0; }
   let grazeFade = smoothstep(0.12, 0.38, abs(dot(N, normalize(-P))));
   if (grazeFade <= 0.001) { return 1.0; }
@@ -603,20 +874,25 @@ fn fs(in : FSOut) -> @location(0) f32 {
   // sampled with a metre-wide kernel measured in pixels.
   let radiusUV = clamp(radius * camera.proj.x / max(-P.z, 1e-3) * 0.5, 0.004, 0.22);
 
-  let pix = in.uv * camera.screen.xy;
-  let rot = fract(52.9829189 * fract(0.06711056 * pix.x + 0.00583715 * pix.y)) * 6.2831853;
-
-  var occlusion = 0.0;
+  // in.clip.xy is this pass's own pixel coordinate, which is what the 4x4 tile
+  // has to be keyed on: the AO pass runs at half resolution, so keying off the
+  // full-res coordinate would only ever visit the even residues and half the
+  // rotations would never be used.
   let SLICES = 6;
   let STEPS = 5;
+  let tile = interleavedIndex(in.clip.xy);
+  let rot = f32(tile) * (PI / f32(SLICES)) / 16.0;
+  let radialOffset = (f32(tile & 3) + 0.5) * 0.25;
+
+  var occlusion = 0.0;
 
   for (var s = 0; s < SLICES; s = s + 1) {
-    let theta = rot + f32(s) * (3.14159265 / f32(SLICES));
+    let theta = rot + f32(s) * (PI / f32(SLICES));
     let dir = vec2<f32>(cos(theta), sin(theta));
 
     var best = 0.0;
     for (var t = 1; t <= STEPS; t = t + 1) {
-      let frac = f32(t) / f32(STEPS);
+      let frac = (f32(t) - 1.0 + radialOffset) / f32(STEPS);
       let uv = in.uv + dir * radiusUV * frac;
       if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { break; }
 
@@ -651,14 +927,12 @@ ${COMMON}
 @group(0) @binding(2) var aoTex : texture_2d<f32>;
 @group(0) @binding(3) var depthTex : texture_depth_2d;
 
+fn loadDepth(uv : vec2<f32>) -> f32 {
+  return textureLoad(depthTex, pixelOf(uv), 0);
+}
+
 @vertex
 fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
-
-fn loadDepth(uv : vec2<f32>) -> f32 {
-  let c = vec2<i32>(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) *
-                    vec2<f32>(camera.screen.x - 1.0, camera.screen.y - 1.0));
-  return textureLoad(depthTex, c, 0);
-}
 
 /**
  * Depth-aware box blur. Weighting each tap by how close its depth is to the
@@ -673,8 +947,12 @@ fn fs(in : FSOut) -> @location(0) f32 {
 
   var sum = 0.0;
   var weight = 0.0;
-  for (var y = -2; y <= 2; y = y + 1) {
-    for (var x = -2; x <= 2; x = x + 1) {
+  // Exactly four pixels on each axis, matching the 4x4 rotation tile. Any four
+  // consecutive pixels contain one of every rotation, so this kernel averages
+  // one whole set of sample directions \u2014 a 5x5 would double-count some and
+  // leave a residual pattern behind.
+  for (var y = -1; y <= 2; y = y + 1) {
+    for (var x = -1; x <= 2; x = x + 1) {
       let uv = in.uv + vec2<f32>(f32(x), f32(y)) * texel;
       let z = linearDepth(loadDepth(uv), camera.proj.z);
       let w = exp(-abs(z - centerZ) * 2.0);
@@ -699,14 +977,12 @@ ${COMMON}
 @group(0) @binding(5) var depthTex : texture_depth_2d;
 @group(0) @binding(6) var aoTex : texture_2d<f32>;
 
+fn loadDepth(uv : vec2<f32>) -> f32 {
+  return textureLoad(depthTex, pixelOf(uv), 0);
+}
+
 @vertex
 fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
-
-fn loadDepth(uv : vec2<f32>) -> f32 {
-  let c = vec2<i32>(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) *
-                    vec2<f32>(camera.screen.x - 1.0, camera.screen.y - 1.0));
-  return textureLoad(depthTex, c, 0);
-}
 
 fn viewToUV(p : vec3<f32>) -> vec2<f32> {
   let dist = max(-p.z, 1e-5);
@@ -728,66 +1004,127 @@ struct Reflection {
  * than the depth buffer can justify \u2014 that rejection is what keeps thin
  * geometry from smearing a false reflection across the floor.
  */
-fn traceSSR(origin : vec3<f32>, dir : vec3<f32>, jitter : f32) -> Reflection {
+/**
+ * Screen-space reflection, marched in screen space.
+ *
+ * The ray is projected to the screen once, then walked at roughly one pixel
+ * per step while 1/z is interpolated linearly along that line \u2014 1/z being the
+ * only depth quantity that varies linearly across a screen-space line, which
+ * is what makes the march independent of camera orientation.
+ *
+ * Three rules keep a reflection ray from finding its own surface, which is
+ * the failure that shows up as black seams at contact lines, a dark band at
+ * the horizon, and reflections that shrink as the camera nears the ground:
+ *
+ *   1. The origin is lifted off the surface along its normal, so the pixel it
+ *      starts on is unambiguously *behind* the ray, never level with it.
+ *   2. Steps are never shorter than a pixel. Sub-pixel steps re-sample the
+ *      origin pixel, and at grazing angles its depth matches the ray to within
+ *      precision \u2014 a guaranteed false hit.
+ *   3. A hit is an *overlap*: the depth range the ray covered during the step
+ *      must intersect a thin slab behind the visible surface. A threshold on
+ *      "how far behind" alone accepts hits too early along grazing rays, which
+ *      compresses the reflection toward its contact point.
+ */
+fn traceSSR(P : vec3<f32>, N : vec3<f32>, R : vec3<f32>, jitter : f32) -> Reflection {
   var result : Reflection;
   result.color = vec3<f32>(0.0);
   result.hit = 0.0;
 
-  let steps = i32(camera.ssr.y);
-  let maxDist = camera.ssr.w;
-  var stepLen = maxDist / f32(steps) * 0.22;
+  let near = camera.proj.z;
 
-  var t = stepLen * (0.5 + jitter);
+  // Rule 1. The lift grows with distance because depth precision does.
+  let lift = max(0.01, -P.z * 0.0025);
+  let O = P + N * lift;
+  if (O.z > -near) { return result; }
+
+  // Clip to the near plane: past it the ray is behind the eye and projecting
+  // it would fold the line back on itself.
+  var Q = O + R * camera.ssr.w;
+  if (Q.z > -near) {
+    if (abs(R.z) < 1e-6) { return result; }
+    let tClip = (-near - O.z) / R.z;
+    if (tClip <= 0.0) { return result; }
+    Q = O + R * tClip;
+  }
+
+  let pxStart = viewToUV(O) * camera.screen.xy;
+  let pxEnd = viewToUV(Q) * camera.screen.xy;
+  let delta = pxEnd - pxStart;
+  let span = max(abs(delta.x), abs(delta.y));
+  if (span < 1.0) { return result; }
+
+  // Rule 2. One step per pixel, never fewer pixels than steps.
+  let stepCount = min(span, camera.ssr.y);
+  let invStep = 1.0 / stepCount;
+
+  let invZStart = 1.0 / O.z;
+  let invZEnd = 1.0 / Q.z;
+
+  // The first sample lands a full step out, jittered within that step.
   var prevT = 0.0;
+  var prevRayZ = O.z;
+  var t = invStep * (1.0 + jitter);
   var hitT = -1.0;
+  var hitPx = vec2<i32>(0);
 
-  for (var i = 0; i < steps; i = i + 1) {
-    let p = origin + dir * t;
-    if (-p.z < camera.proj.z) { break; }
+  for (var i = 0; i < i32(stepCount); i = i + 1) {
+    if (t > 1.0) { break; }
 
-    let uv = viewToUV(p);
+    let uv = (pxStart + delta * t) * camera.screen.zw;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { break; }
 
-    let sceneZ = -linearDepth(loadDepth(uv), camera.proj.z);
-    let diff = sceneZ - p.z;          // positive: the ray is behind geometry
+    let rayZ = 1.0 / mix(invZStart, invZEnd, t);
+    let sceneZ = -linearDepth(loadDepth(uv), near);
 
-    // Thickness scales with distance: one depth sample stands for a bigger
-    // slab of world the further away it is.
-    if (diff > 0.0 && diff < camera.ssr.z * max(1.0, -p.z * 0.45)) {
+    // Rule 3. View z is negative: larger is nearer the eye. The ray spans
+    // [rayFar, rayNear] over this step; the surface occupies a slab from its
+    // visible face (sceneZ) back to sceneZ - thickness.
+    let rayNear = max(prevRayZ, rayZ);
+    let rayFar = min(prevRayZ, rayZ);
+    let thickness = camera.ssr.z + (-sceneZ) * 0.02;
+    if (rayFar <= sceneZ && rayNear >= sceneZ - thickness) {
       hitT = t;
+      hitPx = pixelOf(uv);
       break;
     }
-    if (diff > 0.0) { break; }        // behind, but too deep to be this surface
 
     prevT = t;
-    stepLen = stepLen * 1.14;
-    t = t + stepLen;
-    if (t > maxDist) { break; }
+    prevRayZ = rayZ;
+    t = t + invStep;
   }
 
   if (hitT < 0.0) { return result; }
 
+  // Refine the crossing between the last clear step and the hit. The lower
+  // bound is the last point known to be in front of everything, so the search
+  // cannot drift back to the origin the way an unbounded one can.
   var lo = prevT;
   var hi = hitT;
-  for (var i = 0; i < 6; i = i + 1) {
+  for (var i = 0; i < 5; i = i + 1) {
     let mid = (lo + hi) * 0.5;
-    let p = origin + dir * mid;
-    let sceneZ = -linearDepth(loadDepth(viewToUV(p)), camera.proj.z);
-    if (sceneZ - p.z > 0.0) { hi = mid; } else { lo = mid; }
+    let uv = (pxStart + delta * mid) * camera.screen.zw;
+    let rayZ = 1.0 / mix(invZStart, invZEnd, mid);
+    if (-linearDepth(loadDepth(uv), near) >= rayZ) {
+      hi = mid;
+      hitPx = pixelOf(uv);   // only ever a pixel that passed the depth test
+    } else {
+      lo = mid;
+    }
   }
+  let hitUV = (vec2<f32>(hitPx) + 0.5) * camera.screen.zw;
 
-  let p = origin + dir * hi;
-  let uv = viewToUV(p);
+  // Fade where the march has no information: at the edge of the screen and at
+  // the very end of the ray.
+  let edge = min(min(hitUV.x, 1.0 - hitUV.x), min(hitUV.y, 1.0 - hitUV.y));
+  let edgeFade = smoothstep(0.0, 0.1, edge);
+  let endFade = 1.0 - smoothstep(0.8, 1.0, hi);
 
-  // Fade at the screen edges, at the end of the ray, and when the ray points
-  // back at the camera \u2014 the three places SSR has no information.
-  let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-  let edgeFade = smoothstep(0.0, 0.12, edge);
-  let distFade = 1.0 - smoothstep(maxDist * 0.6, maxDist, hi);
-  let faceFade = clamp(1.0 - dir.z * 1.4, 0.0, 1.0);
-
-  result.color = textureSampleLevel(sceneColor, texSampler, uv, 0.0).rgb;
-  result.hit = edgeFade * distFade * faceFade;
+  // textureLoad, not a filtered sample: a bilinear fetch at a sub-pixel hit
+  // blends in the neighbour behind the occluder, and at a contact line that
+  // neighbour is the dark floor \u2014 which is exactly what drew a black seam.
+  result.color = textureLoad(sceneColor, hitPx, 0).rgb;
+  result.hit = edgeFade * endFade;
   return result;
 }
 
@@ -825,8 +1162,10 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   let ambient = mix(ground, camera.ambient.rgb, up) * albedo * (1.0 - metallic * 0.6) * ao;
   hdr = hdr + ambient;
 
-  let pix = in.uv * camera.screen.xy;
-  let jitter = fract(52.9829189 * fract(0.06711056 * pix.x + 0.00583715 * pix.y));
+  // Same 4x4 tile as the occlusion pass: sixteen fixed step phases rather than
+  // per-pixel white noise, so what undersampling remains is a faint regular
+  // pattern instead of stipple.
+  let jitter = f32(interleavedIndex(in.clip.xy)) / 16.0;
 
   let nDotV = max(dot(N, V), 1e-4);
   // Metals tint their reflection with their own albedo \u2014 f0 is the albedo, not
@@ -840,14 +1179,14 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   // most of the depth buffer per step, so it hits or misses essentially at
   // random. Fade to the analytic environment instead of stippling.
   let viewDist = -P.z;
-  let ssrFade = 1.0 - smoothstep(camera.fade.y * 0.6, camera.fade.y, viewDist);
+  let ssrFade = 1.0 - smoothstep(camera.fade.y * 0.4, camera.fade.y, viewDist);
   let weight = clamp(1.0 - roughness * 1.35, 0.0, 1.0) * camera.ssr.x * ssrFade;
 
   let Rworld = normalize((camera.invView * vec4<f32>(R, 0.0)).xyz);
   var reflected = sampleEnvironment(Rworld, roughness, camera.ambient.rgb);
 
   if (weight > 0.001) {
-    let ssr = traceSSR(P, R, jitter);
+    let ssr = traceSSR(P, N, R, jitter);
     reflected = mix(reflected, ssr.color, ssr.hit * weight);
   }
 
@@ -864,7 +1203,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   let fogTarget = mix(camera.fog.rgb, aerial, camera.fog.a);
   hdr = mix(hdr, fogTarget, fogAmount);
 
-  return vec4<f32>(hdr, 1.0);
+  return vec4<f32>(sanitize(hdr), 1.0);
 }
 `
 );
@@ -881,20 +1220,22 @@ ${COMMON}
 fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
 
 /** Thirteen-tap downsample (Jimenez). Stable under motion; no pulsing fireflies. */
+fn tap(uv : vec2<f32>) -> vec3<f32> { return sanitize(textureSampleLevel(src, texSampler, uv, 0.0).rgb); }
+
 fn downsample13(uv : vec2<f32>, texel : vec2<f32>) -> vec3<f32> {
-  let a = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>(-2.0,  2.0), 0.0).rgb;
-  let b = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 0.0,  2.0), 0.0).rgb;
-  let c = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 2.0,  2.0), 0.0).rgb;
-  let d = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>(-2.0,  0.0), 0.0).rgb;
-  let e = textureSampleLevel(src, texSampler, uv, 0.0).rgb;
-  let f = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 2.0,  0.0), 0.0).rgb;
-  let g = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>(-2.0, -2.0), 0.0).rgb;
-  let h = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 0.0, -2.0), 0.0).rgb;
-  let i = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 2.0, -2.0), 0.0).rgb;
-  let j = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>(-1.0,  1.0), 0.0).rgb;
-  let k = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 1.0,  1.0), 0.0).rgb;
-  let l = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>(-1.0, -1.0), 0.0).rgb;
-  let m = textureSampleLevel(src, texSampler, uv + texel * vec2<f32>( 1.0, -1.0), 0.0).rgb;
+  let a = tap(uv + texel * vec2<f32>(-2.0,  2.0));
+  let b = tap(uv + texel * vec2<f32>( 0.0,  2.0));
+  let c = tap(uv + texel * vec2<f32>( 2.0,  2.0));
+  let d = tap(uv + texel * vec2<f32>(-2.0,  0.0));
+  let e = tap(uv);
+  let f = tap(uv + texel * vec2<f32>( 2.0,  0.0));
+  let g = tap(uv + texel * vec2<f32>(-2.0, -2.0));
+  let h = tap(uv + texel * vec2<f32>( 0.0, -2.0));
+  let i = tap(uv + texel * vec2<f32>( 2.0, -2.0));
+  let j = tap(uv + texel * vec2<f32>(-1.0,  1.0));
+  let k = tap(uv + texel * vec2<f32>( 1.0,  1.0));
+  let l = tap(uv + texel * vec2<f32>(-1.0, -1.0));
+  let m = tap(uv + texel * vec2<f32>( 1.0, -1.0));
 
   return e * 0.125 + (a + c + g + i) * 0.03125 + (b + d + f + h) * 0.0625 +
          (j + k + l + m) * 0.125;
@@ -988,14 +1329,19 @@ fn luma(c : vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722))
 
 /** Graded pixel: HDR + bloom, tonemapped and gamma-encoded. FXAA runs on this. */
 fn gradeAt(uv : vec2<f32>) -> vec3<f32> {
-  let hdr = textureSampleLevel(hdrTex, texSampler, uv, 0.0).rgb;
-  let bloom = textureSampleLevel(bloomTex, texSampler, uv, 0.0).rgb;
+  let hdr = sanitize(textureSampleLevel(hdrTex, texSampler, uv, 0.0).rgb);
+  let bloom = sanitize(textureSampleLevel(bloomTex, texSampler, uv, 0.0).rgb);
   return pow(tonemapACES((hdr + bloom * camera.bloom.z) * camera.params.y), vec3<f32>(1.0 / 2.2));
 }
 
 @fragment
 fn fs(in : FSOut) -> @location(0) vec4<f32> {
   var color = gradeAt(in.uv);
+
+  // Last line of defence. Anything upstream that produced a NaN would show up
+  // here as a black fragment, and a black fragment on screen is a far worse
+  // failure than a slightly wrong colour.
+  color = select(color, vec3<f32>(0.0), color != color);
 
   // FXAA (console variant): one diagonal blend along the detected edge. Cheap,
   // and it is the reason this pipeline can skip MSAA and still keep its depth
@@ -1083,7 +1429,7 @@ function mesh(positions, normals, uvs, indices) {
   };
 }
 function box(w = 1, h = 1, d = 1) {
-  const half = [w / 2, h / 2, d / 2];
+  const half2 = [w / 2, h / 2, d / 2];
   const p = [], nm = [], uv = [], idx = [];
   const faces = [
     { n: [1, 0, 0], u: [0, 0, -1], v: [0, 1, 0] },
@@ -1096,9 +1442,9 @@ function box(w = 1, h = 1, d = 1) {
   faces.forEach((f, fi) => {
     for (const [su, sv, tu, tv] of [[-1, -1, 0, 0], [1, -1, 1, 0], [1, 1, 1, 1], [-1, 1, 0, 1]]) {
       p.push(
-        (f.n[0] + f.u[0] * su + f.v[0] * sv) * half[0],
-        (f.n[1] + f.u[1] * su + f.v[1] * sv) * half[1],
-        (f.n[2] + f.u[2] * su + f.v[2] * sv) * half[2]
+        (f.n[0] + f.u[0] * su + f.v[0] * sv) * half2[0],
+        (f.n[1] + f.u[1] * su + f.v[1] * sv) * half2[1],
+        (f.n[2] + f.u[2] * su + f.v[2] * sv) * half2[2]
       );
       nm.push(f.n[0], f.n[1], f.n[2]);
       uv.push(tu, tv);
@@ -1109,12 +1455,12 @@ function box(w = 1, h = 1, d = 1) {
   return mesh(p, nm, uv, idx);
 }
 function roundedBox(w = 1, h = 1, d = 1, radius = 0.08, segments = 6) {
-  const half = [w / 2, h / 2, d / 2];
-  const r = Math.min(radius, Math.min(half[0], Math.min(half[1], half[2])) * 0.999);
+  const half2 = [w / 2, h / 2, d / 2];
+  const r = Math.min(radius, Math.min(half2[0], Math.min(half2[1], half2[2])) * 0.999);
   const inner = [
-    Math.max(half[0] - r, 0),
-    Math.max(half[1] - r, 0),
-    Math.max(half[2] - r, 0)
+    Math.max(half2[0] - r, 0),
+    Math.max(half2[1] - r, 0),
+    Math.max(half2[2] - r, 0)
   ];
   const faces = [
     { n: [1, 0, 0], u: [0, 0, -1], v: [0, 1, 0] },
@@ -1134,9 +1480,9 @@ function roundedBox(w = 1, h = 1, d = 1, radius = 0.08, segments = 6) {
       for (let i = 0; i <= segments; i++) {
         const su = i / segments * 2 - 1;
         const s = [
-          (f.n[0] + f.u[0] * su + f.v[0] * sv) * half[0],
-          (f.n[1] + f.u[1] * su + f.v[1] * sv) * half[1],
-          (f.n[2] + f.u[2] * su + f.v[2] * sv) * half[2]
+          (f.n[0] + f.u[0] * su + f.v[0] * sv) * half2[0],
+          (f.n[1] + f.u[1] * su + f.v[1] * sv) * half2[1],
+          (f.n[2] + f.u[2] * su + f.v[2] * sv) * half2[2]
         ];
         const c = [clampAbs(s[0], inner[0]), clampAbs(s[1], inner[1]), clampAbs(s[2], inner[2])];
         let nx = s[0] - c[0], ny = s[1] - c[1], nz = s[2] - c[2];
@@ -1963,7 +2309,8 @@ var Renderer = class {
     this.ssr = {
       intensity: options.ssr?.intensity ?? 1,
       steps: options.ssr?.steps ?? 48,
-      thickness: options.ssr?.thickness ?? 0.7,
+      /** World-space depth a surface is assumed to have behind its visible face. */
+      thickness: options.ssr?.thickness ?? 0.5,
       maxDistance: options.ssr?.maxDistance ?? 70,
       fadeDistance: options.ssr?.fadeDistance ?? 90
     };
@@ -2006,13 +2353,6 @@ var Renderer = class {
       label: "axion-lights"
     });
     this.lightData = new Float32Array(MAX_LIGHTS * LIGHT_FLOATS);
-    const faceSlots = this.shadows.maxLights * 6;
-    this.faceBuffer = device.createBuffer({
-      size: Math.max(FACE_SLOT_BYTES, faceSlots * FACE_SLOT_BYTES),
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      label: "axion-shadow-faces"
-    });
-    this.faceData = new Float32Array((faceSlots || 1) * (FACE_SLOT_BYTES / 4));
     this.meshes = [];
     this.materials = [];
     this._pipelines = /* @__PURE__ */ new Map();
@@ -2039,6 +2379,7 @@ var Renderer = class {
     this._sVisMesh = new Uint32Array(4096);
     this._frustum = new Float32Array(24);
     this._shadowBatches = [];
+    this._shadowSlots = /* @__PURE__ */ new Map();
     this._targets = null;
     this._targetSize = [0, 0];
     this.stats = {
@@ -2069,10 +2410,34 @@ var Renderer = class {
         { binding: 4, visibility: FRAG, sampler: { type: "comparison" } }
       ]
     });
+    this._materialLayout = d.createBindGroupLayout({
+      label: "axion-material",
+      entries: [
+        { binding: 0, visibility: FRAG, sampler: { type: "filtering" } },
+        { binding: 1, visibility: FRAG, texture: { sampleType: "float" } },
+        { binding: 2, visibility: FRAG, texture: { sampleType: "float" } },
+        { binding: 3, visibility: FRAG, texture: { sampleType: "float" } },
+        { binding: 4, visibility: FRAG, buffer: { type: "uniform" } }
+      ]
+    });
     this._geometryLayout = d.createPipelineLayout({
-      bindGroupLayouts: [this._frameLayout],
+      bindGroupLayouts: [this._frameLayout, this._materialLayout],
       label: "axion-geometry-layout"
     });
+    this._materialSampler = d.createSampler({
+      label: "axion-material",
+      addressModeU: "repeat",
+      addressModeV: "repeat",
+      magFilter: "linear",
+      minFilter: "linear",
+      mipmapFilter: "linear",
+      maxAnisotropy: 8
+    });
+    this._defaultTextures = {
+      white: solidTexture(d, [255, 255, 255, 255], { srgb: true, label: "axion-white" }),
+      data: solidTexture(d, [255, 255, 255, 255], { label: "axion-white-linear" }),
+      normal: solidTexture(d, [128, 128, 255, 255], { label: "axion-flat-normal" })
+    };
     this._shadowLayout = d.createBindGroupLayout({
       label: "axion-shadow",
       entries: [
@@ -2147,6 +2512,24 @@ var Renderer = class {
       primitive: { topology: "triangle-list", cullMode: "front", frontFace: "ccw" },
       depthStencil: { format: "depth32float", depthWriteEnabled: true, depthCompare: "less" }
     });
+    this._shadowMaskPipeline = this.device.createRenderPipeline({
+      label: "axion-shadow-mask",
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this._shadowLayout, this._materialLayout] }),
+      vertex: {
+        module: m.shadow,
+        entryPoint: "vsMask",
+        buffers: [{
+          arrayStride: VERTEX_STRIDE_BYTES,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: "float32x3" },
+            { shaderLocation: 2, offset: 24, format: "float32x2" }
+          ]
+        }]
+      },
+      fragment: { module: m.shadow, entryPoint: "fsMask", targets: [] },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+      depthStencil: { format: "depth32float", depthWriteEnabled: true, depthCompare: "less" }
+    });
     this._aoPipeline = this._fullscreenPipeline("axion-ao", this._aoLayout, m.ao, AO_FORMAT);
     this._aoBlurPipeline = this._fullscreenPipeline("axion-ao-blur", this._aoBlurLayout, m.aoBlur, AO_FORMAT);
     this._resolvePipeline = this._fullscreenPipeline("axion-resolve", this._resolveLayout, m.resolve, HDR_FORMAT);
@@ -2158,10 +2541,30 @@ var Renderer = class {
     });
     this._finalPipeline = this._fullscreenPipeline("axion-final", this._finalLayout, m.final, this.format);
   }
+  /**
+   * (Re)allocate the shadow atlas and the per-face uniform slots.
+   *
+   * `shadows.maxLights` and `shadows.size` are plain writable fields, so they
+   * can change at any time — including mid-session from a UI slider. Anything
+   * derived from them has to be rebuilt here rather than assumed fixed at
+   * construction, or a raised limit indexes past the end of the atlas.
+   */
   _buildShadowTarget() {
     const layers = Math.max(6, this.shadows.maxLights * 6);
     const size = this.shadows.size;
-    this._shadowTexture?.destroy();
+    this._shadowBuiltFor = { maxLights: this.shadows.maxLights, size };
+    const faceBytes = Math.max(FACE_SLOT_BYTES, layers * FACE_SLOT_BYTES);
+    if (!this.faceBuffer || this.faceBuffer.size < faceBytes) {
+      retire(this.faceBuffer);
+      this.faceBuffer = this.device.createBuffer({
+        size: faceBytes,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        label: "axion-shadow-faces"
+      });
+      this.faceData = new Float32Array(faceBytes / 4);
+      this._boundShadowBuffer = null;
+    }
+    retire(this._shadowTexture);
     this._shadowTexture = this.device.createTexture({
       size: [size, size, layers],
       format: "depth32float",
@@ -2178,6 +2581,13 @@ var Renderer = class {
       }));
     }
     this._boundInstanceBuffer = null;
+  }
+  _ensureShadowCapacity() {
+    const built = this._shadowBuiltFor;
+    if (built && built.maxLights === this.shadows.maxLights && built.size === this.shadows.size) return;
+    this._buildShadowTarget();
+    this._rebuildFrameBindGroup();
+    this._rebuildShadowBindGroup();
   }
   /* ------------------------------------------------------------ registry */
   /** Upload a mesh into the shared arenas. Returns a mesh id. */
@@ -2217,9 +2627,43 @@ var Renderer = class {
     noiseStrength = 0.6,
     bump = 0.5,
     oxide = 0,
+    // Textures, as GPUTextures. Base colour must be an sRGB format; the
+    // metallic-roughness (G = roughness, B = metallic) and normal maps linear.
+    baseColorTexture = null,
+    metallicRoughnessTexture = null,
+    normalTexture = null,
+    normalScale = 1,
+    // 'OPAQUE' or 'MASK'. MASK discards below alphaCutoff, in both the
+    // geometry pass and the shadow pass.
+    alphaMode = "OPAQUE",
+    alphaCutoff = 0.5,
     name = `material${this.materials.length}`
   } = {}) {
     const id = this.materials.length;
+    const masked = alphaMode === "MASK";
+    const params = this.device.createBuffer({
+      label: `axion-material-${name}`,
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    this.device.queue.writeBuffer(params, 0, new Float32Array([
+      masked ? alphaCutoff : 0,
+      normalScale,
+      normalTexture ? 1 : 0,
+      0
+    ]));
+    const d = this._defaultTextures;
+    const bindGroup = this.device.createBindGroup({
+      layout: this._materialLayout,
+      label: `axion-material-${name}`,
+      entries: [
+        { binding: 0, resource: this._materialSampler },
+        { binding: 1, resource: (baseColorTexture ?? d.white).createView() },
+        { binding: 2, resource: (metallicRoughnessTexture ?? d.data).createView() },
+        { binding: 3, resource: (normalTexture ?? d.normal).createView() },
+        { binding: 4, resource: { buffer: params } }
+      ]
+    });
     this.materials.push({
       id,
       name,
@@ -2234,7 +2678,10 @@ var Renderer = class {
       noiseScale,
       noiseStrength,
       bump,
-      oxide
+      oxide,
+      masked,
+      bindGroup,
+      params
     });
     return id;
   }
@@ -2322,7 +2769,7 @@ var Renderer = class {
   _ensureTargets() {
     const { width, height } = this.canvas;
     if (this._targetSize[0] === width && this._targetSize[1] === height) return;
-    for (const t2 of this._targets?.all ?? []) t2.destroy();
+    for (const t2 of this._targets?.all ?? []) retire(t2);
     const make = (format, w, h, label) => this.device.createTexture({
       size: [Math.max(1, w), Math.max(1, h)],
       format,
@@ -2449,7 +2896,8 @@ var Renderer = class {
     batches.length = 0;
     if (lights.length === 0) return 0;
     const archetypes = world.query([LocalToWorld, MeshRef, Bounds], [Hidden]);
-    const meshCount = Math.max(1, this.meshes.length);
+    const matCount = Math.max(1, this.materials.length);
+    const meshCount = Math.max(1, this.meshes.length) * matCount;
     if (!this._sCounts || this._sCounts.length < meshCount + 1) {
       this._sCounts = new Uint32Array(meshCount + 1);
       this._sCursor = new Uint32Array(meshCount + 1);
@@ -2484,8 +2932,8 @@ var Renderer = class {
           const dx = cx - L.x, dy = cy - L.y, dz = cz - L.z;
           const distSq = dx * dx + dy * dy + dz * dz;
           if (distSq > (L.range + radius) * (L.range + radius)) continue;
-          if (distSq < radius * radius) continue;
-          const mesh2 = R[r * 2 + M_MESH];
+          if (distSq < radius * radius && radius < Math.min(1, 0.1 * L.range)) continue;
+          const mesh2 = R[r * 2 + M_MESH] * matCount + R[r * 2 + M_MATERIAL];
           this._sVisArch[visible] = ai;
           this._sVisRow[visible] = r;
           this._sVisMesh[visible] = mesh2;
@@ -2501,7 +2949,13 @@ var Renderer = class {
       for (let k = 0; k < meshCount; k++) {
         this._sCursor[k] = running;
         if (this._sCounts[k] > 0) {
-          batches.push({ light: li, mesh: k, first: running, count: this._sCounts[k] });
+          batches.push({
+            light: li,
+            mesh: k / matCount | 0,
+            material: k % matCount,
+            first: running,
+            count: this._sCounts[k]
+          });
         }
         running += this._sCounts[k];
       }
@@ -2521,7 +2975,9 @@ var Renderer = class {
   /* ------------------------------------------------------------- frame  */
   render(world, camera, time = 0) {
     const t0 = performance.now();
+    sweepRetired();
     this._ensureTargets();
+    this._ensureShadowCapacity();
     const { width, height } = this.canvas;
     const t = this._targets;
     const lightList = [];
@@ -2531,6 +2987,7 @@ var Renderer = class {
       for (let r = 0; r < a.count && lightList.length < MAX_LIGHTS; r++) {
         const tOff = r * 10 + T_POS, l = r * 5;
         lightList.push({
+          entity: a.entities[r],
           x: T[tOff],
           y: T[tOff + 1],
           z: T[tOff + 2],
@@ -2546,13 +3003,41 @@ var Renderer = class {
     let shadowLights = [];
     if (this.shadows.enabled && this.shadows.maxLights > 0) {
       const ex = camera.position[0], ey = camera.position[1], ez = camera.position[2];
-      shadowLights = lightList.map((l) => {
+      const ranked = lightList.map((l) => {
         const d = Math.hypot(l.x - ex, l.y - ey, l.z - ez);
         return { l, score: l.intensity / (1 + d * d * 0.01) };
-      }).sort((a, b) => b.score - a.score).slice(0, this.shadows.maxLights).map((e) => e.l);
-      shadowLights.forEach((l, i) => {
-        l.slot = i;
-      });
+      }).sort((a, b) => b.score - a.score);
+      const max = this.shadows.maxLights;
+      const margin = Math.min(ranked.length, max + 2);
+      const next = /* @__PURE__ */ new Map();
+      const taken = /* @__PURE__ */ new Set();
+      for (let i = 0; i < margin && next.size < max; i++) {
+        const l = ranked[i].l;
+        const held = this._shadowSlots.get(l.entity);
+        if (held !== void 0 && !taken.has(held)) {
+          next.set(l.entity, held);
+          taken.add(held);
+        }
+      }
+      const free = [];
+      for (let sIdx = max - 1; sIdx >= 0; sIdx--) if (!taken.has(sIdx)) free.push(sIdx);
+      for (const { l } of ranked) {
+        if (next.size >= max) break;
+        if (next.has(l.entity)) continue;
+        const slot = free.pop();
+        if (slot === void 0) break;
+        next.set(l.entity, slot);
+      }
+      this._shadowSlots = next;
+      for (const l of lightList) {
+        const slot = next.get(l.entity);
+        if (slot !== void 0) {
+          l.slot = slot;
+          shadowLights.push(l);
+        }
+      }
+    } else {
+      this._shadowSlots.clear();
     }
     const shadowCasters = this.shadows.enabled ? this._buildShadowBatches(world, shadowLights) : 0;
     if (shadowCasters > 0) {
@@ -2719,8 +3204,9 @@ var Renderer = class {
     const enc = this.device.createCommandEncoder({ label: "axion-frame" });
     let shadowDraws = 0;
     if (shadowCasters > 0) {
+      const maxSlot = this._shadowFaceViews.length / 6 | 0;
       for (const light of shadowLights) {
-        if (light.slot < 0) continue;
+        if (light.slot < 0 || light.slot >= maxSlot) continue;
         const batches2 = this._shadowBatches.filter((b) => shadowLights[b.light] === light);
         for (let face = 0; face < 6; face++) {
           const layer = light.slot * 6 + face;
@@ -2734,13 +3220,20 @@ var Renderer = class {
               depthStoreOp: "store"
             }
           });
-          pass.setPipeline(this._shadowPipeline);
           pass.setBindGroup(0, this.shadowBindGroup, [layer * FACE_SLOT_BYTES]);
           pass.setVertexBuffer(0, this.vertexArena.buffer);
           pass.setIndexBuffer(this.indexArena.buffer, "uint32");
+          let bound = null;
           for (const b of batches2) {
             const m = this.meshes[b.mesh];
             if (!m) continue;
+            const mat = this.materials[b.material];
+            const pipeline = mat?.masked ? this._shadowMaskPipeline : this._shadowPipeline;
+            if (pipeline !== bound) {
+              pass.setPipeline(pipeline);
+              bound = pipeline;
+            }
+            if (mat?.masked) pass.setBindGroup(1, mat.bindGroup);
             pass.drawIndexed(m.indexCount, b.count, m.firstIndex, m.baseVertex, b.first);
             shadowDraws++;
           }
@@ -2771,7 +3264,7 @@ var Renderer = class {
     geo.setBindGroup(0, this.frameBindGroup);
     geo.setVertexBuffer(0, this.vertexArena.buffer);
     geo.setIndexBuffer(this.indexArena.buffer, "uint32");
-    let draws = 0, tris = 0, batches = 0, currentPipeline = null;
+    let draws = 0, tris = 0, batches = 0, currentPipeline = null, currentMaterial = null;
     for (let phase = 0; phase < 2; phase++) {
       for (let k = 0; k < keyCount; k++) {
         const count = this._counts[k];
@@ -2785,6 +3278,10 @@ var Renderer = class {
         if (pipeline !== currentPipeline) {
           geo.setPipeline(pipeline);
           currentPipeline = pipeline;
+        }
+        if (material !== currentMaterial) {
+          geo.setBindGroup(1, material.bindGroup);
+          currentMaterial = material;
         }
         geo.drawIndexed(m.indexCount, count, m.firstIndex, m.baseVertex, start);
         draws++;
@@ -3020,14 +3517,24 @@ var FlyControls = class {
     this.position = new Float32Array(position);
     this._velocity = new Float32Array(3);
     this._keys = /* @__PURE__ */ new Set();
-    this._onDown = () => {
-      if (this.enabled) element.requestPointerLock?.();
+    this._dragging = false;
+    this._onDown = (e) => {
+      if (!this.enabled) return;
+      if (e.button === 0) this._dragging = true;
+      try {
+        element.requestPointerLock?.()?.catch?.(() => {
+        });
+      } catch {
+      }
+    };
+    this._onUp = () => {
+      this._dragging = false;
     };
     this._onLockChange = () => {
       this.locked = document.pointerLockElement === element;
     };
     this._onMove = (e) => {
-      if (!this.enabled || !this.locked) return;
+      if (!this.enabled || !(this.locked || this._dragging && e.buttons & 1)) return;
       this.yaw -= e.movementX * this.sensitivity;
       const limit = Math.PI / 2 - 0.01;
       this.pitch = Math.max(-limit, Math.min(limit, this.pitch - e.movementY * this.sensitivity));
@@ -3039,6 +3546,7 @@ var FlyControls = class {
     };
     this._onKeyUp = (e) => this._keys.delete(e.code);
     element.addEventListener("mousedown", this._onDown);
+    window.addEventListener("mouseup", this._onUp);
     document.addEventListener("pointerlockchange", this._onLockChange);
     document.addEventListener("mousemove", this._onMove);
     window.addEventListener("keydown", this._onKeyDown);
@@ -3122,6 +3630,7 @@ var FlyControls = class {
   }
   dispose() {
     this.el.removeEventListener("mousedown", this._onDown);
+    window.removeEventListener("mouseup", this._onUp);
     document.removeEventListener("pointerlockchange", this._onLockChange);
     document.removeEventListener("mousemove", this._onMove);
     window.removeEventListener("keydown", this._onKeyDown);
@@ -3376,6 +3885,11 @@ var App = class _App {
     this._onFrame = fn;
     return this;
   }
+  /** Runs after each frame is rendered, before it is presented. */
+  onAfterRender(fn) {
+    this._afterRender = fn;
+    return this;
+  }
   _resize() {
     if (resizeCanvas(this.canvas, this.maxDpr) || this.camera.aspect === 1) {
       this.camera.aspect = this.canvas.width / this.canvas.height;
@@ -3407,6 +3921,7 @@ var App = class _App {
       }
       this._onFrame?.(dt, this);
       this.renderer.render(this.world, this.camera, this.time);
+      this._afterRender?.(this);
       this._raf = requestAnimationFrame(tick);
     };
     this._raf = requestAnimationFrame(tick);
@@ -3439,8 +3954,571 @@ var App = class _App {
   }
 };
 
+// src/debug/frame-trap.js
+var aces = (x) => Math.min(1, Math.max(
+  0,
+  x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14)
+));
+var displayed = (x) => Math.pow(aces(x), 1 / 2.2) * 255;
+var half = (h) => {
+  const e = h >> 10 & 31, f = h & 1023;
+  if (e === 31) return NaN;
+  return (h & 32768 ? -1 : 1) * (e ? Math.pow(2, e - 15) * (1 + f / 1024) : Math.pow(2, -14) * (f / 1024));
+};
+function createFrameTrap(app, {
+  size = 192,
+  // centre region, in pixels; size*4 and size*8 must be 256-aligned
+  warmup = 30,
+  // frames to learn the baseline before arming
+  minFraction = 0.02,
+  // black share of the region that counts as a region
+  onCatch = () => {
+  }
+} = {}) {
+  if (size * 4 % 256 !== 0) throw new Error("frame trap: size * 4 must be a multiple of 256");
+  const device = app.device;
+  const bgra = navigator.gpu.getPreferredCanvasFormat() === "bgra8unorm";
+  const slots = [0, 1, 2].map(() => ({
+    busy: false,
+    final: device.createBuffer({ size: size * size * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }),
+    hdr: device.createBuffer({ size: size * size * 8, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ })
+  }));
+  let enabled = false, baseline = 0, seen = 0;
+  const pending = /* @__PURE__ */ new Set();
+  function capture() {
+    if (!enabled) return;
+    const slot = slots.find((s) => !s.busy);
+    if (!slot) return;
+    const tex = app.renderer.context.getCurrentTexture();
+    const hdr = app.renderer._targets?.hdr;
+    if (!hdr || hdr.width !== tex.width || hdr.height !== tex.height) return;
+    const w = Math.min(size, tex.width), h = Math.min(size, tex.height);
+    const origin = [(tex.width - w) / 2 | 0, (tex.height - h) / 2 | 0];
+    const enc = device.createCommandEncoder({ label: "frame-trap" });
+    enc.copyTextureToBuffer({ texture: tex, origin }, { buffer: slot.final, bytesPerRow: size * 4 }, [w, h]);
+    enc.copyTextureToBuffer({ texture: hdr, origin }, { buffer: slot.hdr, bytesPerRow: size * 8 }, [w, h]);
+    device.queue.submit([enc.finish()]);
+    slot.busy = true;
+    const meta = {
+      frame: app.frame,
+      time: app.time,
+      w,
+      h,
+      camera: Array.from(app.camera.position),
+      target: Array.from(app.camera.target)
+    };
+    const job = Promise.all([
+      slot.final.mapAsync(GPUMapMode.READ),
+      slot.hdr.mapAsync(GPUMapMode.READ)
+    ]).then(() => {
+      const px = new Uint8Array(slot.final.getMappedRange()).slice();
+      const hx = new Uint16Array(slot.hdr.getMappedRange()).slice();
+      slot.final.unmap();
+      slot.hdr.unmap();
+      slot.busy = false;
+      if (enabled) analyse(px, hx, meta);
+    }).catch(() => {
+      slot.busy = false;
+    });
+    pending.add(job);
+    job.finally(() => pending.delete(job));
+  }
+  function analyse(px, hx, meta) {
+    let finalBlack = 0, hdrBlack = 0, unexplained = 0;
+    for (let y = 0; y < meta.h; y++) {
+      for (let x = 0; x < meta.w; x++) {
+        const o = y * size + x;
+        const isBlack = px[o * 4] <= 2 && px[o * 4 + 1] <= 2 && px[o * 4 + 2] <= 2;
+        const r = half(hx[o * 4]), g = half(hx[o * 4 + 1]), b = half(hx[o * 4 + 2]);
+        const peak = Math.max(r, g, b);
+        const hdrShowsBlack = !(displayed(peak) > 3);
+        if (hdrShowsBlack) hdrBlack++;
+        if (isBlack) {
+          finalBlack++;
+          if (!hdrShowsBlack && displayed(peak) > 6) unexplained++;
+        }
+      }
+    }
+    seen++;
+    const area = meta.w * meta.h;
+    const tripped = seen > warmup && finalBlack > area * minFraction && finalBlack > baseline * 4 + 50;
+    if (!tripped) {
+      baseline = baseline * 0.95 + finalBlack * 0.05;
+      return;
+    }
+    enabled = false;
+    app.stop();
+    const rgba = new Uint8ClampedArray(area * 4);
+    for (let y = 0; y < meta.h; y++) {
+      for (let x = 0; x < meta.w; x++) {
+        const s = (y * size + x) * 4, d = (y * meta.w + x) * 4;
+        rgba[d] = px[s + (bgra ? 2 : 0)];
+        rgba[d + 1] = px[s + 1];
+        rgba[d + 2] = px[s + (bgra ? 0 : 2)];
+        rgba[d + 3] = 255;
+      }
+    }
+    onCatch({
+      ...meta,
+      area,
+      finalBlack,
+      hdrBlack,
+      unexplained,
+      rgba,
+      // Mostly explained by the HDR target means the black was already there.
+      stage: unexplained * 2 < finalBlack ? "hdr" : "post"
+    });
+  }
+  return {
+    capture,
+    /** Resolves once every in-flight readback has been analysed. */
+    settle: () => Promise.all([...pending]),
+    get enabled() {
+      return enabled;
+    },
+    set enabled(on) {
+      enabled = on;
+      baseline = 0;
+      seen = 0;
+    },
+    destroy() {
+      for (const s of slots) {
+        s.final.destroy();
+        s.hdr.destroy();
+      }
+    }
+  };
+}
+
+// src/loaders/packed.js
+var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+var lookup = null;
+function base64ToBytes(b64) {
+  if (typeof Uint8Array.fromBase64 === "function") return Uint8Array.fromBase64(b64);
+  if (!lookup) {
+    lookup = new Uint8Array(128);
+    for (let i2 = 0; i2 < 64; i2++) lookup[B64.charCodeAt(i2)] = i2;
+  }
+  let len = b64.length;
+  while (len && b64.charCodeAt(len - 1) === 61) len--;
+  const out = new Uint8Array(len * 3 >> 2);
+  let o = 0, i = 0;
+  for (; i + 4 <= len; i += 4) {
+    const n = lookup[b64.charCodeAt(i)] << 18 | lookup[b64.charCodeAt(i + 1)] << 12 | lookup[b64.charCodeAt(i + 2)] << 6 | lookup[b64.charCodeAt(i + 3)];
+    out[o++] = n >> 16;
+    out[o++] = n >> 8 & 255;
+    out[o++] = n & 255;
+  }
+  const rest = len - i;
+  if (rest >= 2) {
+    const n = lookup[b64.charCodeAt(i)] << 18 | lookup[b64.charCodeAt(i + 1)] << 12 | (rest === 3 ? lookup[b64.charCodeAt(i + 2)] << 6 : 0);
+    out[o++] = n >> 16;
+    if (rest === 3) out[o++] = n >> 8 & 255;
+  }
+  return out;
+}
+async function gunzip(bytes) {
+  if (typeof DecompressionStream !== "function") {
+    throw new Error("packed asset: this browser has no DecompressionStream");
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return new Response(stream).arrayBuffer();
+}
+async function unpackAsset(entry) {
+  if (typeof entry === "string") {
+    entry = globalThis.AxionAssets?.[entry];
+    if (!entry) throw new Error("packed asset not found \u2014 is its <script> tag on the page?");
+  }
+  const layers = entry.format.split(".");
+  let data = entry.data;
+  for (let i = layers.length - 1; i > 0; i--) {
+    const layer = layers[i];
+    if (layer === "b64") data = base64ToBytes(data);
+    else if (layer === "gz") data = await gunzip(data);
+    else throw new Error(`packed asset: unknown layer "${layer}"`);
+  }
+  const buffer = data instanceof ArrayBuffer ? data : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+  if (entry.bytes && buffer.byteLength !== entry.bytes) {
+    throw new Error(`packed asset: expected ${entry.bytes} bytes, got ${buffer.byteLength}`);
+  }
+  return buffer;
+}
+
+// src/loaders/gltf.js
+var COMPONENTS = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT4: 16 };
+var TYPED = {
+  5120: Int8Array,
+  5121: Uint8Array,
+  5122: Int16Array,
+  5123: Uint16Array,
+  5125: Uint32Array,
+  5126: Float32Array
+};
+var NORMALIZE = { 5120: 127, 5121: 255, 5122: 32767, 5123: 65535 };
+function parseGLB(arrayBuffer) {
+  const view = new DataView(arrayBuffer);
+  if (view.getUint32(0, true) !== 1179937895) throw new Error("glb: bad magic");
+  if (view.getUint32(4, true) !== 2) throw new Error("glb: only version 2 is supported");
+  let offset = 12, json = null, bin = null;
+  while (offset < view.byteLength) {
+    const length = view.getUint32(offset, true);
+    const type = view.getUint32(offset + 4, true);
+    const start = offset + 8;
+    if (type === 1313821514) json = JSON.parse(new TextDecoder().decode(new Uint8Array(arrayBuffer, start, length)));
+    else if (type === 5130562) bin = new Uint8Array(arrayBuffer, start, length);
+    offset = start + length;
+  }
+  if (!json) throw new Error("glb: no JSON chunk");
+  return { json, bin };
+}
+var isGLB = (arrayBuffer) => arrayBuffer.byteLength >= 4 && new DataView(arrayBuffer).getUint32(0, true) === 1179937895;
+function bufferViewBytes(json, buffers, index) {
+  const bv = json.bufferViews[index];
+  const buf = buffers[bv.buffer];
+  return new Uint8Array(buf.buffer, buf.byteOffset + (bv.byteOffset ?? 0), bv.byteLength);
+}
+function readAccessor(json, buffers, index) {
+  const acc = json.accessors[index];
+  const n = COMPONENTS[acc.type];
+  const Typed = TYPED[acc.componentType];
+  const count = acc.count;
+  const out = acc.componentType === 5126 || acc.normalized ? new Float32Array(count * n) : new (Typed === Uint32Array ? Uint32Array : Float32Array)(count * n);
+  if (acc.bufferView === void 0) return { data: out, n, count };
+  const bv = json.bufferViews[acc.bufferView];
+  const base = bufferViewBytes(json, buffers, acc.bufferView);
+  const elemBytes = Typed.BYTES_PER_ELEMENT;
+  const stride = bv.byteStride || elemBytes * n;
+  const start = acc.byteOffset ?? 0;
+  const dv = new DataView(base.buffer, base.byteOffset, base.byteLength);
+  const scale = acc.normalized ? 1 / NORMALIZE[acc.componentType] : 1;
+  const get = {
+    5120: (o) => dv.getInt8(o),
+    5121: (o) => dv.getUint8(o),
+    5122: (o) => dv.getInt16(o, true),
+    5123: (o) => dv.getUint16(o, true),
+    5125: (o) => dv.getUint32(o, true),
+    5126: (o) => dv.getFloat32(o, true)
+  }[acc.componentType];
+  for (let i = 0; i < count; i++) {
+    const o = start + i * stride;
+    for (let c = 0; c < n; c++) {
+      const v = get(o + c * elemBytes);
+      out[i * n + c] = acc.normalized ? Math.max(v * scale, -1) : v;
+    }
+  }
+  return { data: out, n, count };
+}
+function composeTRS(t = [0, 0, 0], r = [0, 0, 0, 1], s = [1, 1, 1]) {
+  const [x, y, z, w] = r;
+  const x2 = x + x, y2 = y + y, z2 = z + z;
+  const xx = x * x2, xy = x * y2, xz = x * z2, yy = y * y2, yz = y * z2, zz = z * z2;
+  const wx = w * x2, wy = w * y2, wz = w * z2;
+  return [
+    (1 - (yy + zz)) * s[0],
+    (xy + wz) * s[0],
+    (xz - wy) * s[0],
+    0,
+    (xy - wz) * s[1],
+    (1 - (xx + zz)) * s[1],
+    (yz + wx) * s[1],
+    0,
+    (xz + wy) * s[2],
+    (yz - wx) * s[2],
+    (1 - (xx + yy)) * s[2],
+    0,
+    t[0],
+    t[1],
+    t[2],
+    1
+  ];
+}
+function mul(a, b) {
+  const o = new Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    }
+  }
+  return o;
+}
+function normalMatrix(m) {
+  const a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9], i = m[10];
+  const A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+  const det = a * A + b * B + c * C;
+  const k = 1 / (det || 1);
+  return {
+    det,
+    n: [
+      A * k,
+      B * k,
+      C * k,
+      -(b * i - c * h) * k,
+      (a * i - c * g) * k,
+      -(a * h - b * g) * k,
+      (b * f - c * e) * k,
+      -(a * f - c * d) * k,
+      (a * e - b * d) * k
+    ]
+  };
+}
+function uvTransformOf(material) {
+  const pbr = material?.pbrMetallicRoughness ?? {};
+  const ref = pbr.baseColorTexture ?? pbr.metallicRoughnessTexture ?? material?.normalTexture;
+  const t = ref?.extensions?.KHR_texture_transform;
+  if (!t) return null;
+  const [ox, oy] = t.offset ?? [0, 0];
+  const [sx, sy] = t.scale ?? [1, 1];
+  const r = t.rotation ?? 0, c = Math.cos(r), sn = Math.sin(r);
+  return [c * sx, sn * sy, ox, -sn * sx, c * sy, oy];
+}
+function parseGLTF(json, buffers) {
+  const primitives = [];
+  const uvTransforms = (json.materials ?? []).map(uvTransformOf);
+  const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
+  let triangles = 0;
+  const sceneIndex = json.scene ?? 0;
+  const roots = json.scenes?.[sceneIndex]?.nodes ?? json.nodes?.map((_, i) => i) ?? [];
+  const identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+  const visit = (nodeIndex, parent) => {
+    const node = json.nodes[nodeIndex];
+    const local = node.matrix ? node.matrix.slice() : composeTRS(node.translation, node.rotation, node.scale);
+    const world = mul(parent, local);
+    if (node.mesh !== void 0) {
+      const mesh2 = json.meshes[node.mesh];
+      const { n: nm, det } = normalMatrix(world);
+      mesh2.primitives.forEach((prim, pi) => {
+        if ((prim.mode ?? 4) !== 4) return;
+        const pos = readAccessor(json, buffers, prim.attributes.POSITION);
+        const count = pos.count;
+        const nor = prim.attributes.NORMAL !== void 0 ? readAccessor(json, buffers, prim.attributes.NORMAL) : null;
+        const uv = prim.attributes.TEXCOORD_0 !== void 0 ? readAccessor(json, buffers, prim.attributes.TEXCOORD_0) : null;
+        const uvT = uvTransforms[prim.material] ?? null;
+        let idx = prim.indices !== void 0 ? readAccessor(json, buffers, prim.indices).data : null;
+        if (!idx) {
+          idx = new Uint32Array(count);
+          for (let i = 0; i < count; i++) idx[i] = i;
+        }
+        const indices = new Uint32Array(idx);
+        if (det < 0) {
+          for (let t = 0; t < indices.length; t += 3) {
+            const tmp = indices[t + 1];
+            indices[t + 1] = indices[t + 2];
+            indices[t + 2] = tmp;
+          }
+        }
+        const F = VERTEX_STRIDE_FLOATS;
+        const v = new Float32Array(count * F);
+        for (let i = 0; i < count; i++) {
+          const x = pos.data[i * 3], y = pos.data[i * 3 + 1], z = pos.data[i * 3 + 2];
+          const wx = world[0] * x + world[4] * y + world[8] * z + world[12];
+          const wy = world[1] * x + world[5] * y + world[9] * z + world[13];
+          const wz = world[2] * x + world[6] * y + world[10] * z + world[14];
+          v[i * F] = wx;
+          v[i * F + 1] = wy;
+          v[i * F + 2] = wz;
+          if (wx < min[0]) min[0] = wx;
+          if (wy < min[1]) min[1] = wy;
+          if (wz < min[2]) min[2] = wz;
+          if (wx > max[0]) max[0] = wx;
+          if (wy > max[1]) max[1] = wy;
+          if (wz > max[2]) max[2] = wz;
+          if (uv) {
+            const u0 = uv.data[i * 2], v0 = uv.data[i * 2 + 1];
+            if (uvT) {
+              v[i * F + 6] = uvT[0] * u0 + uvT[1] * v0 + uvT[2];
+              v[i * F + 7] = uvT[3] * u0 + uvT[4] * v0 + uvT[5];
+            } else {
+              v[i * F + 6] = u0;
+              v[i * F + 7] = v0;
+            }
+          }
+        }
+        if (nor) {
+          for (let i = 0; i < count; i++) {
+            const x = nor.data[i * 3], y = nor.data[i * 3 + 1], z = nor.data[i * 3 + 2];
+            let nx = nm[0] * x + nm[3] * y + nm[6] * z;
+            let ny = nm[1] * x + nm[4] * y + nm[7] * z;
+            let nz = nm[2] * x + nm[5] * y + nm[8] * z;
+            const l = Math.hypot(nx, ny, nz) || 1;
+            v[i * F + 3] = nx / l;
+            v[i * F + 4] = ny / l;
+            v[i * F + 5] = nz / l;
+          }
+        } else {
+          for (let t = 0; t < indices.length; t += 3) {
+            const a = indices[t] * F, b = indices[t + 1] * F, c = indices[t + 2] * F;
+            const e1 = [v[b] - v[a], v[b + 1] - v[a + 1], v[b + 2] - v[a + 2]];
+            const e2 = [v[c] - v[a], v[c + 1] - v[a + 1], v[c + 2] - v[a + 2]];
+            const fx = e1[1] * e2[2] - e1[2] * e2[1];
+            const fy = e1[2] * e2[0] - e1[0] * e2[2];
+            const fz = e1[0] * e2[1] - e1[1] * e2[0];
+            for (const k of [a, b, c]) {
+              v[k + 3] += fx;
+              v[k + 4] += fy;
+              v[k + 5] += fz;
+            }
+          }
+          for (let i = 0; i < count; i++) {
+            const o = i * F, l = Math.hypot(v[o + 3], v[o + 4], v[o + 5]) || 1;
+            v[o + 3] /= l;
+            v[o + 4] /= l;
+            v[o + 5] /= l;
+          }
+        }
+        let cx = 0, cy = 0, cz = 0;
+        for (let i = 0; i < count; i++) {
+          cx += v[i * F];
+          cy += v[i * F + 1];
+          cz += v[i * F + 2];
+        }
+        cx /= count;
+        cy /= count;
+        cz /= count;
+        let r2 = 0;
+        for (let i = 0; i < count; i++) {
+          const dx = v[i * F] - cx, dy = v[i * F + 1] - cy, dz = v[i * F + 2] - cz;
+          r2 = Math.max(r2, dx * dx + dy * dy + dz * dz);
+        }
+        triangles += indices.length / 3;
+        primitives.push({
+          name: `${mesh2.name ?? `mesh${node.mesh}`}/${pi}`,
+          material: prim.material ?? -1,
+          geometry: {
+            vertices: v,
+            indices,
+            vertexCount: count,
+            bounds: new Float32Array([cx, cy, cz, Math.sqrt(r2)])
+          }
+        });
+      });
+    }
+    for (const child of node.children ?? []) visit(child, world);
+  };
+  for (const r of roots) visit(r, identity);
+  const materials = (json.materials ?? []).map((m, i) => {
+    const pbr = m.pbrMetallicRoughness ?? {};
+    const f = pbr.baseColorFactor ?? [1, 1, 1, 1];
+    return {
+      name: m.name ?? `material${i}`,
+      color: [f[0], f[1], f[2]],
+      alpha: f[3],
+      metallic: pbr.metallicFactor ?? 1,
+      roughness: pbr.roughnessFactor ?? 1,
+      baseColorTexture: pbr.baseColorTexture?.index,
+      metallicRoughnessTexture: pbr.metallicRoughnessTexture?.index,
+      normalTexture: m.normalTexture?.index,
+      normalScale: m.normalTexture?.scale ?? 1,
+      alphaMode: m.alphaMode ?? "OPAQUE",
+      alphaCutoff: m.alphaCutoff ?? 0.5,
+      doubleSided: !!m.doubleSided
+    };
+  });
+  return { primitives, materials, bounds: { min, max }, triangles };
+}
+function resolve(uri, base) {
+  if (uri.startsWith("data:")) return uri;
+  return new URL(uri, base).href;
+}
+async function fetchBytes(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`gltf: ${res.status} fetching ${url}`);
+  return new Uint8Array(await res.arrayBuffer());
+}
+async function pool(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+async function loadGLTF(app, source, { onProgress = () => {
+} } = {}) {
+  let raw, base;
+  if (typeof source === "string") {
+    base = new URL(source, globalThis.location?.href ?? "http://localhost/").href;
+    raw = await fetchBytes(base);
+  } else if (source?.format && source?.data !== void 0) {
+    onProgress("unpacking", 0, 1);
+    raw = new Uint8Array(await unpackAsset(source));
+    onProgress("unpacking", 1, 1);
+    base = globalThis.location?.href ?? "http://localhost/";
+  } else if (source instanceof ArrayBuffer || ArrayBuffer.isView(source)) {
+    raw = source instanceof ArrayBuffer ? new Uint8Array(source) : new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+    base = globalThis.location?.href ?? "http://localhost/";
+  } else {
+    throw new Error("loadGLTF: expected a URL, an ArrayBuffer, or a packed asset");
+  }
+  let json, buffers;
+  if (isGLB(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength))) {
+    const glb = parseGLB(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));
+    json = glb.json;
+    buffers = await Promise.all((json.buffers ?? []).map((b, i) => i === 0 && b.uri === void 0 ? glb.bin : fetchBytes(resolve(b.uri, base))));
+  } else {
+    json = JSON.parse(new TextDecoder().decode(raw));
+    buffers = await Promise.all((json.buffers ?? []).map((b) => fetchBytes(resolve(b.uri, base))));
+  }
+  onProgress("geometry", 0, 1);
+  const parsed = parseGLTF(json, buffers);
+  onProgress("geometry", 1, 1);
+  const srgbTextures = /* @__PURE__ */ new Set();
+  for (const m of parsed.materials) if (m.baseColorTexture !== void 0) srgbTextures.add(m.baseColorTexture);
+  const device = app.device;
+  const textureCount = (json.textures ?? []).length;
+  let done = 0;
+  const gpuTextures = await pool(json.textures ?? [], 6, async (tex, ti) => {
+    const img = json.images[tex.extensions?.EXT_texture_webp?.source ?? tex.source];
+    let blob;
+    if (img.bufferView !== void 0) {
+      blob = new Blob([bufferViewBytes(json, buffers, img.bufferView)], { type: img.mimeType });
+    } else {
+      blob = await (await fetch(resolve(img.uri, base))).blob();
+    }
+    const bitmap = await createImageBitmap(blob, { colorSpaceConversion: "none", premultiplyAlpha: "none" });
+    const texture = textureFromImage(device, bitmap, {
+      srgb: srgbTextures.has(ti),
+      label: img.name ?? img.uri ?? `texture${ti}`
+    });
+    bitmap.close?.();
+    onProgress("textures", ++done, textureCount);
+    return texture;
+  });
+  const materialIds = parsed.materials.map((m) => app.material({
+    name: m.name,
+    color: m.color,
+    alpha: m.alpha,
+    metallic: m.metallic,
+    roughness: m.roughness,
+    baseColorTexture: gpuTextures[m.baseColorTexture] ?? null,
+    metallicRoughnessTexture: gpuTextures[m.metallicRoughnessTexture] ?? null,
+    normalTexture: gpuTextures[m.normalTexture] ?? null,
+    normalScale: m.normalScale,
+    alphaMode: m.alphaMode,
+    alphaCutoff: m.alphaCutoff,
+    doubleSided: m.doubleSided
+  }));
+  const fallback = materialIds.length ? null : app.material({ name: "gltf-default" });
+  const entities = parsed.primitives.map((p) => {
+    const mesh2 = app.renderer.createMesh(p.geometry, p.name);
+    const material = p.material >= 0 ? materialIds[p.material] : fallback ?? app.renderer.defaultMaterial;
+    return app.add({ mesh: mesh2, material });
+  });
+  return {
+    entities,
+    bounds: parsed.bounds,
+    triangles: parsed.triangles,
+    primitives: parsed.primitives.length,
+    materials: materialIds.length,
+    textures: gpuTextures.length
+  };
+}
+
 // src/index.js
-var VERSION = "0.2.0";
+var VERSION = "0.4.1";
 export {
   AO_BLUR_WGSL,
   AO_WGSL,
@@ -3478,19 +4556,29 @@ export {
   VERSION,
   VERTEX_STRIDE_BYTES,
   World,
+  base64ToBytes,
   box,
   composeRange,
   createDevice,
+  createFrameTrap,
   defineComponent,
   entityGen,
   entityIndex,
+  generateMips,
   icosphere,
+  loadGLTF,
   math_exports as math,
   motionSystem,
+  parseGLB,
+  parseGLTF,
   plane,
+  readAccessor,
   resizeCanvas,
   roundedBox,
+  solidTexture,
   sphere,
+  textureFromImage,
   torus,
-  transformSystem
+  transformSystem,
+  unpackAsset
 };

@@ -200,6 +200,9 @@ export class App {
 
   onFrame(fn) { this._onFrame = fn; return this; }
 
+  /** Runs after each frame is rendered, before it is presented. */
+  onAfterRender(fn) { this._afterRender = fn; return this; }
+
   _resize() {
     if (resizeCanvas(this.canvas, this.maxDpr) || this.camera.aspect === 1) {
       this.camera.aspect = this.canvas.width / this.canvas.height;
@@ -235,6 +238,9 @@ export class App {
 
       this._onFrame?.(dt, this);
       this.renderer.render(this.world, this.camera, this.time);
+      // Same task as the render: getCurrentTexture() still returns the frame
+      // that was just drawn, so a hook here can copy it before it is shown.
+      this._afterRender?.(this);
       this._raf = requestAnimationFrame(tick);
     };
     this._raf = requestAnimationFrame(tick);

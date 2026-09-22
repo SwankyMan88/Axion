@@ -108,6 +108,25 @@ shadow ×(6 per light) → geometry (3 MRT) → AO → AO blur → resolve → b
   step. Both then hit or miss essentially at random, which reads as dithering
   across the distance. Fading to the analytic environment is honest: no
   occlusion beats invented occlusion.
+- **Reflections march in screen space.** The ray is projected once and walked
+  about a pixel at a time while 1/z is interpolated — the only depth quantity
+  that is linear across a screen-space line. Stepping in view space and
+  projecting each sample makes the step length depend on camera orientation,
+  which reads as reflections that stretch or squash as you move. The origin is
+  lifted off its surface, steps are never sub-pixel, and a hit is a depth
+  *overlap* with a thin slab, which together stop a ray from finding its own
+  surface: the cause of black seams at contact lines and at the horizon.
+- **`sign(0)` is zero in WGSL.** The octahedral normal encoding folds the
+  lower hemisphere by multiplying by the sign of each component, so it needs a
+  sign that is never zero. With plain `sign()`, a floor seen by a camera tilted
+  upward lost its tilt on the way through the G-buffer, and reflections were
+  crushed to a fraction of their height. The mirror regression test now
+  includes tilted cameras, because a level one sits exactly where this error
+  vanishes.
+- **One pixel grid everywhere.** Depth lookups use `floor(uv * size)`, and a
+  reflection takes its colour with `textureLoad` from exactly the pixel whose
+  depth confirmed the hit. Scaling by `size - 1`, or fetching with a filtered
+  sample, lets the depth test and the colour come from neighbouring pixels.
 - **Procedural surface, not textures.** `noiseScale` above zero switches on
   four-octave fBm evaluated per pixel in world space, driving albedo,
   roughness, metallic and a gradient-derived normal. No UVs to unwrap, no seams,
@@ -210,8 +229,100 @@ demo/index.html         live viewport with frame telemetry
 examples/               a Khan Academy webpage program, CDN-loaded
 build.mjs               esbuild -> dist/ (esm + iife + minified iife)
 test/smoke.mjs          headless checks (math, ECS, geometry)
-test/gpu-validate.mjs   headless GPU validation + measured pass checks
+test/gpu-validate.mjs   headless GPU harness; runs any page given as an argument
+test/regressions.html   pixel-measured checks for bugs that passed everything else
+test/trap-check.html    the frame trap fires, attributes correctly, stays quiet
+src/debug/frame-trap.js catches one-frame black regions and names the stage
+src/loaders/gltf.js     glTF / GLB: pure parser plus GPU upload
+src/gpu/textures.js     texture upload, GPU mip generation, 1x1 defaults
+demo/sponza.html        fly-through of Crytek Sponza
+scripts/fetch-sponza.mjs downloads the full-resolution Sponza
 ```
+
+## Loading models
+
+```js
+const scene = await AX.loadGLTF(app, './assets/sponza.glb', {
+  onProgress: (stage, done, total) => console.log(stage, done, total),
+});
+// { entities, bounds, triangles, primitives, materials, textures }
+```
+
+`.gltf` (external or `data:` buffers) and `.glb` both work. Node transforms
+are baked into the vertices at load, so a static scene costs nothing per node
+at draw time and every primitive gets an exact bounding sphere for culling.
+Normals go through the inverse transpose, and mirrored nodes have their
+winding flipped so front faces stay front faces.
+
+Materials read `pbrMetallicRoughness` base colour and metallic-roughness
+textures and factors, normal maps, `alphaMode` `MASK` (tested in both the
+geometry and the shadow pass, so leaves cast leaf-shaped shadows) and
+`doubleSided` (back faces are lit from behind). Textures upload with a full
+mip chain generated on the GPU in linear light, and sample with trilinear,
+8x anisotropic filtering.
+
+Normal maps need no tangent attribute: the tangent frame is rebuilt per pixel
+from screen-space derivatives of position and UV, so the vertex format stays 32
+bytes for everything.
+
+Not yet: skinning, morph targets, node animation, emissive and occlusion
+textures, `KHR_` extensions, blended (`BLEND`) transparency.
+
+### Sponza
+
+`demo/sponza.html` flies through Crytek Sponza — 262k triangles, 69 textures —
+lit by moving, shadowed torches and a skylight.
+
+```bash
+npm run fetch:sponza  # full-resolution originals into demo/assets/sponza/
+npm run dev           # then open http://localhost:8080/sponza.html
+```
+
+Without the fetch it falls back to `demo/assets/sponza.glb`, a packed build
+with 512px textures and the unused tangents stripped (10.8 MB). Neither is
+committed. `npm run test:sponza` loads it through the public loader and
+renders it headlessly.
+
+## Packed models (one script, no fetch)
+
+`assets/sponza.js` is the whole Sponza scene — quantized geometry
+(`KHR_mesh_quantization`), 69 WebP textures at 1024 px — as a GLB, gzipped and
+base64'd into one script (~16 MB, under jsDelivr's 20 MB per-file cap). Load it
+with a script tag and hand it to the loader:
+
+```html
+<script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.4.1/dist/axion.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.4.1/assets/sponza.js"></script>
+<script>
+  const app = await Axion.App.create(canvas);
+  await Axion.loadGLTF(app, AxionAssets.sponza);
+</script>
+```
+
+This works where `fetch()` is blocked but CDN scripts are allowed — Khan
+Academy's case. See `examples/khan-academy-sponza.html`. Rebuild with
+`npm run fetch:sponza && npm run pack:sponza` (`--size`, `--quality` to trade
+size for detail). Credits: `assets/NOTICE.md`.
+
+## Debugging a one-frame glitch
+
+`createFrameTrap` catches a transient black region and freezes on it. Each
+frame it copies the centre of the presented image and of the HDR target back
+to the CPU, and on the first frame whose centre suddenly goes black it stops
+the loop and reports which stage produced it — `hdr` (geometry, reflections,
+occlusion, resolve) or `post` (bloom, tonemap, FXAA).
+
+```js
+const app = await AX.App.create(canvas, { canvasUsage: GPUTextureUsage.COPY_SRC });
+const trap = AX.createFrameTrap(app, { onCatch: (report) => console.warn(report) });
+app.onAfterRender(() => trap.capture());
+trap.enabled = true;
+```
+
+Its most useful answer is the one it gives by staying silent: if you can see a
+black box and the trap never fires, the box is not in any frame the engine
+rendered — it is being added after presentation, by the browser's compositor
+or the display driver. The demo has this on its **trap** toggle.
 
 ## Shipping it
 
@@ -223,7 +334,7 @@ The IIFE builds expose a global `Axion`, for pages that cannot use modules.
 Push a tag to GitHub and jsDelivr serves it with no publishing step:
 
 ```html
-<script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.2.0/dist/axion.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.4.1/dist/axion.min.js"></script>
 <script>
   const app = await Axion.App.create(document.querySelector('canvas'));
 </script>
@@ -250,6 +361,14 @@ npm run test:gpu      # against Dawn, headless, and render three frames
 npm run test:bundle   # load the minified CDN build through a plain script tag
 ```
 
+`npm run test:gpu` runs three pages. `test/regressions.html` holds checks that
+exist because a bug passed every other test: a pole on a mirror floor must
+reflect at the same height as it stands (a physical invariant — the reflection
+of its top is as far below the contact line as the top is above it), measured
+at four camera heights; and no target may ever hold a non-finite value.
+`test/trap-check.html` proves the frame trap fires on a black frame, names the
+right stage, and stays quiet on ordinary ones.
+
 `test/gpu-validate.mjs` is the one that catches the mistakes unit tests cannot:
 a WGSL type error, a struct whose layout disagrees with the buffer feeding it,
 a bind group that does not match its layout. It renders with a software adapter,
@@ -267,7 +386,8 @@ Requires WebGPU: Chrome/Edge 113+, Safari 18+, or Firefox with
 
 ## Not built yet
 
-Honest list, in the order they'd matter: temporal anti-aliasing and reprojection
+Honest list, in the order they'd matter: a directional sun with cascaded
+shadows (Sponza is lit here by a distant point light standing in for one); temporal anti-aliasing and reprojection
 — it would denoise SSR and AO together and replace FXAA, and it is now the
 single biggest quality win left; GPU-driven culling in a compute pass with
 `drawIndexedIndirect`; clustered light assignment (the fragment loop is still
@@ -276,6 +396,14 @@ only point lights cast today; a mip chain on the scene color so rough
 reflections blur instead of staying sharp; glTF loading; textures and a
 sampler/bind-group cache; skinned meshes; a transform hierarchy (transforms are
 flat today); transparency sorting; a worker-parallel system scheduler.
+
+**Known issue: specular highlights on very smooth surfaces are too dim.** The
+GGX distribution floors its denominator at `1e-5` to avoid dividing by zero,
+but for roughness below about 0.2 the true denominator is far smaller, so the
+peak is capped — on the demo's wet floor (roughness 0.1), by roughly 300×. The
+fix is a smaller floor plus a clamp on the lit result below the fp16 limit of
+the HDR target, so an exact highlight cannot overflow to infinity. It changes
+how every glossy material looks, so it is deliberately a separate change.
 
 Shadow cost scales with shadowed lights, not with scene size: four lights is
 twenty-four depth passes. Casters are culled per light against its range, and

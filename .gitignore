@@ -2,3 +2,8 @@ node_modules/
 package-lock.json
 test/frame.png
 .DS_Store
+
+# Third-party test assets: fetched or packed on demand, never committed.
+demo/assets/sponza/
+demo/assets/sponza.glb
+demo/assets/sponza-web/

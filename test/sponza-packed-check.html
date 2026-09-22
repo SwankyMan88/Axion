@@ -1,0 +1,80 @@
+<!doctype html><meta charset="utf-8">
+<!-- Loads dist/axion.min.js + assets/sponza.js via script tags (the Khan Academy path)
+     alpha-tested foliage, normal maps, shadowed lights, the whole pass stack. -->
+<canvas id="c" width="640" height="400" style="width:640px;height:400px"></canvas>
+<script src="../dist/axion.min.js"></script>
+<script src="../assets/sponza.js"></script>
+<script type="module">
+const AX = globalThis.Axion; // exactly as Khan Academy would: classic script tags, no fetch
+const out = { ok: false, steps: [], errors: [], measured: {} };
+window.__result = out;
+const half=(h)=>{const e=(h>>10)&31,f=h&1023; if(e===31) return NaN;
+  return (h&0x8000?-1:1)*(e?Math.pow(2,e-15)*(1+f/1024):Math.pow(2,-14)*(f/1024));};
+try {
+  const canvas = document.getElementById('c');
+  const gpu = await AX.createDevice(canvas);
+  gpu.device.pushErrorScope('validation');
+  const app = new AX.App(canvas, gpu, {
+    controls: false, clearColor: [0.05, 0.06, 0.08, 1], ambient: [0.10, 0.105, 0.12], groundAmbient: 0.45,
+    exposure: 1.1, ssr: { steps: 24, maxDistance: 40, fadeDistance: 60, thickness: 0.35 },
+    ao: { radius: 0.9, fadeDistance: 35 }, bloom: { threshold: 1.2, strength: 0.35 },
+    shadows: { maxLights: 3, size: 512, pcfRadius: 1.4, near: 0.1 },
+  });
+  const t0 = performance.now();
+  const src = globalThis.AxionAssets.sponza;
+  const loaded = await AX.loadGLTF(app, src);
+  out.measured.loadMs = Math.round(performance.now() - t0);
+  out.measured.loaded = { primitives: loaded.primitives, triangles: loaded.triangles,
+                          materials: loaded.materials, textures: loaded.textures };
+  out.steps.push('loaded');
+
+  app.light([1.5, 26, 0.6], { color: [1, 0.94, 0.86], intensity: 1400, range: 70 });
+  app.light([6, 1.8, -0.2], { color: [1, 0.62, 0.32], intensity: 55, range: 16 });
+  app.light([-4, 2.6, 2.4], { color: [0.45, 0.62, 1], intensity: 55, range: 16 });
+
+  const view = (pos, target) => {
+    app.camera.aspect = canvas.width / canvas.height;
+    app.camera.position.set(pos); app.camera.target.set(target); app.camera.update();
+  };
+  const sample = async () => {
+    const tex = app.renderer._targets.hdr, w = tex.width, h = tex.height, bpr = Math.ceil(w*8/256)*256;
+    const buf = gpu.device.createBuffer({ size: bpr*h, usage: GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ });
+    const e = gpu.device.createCommandEncoder();
+    e.copyTextureToBuffer({ texture: tex }, { buffer: buf, bytesPerRow: bpr }, [w, h, 1]);
+    gpu.device.queue.submit([e.finish()]); await buf.mapAsync(GPUMapMode.READ);
+    const raw = new Uint16Array(buf.getMappedRange()); let bad = 0, sum = 0;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const o = (y*bpr)/2 + x*4, r = half(raw[o]), g = half(raw[o+1]), b = half(raw[o+2]);
+      if (!isFinite(r+g+b)) bad++; else sum += 0.2126*r + 0.7152*g + 0.0722*b;
+    }
+    buf.unmap(); buf.destroy();
+    return { nonFinite: bad, meanLuma: +(sum/(w*h)).toFixed(4) };
+  };
+
+  // Down the nave from the east end, as the demo starts; then across the court.
+  view([10.5, 1.7, -0.3], [0, 2.4, -0.3]);
+  app.renderer.render(app.world, app.camera, 0);
+  await gpu.device.queue.onSubmittedWorkDone();
+  out.measured.nave = { ...(await sample()), stats: { ...app.renderer.stats } };
+
+  view([-9, 5.5, 5.5], [2, 2, -2]);
+  app.renderer.render(app.world, app.camera, 0);
+  await gpu.device.queue.onSubmittedWorkDone();
+  out.measured.upper = { ...(await sample()) };
+
+  // The capture shows the nave view.
+  view([10.5, 1.7, -0.3], [0, 2.4, -0.3]);
+  app.renderer.render(app.world, app.camera, 0);
+  await gpu.device.queue.onSubmittedWorkDone();
+
+  const err = await gpu.device.popErrorScope();
+  if (err) out.errors.push('validation: ' + err.message);
+  if (loaded.textures !== 69) out.errors.push(`expected 69 textures, got ${loaded.textures}`);
+  for (const k of ['nave', 'upper']) {
+    if (out.measured[k].nonFinite) out.errors.push(`${k}: ${out.measured[k].nonFinite} non-finite pixels`);
+    if (!(out.measured[k].meanLuma > 0.01)) out.errors.push(`${k}: frame is essentially black`);
+  }
+  out.ok = out.errors.length === 0;
+} catch (e) { out.errors.push(String(e.stack || e)); }
+out.done = true;
+</script>

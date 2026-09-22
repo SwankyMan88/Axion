@@ -897,7 +897,9 @@ fn main(@builtin(local_invocation_index) li : u32,
     let cell = vec2<f32>(f32(lid.x * 2u + (k & 1u)), f32(lid.y * 2u + (k >> 1u)));
     let uv = (cell + 0.5) / 32.0;
     let c = textureLoad(hdrTex, vec2<i32>(uv * dims), 0).rgb;
-    let lum = dot(sanitize(c), vec3<f32>(0.2126, 0.7152, 0.0722));
+    // Measured after the camera's exposure, so auto exposure is a correction
+    // on top of it: the same in arbitrary units and in lumens.
+    let lum = dot(sanitize(c), vec3<f32>(0.2126, 0.7152, 0.0722)) * camera.params.y;
     // Centre-weighted: the middle of the frame is what you are looking at.
     let w = 1.0 - 0.7 * length(uv - 0.5) * 1.41421;
     acc = acc + vec2<f32>(log2(lum + 1e-4) * w, w);
@@ -1361,7 +1363,7 @@ fn tonemap(x : vec3<f32>) -> vec3<f32> {
 fn exposure() -> f32 {
   var e = camera.params.y;
   if (camera.grade.y > 0.5) {
-    // Put the average scene luminance at middle grey (0.18).
+    // Put the average exposed luminance at middle grey (0.18), within limits.
     let ev = clamp(log2(0.18) - exposureState[0], camera.expo.x, camera.expo.y);
     e = e * exp2(ev);
   }

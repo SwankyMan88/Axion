@@ -68,6 +68,7 @@ export class App {
     this._resize();
 
     liveApps().add(this);
+    if (options.thumbnail !== false) installKhanThumbnail();
     this._onPageHide = () => this.dispose();
     addEventListener('pagehide', this._onPageHide);
     addEventListener('beforeunload', this._onPageHide);
@@ -314,6 +315,44 @@ export class App {
     // user code created and forgot about.
     try { this.device.destroy(); } catch { /* ignore */ }
   }
+}
+
+/**
+ * Khan Academy program thumbnails.
+ *
+ * KA saves a program's thumbnail by calling html2canvas on the frame's parent
+ * and waiting for a data URL posted to the top window. html2canvas cannot read
+ * a WebGPU canvas (its image is gone once the frame is presented), so on KA
+ * this replaces that hook with one that renders a frame and copies it at once.
+ *
+ * It only activates inside KA's sandbox (kasandbox.org). Anywhere else it does
+ * nothing, and `thumbnail: false` in the App options turns it off entirely.
+ */
+function installKhanThumbnail() {
+  if (globalThis.__axionThumbnail) return;
+  let onKhan = false;
+  try {
+    onKhan = /(^|\.)kasandbox\.org$/.test(location.hostname) ||
+      /(^|\.)khanacademy\.org$/.test(new URL(document.referrer).hostname);
+  } catch { /* no referrer */ }
+  if (!onKhan || window.parent === window) return;
+
+  try {
+    const previous = window.parent.html2canvas;
+    window.parent.html2canvas = function () {
+      const app = App.current;
+      if (!app) return previous ? previous.apply(this, arguments) : undefined;
+      let url;
+      try {
+        url = app.snapshot(600, 600).toDataURL();
+      } catch {
+        url = document.createElement('canvas').toDataURL();
+      }
+      window.top.postMessage(url, '*');
+      return undefined;
+    };
+    globalThis.__axionThumbnail = true;
+  } catch { /* parent is cross-origin: nothing to hook */ }
 }
 
 /** Shared across bundle copies: a re-run page may load the script again. */

@@ -122,6 +122,13 @@ try {
   out.measured.physicalExposure = r.effectiveExposure();
   if (Math.abs(phys.display - base.display) > 6) out.errors.push(`physical camera look differs: ${phys.display} vs ${base.display}`);
 
+  // Physical units + auto exposure must land where auto exposure alone does.
+  r.autoExposure.enabled = true;
+  const physAuto = await measure('physicalAuto', () => {});
+  r.autoExposure.enabled = false;
+  if (Math.abs(physAuto.display - aeA.display) > 6)
+    out.errors.push(`physical + auto exposure: ${physAuto.display} vs auto alone ${aeA.display}`);
+
   // Tonemappers must all differ and stay finite.
   r.physical.enabled = false;
   r.ambient = [0.10, 0.105, 0.12];

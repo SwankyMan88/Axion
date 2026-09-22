@@ -1,4 +1,4 @@
-/*! Axion 0.6.0 — WebGPU, data-oriented 3D engine. MIT. */
+/*! Axion 0.6.2 — WebGPU, data-oriented 3D engine. MIT. */
 var Axion = (() => {
   var __defProp = Object.defineProperty;
   var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -1218,7 +1218,9 @@ fn main(@builtin(local_invocation_index) li : u32,
     let cell = vec2<f32>(f32(lid.x * 2u + (k & 1u)), f32(lid.y * 2u + (k >> 1u)));
     let uv = (cell + 0.5) / 32.0;
     let c = textureLoad(hdrTex, vec2<i32>(uv * dims), 0).rgb;
-    let lum = dot(sanitize(c), vec3<f32>(0.2126, 0.7152, 0.0722));
+    // Measured after the camera's exposure, so auto exposure is a correction
+    // on top of it: the same in arbitrary units and in lumens.
+    let lum = dot(sanitize(c), vec3<f32>(0.2126, 0.7152, 0.0722)) * camera.params.y;
     // Centre-weighted: the middle of the frame is what you are looking at.
     let w = 1.0 - 0.7 * length(uv - 0.5) * 1.41421;
     acc = acc + vec2<f32>(log2(lum + 1e-4) * w, w);
@@ -1688,7 +1690,7 @@ fn tonemap(x : vec3<f32>) -> vec3<f32> {
 fn exposure() -> f32 {
   var e = camera.params.y;
   if (camera.grade.y > 0.5) {
-    // Put the average scene luminance at middle grey (0.18).
+    // Put the average exposed luminance at middle grey (0.18), within limits.
     let ev = clamp(log2(0.18) - exposureState[0], camera.expo.x, camera.expo.y);
     e = e * exp2(ev);
   }
@@ -4012,6 +4014,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       this.world.addSystem(transformSystem, { order: 20, name: "transform" });
       this._resize();
       liveApps().add(this);
+      if (options.thumbnail !== false) installKhanThumbnail();
       this._onPageHide = () => this.dispose();
       addEventListener("pagehide", this._onPageHide);
       addEventListener("beforeunload", this._onPageHide);
@@ -4295,6 +4298,32 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       }
     }
   };
+  function installKhanThumbnail() {
+    if (globalThis.__axionThumbnail) return;
+    let onKhan = false;
+    try {
+      onKhan = /(^|\.)kasandbox\.org$/.test(location.hostname) || /(^|\.)khanacademy\.org$/.test(new URL(document.referrer).hostname);
+    } catch {
+    }
+    if (!onKhan || window.parent === window) return;
+    try {
+      const previous = window.parent.html2canvas;
+      window.parent.html2canvas = function() {
+        const app = App.current;
+        if (!app) return previous ? previous.apply(this, arguments) : void 0;
+        let url;
+        try {
+          url = app.snapshot(600, 600).toDataURL();
+        } catch {
+          url = document.createElement("canvas").toDataURL();
+        }
+        window.top.postMessage(url, "*");
+        return void 0;
+      };
+      globalThis.__axionThumbnail = true;
+    } catch {
+    }
+  }
   function liveApps() {
     return globalThis.__axionLiveApps ??= /* @__PURE__ */ new Set();
   }
@@ -4863,6 +4892,6 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   }
 
   // src/index.js
-  var VERSION = "0.6.0";
+  var VERSION = "0.6.2";
   return __toCommonJS(index_exports);
 })();

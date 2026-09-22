@@ -230,10 +230,10 @@
             <div id="bar"><div id="thumb"></div></div>
         </div>
 
-        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.6.0/dist/axion.min.js"></script><!-- My 3D engine Axion -->
-        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.6.0/assets/sponza.js"></script><!-- The Sponza test in JS form -->
+        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.6.1/dist/axion.min.js"></script><!-- My 3D engine Axion -->
+        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.6.1/assets/sponza.js"></script><!-- The Sponza test in JS form -->
 
-        <!-- Shared state: every script below reads and writes through window.sz -->
+        <!-- Shared state -->
         <script type="module">
             var sz = window.sz = {};
 
@@ -283,7 +283,7 @@
             };
         </script>
 
-        <!-- Input: keyboard, mouse lock and drag-to-look -->
+        <!-- Input -->
         <script type="module">
             var sz = window.sz;
             var cam = sz.cam;
@@ -339,7 +339,7 @@
             });
         </script>
 
-        <!-- Collision and physics: triangle grid, ground checks, wall push-out -->
+        <!-- Collision and physics -->
         <script type="module">
             var sz = window.sz;
 
@@ -683,7 +683,7 @@
             };
         </script>
 
-        <!-- Camera: fly and walk movement, fed to the engine's camera each frame -->
+        <!-- Camera -->
         <script type="module">
             var sz = window.sz;
             var cam = sz.cam;
@@ -827,7 +827,7 @@
             };
         </script>
 
-        <!-- Menu: settings panel and its scroll bar -->
+        <!-- Menu -->
         <script type="module">
             var sz = window.sz;
             var cam = sz.cam;
@@ -1042,16 +1042,9 @@
 
                 section("Window");
                 var fsBtn = button("Fullscreen", function () {
-                    if (document.fullscreenElement) {
-                        document.exitFullscreen();
-                        return;
-                    }
-                    var req = document.documentElement.requestFullscreen();
-                    if (req && req.catch) {
-                        req.catch(function () {
-                            sz.msg.textContent = "Fullscreen isn't allowed here";
-                        });
-                    }
+                    var w = window.open();
+                    w.document.write("<!DOCTYPE html>" + document.documentElement.outerHTML);
+                    w.document.close();
                 });
                 document.addEventListener("fullscreenchange", function () {
                     fsBtn.textContent = document.fullscreenElement ? "Exit fullscreen" : "Fullscreen";
@@ -1232,7 +1225,7 @@
             };
         </script>
 
-        <!-- Scene: engine setup, model, lights, collision data, frame loop -->
+        <!-- Scene -->
         <script type="module">
             var sz = window.sz;
             var msg = sz.msg;
@@ -1252,7 +1245,7 @@
                     bloom: { threshold: 1.2, strength: 0.35 },
                     shadows: { maxLights: 3, size: 1024, pcfRadius: 1.4, near: 0.1 },
                     ssil: { intensity: 1, radius: 3 },
-                    volumetric: { enabled: false, density: 0.015, heightFalloff: 0.1, anisotropy: 0.3 },
+                    volumetric: { enabled: true, density: 0.01, heightFalloff: 0.1, anisotropy: 0.3 },
                     tonemap: { mode: "aces" },
                     autoExposure: { enabled: false },
                     physical: { enabled: false, aperture: 2.8, shutter: 1 / 30, iso: 400 }
@@ -1350,48 +1343,6 @@
                     msg.textContent = "Error: " + (e.message || e);
                 });
             }
-        </script>
-
-        <!-- Khan Academy thumbnail -->
-        <script type="module">
-            var size = 600;
-
-            function findCanvas() {
-                var all = document.getElementsByTagName("canvas");
-                for (var i = 0; i < all.length; i++) {
-                    var rect = all[i].getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0) {
-                        return all[i];
-                    }
-                }
-                return null;
-            }
-
-            window.parent.html2canvas = function () {
-                try {
-                    var c;
-                    var app = window.Axion && Axion.App.current;
-
-                    if (app) {
-                        // WebGPU canvases have to be copied right after a render
-                        c = app.snapshot(size, size);
-                    } else {
-                        var src = findCanvas();
-                        if (!src) {
-                            throw "No visible canvas found.";
-                        }
-                        c = document.createElement("canvas");
-                        c.width = size;
-                        c.height = size;
-                        c.getContext("2d").drawImage(src, 0, 0, src.width, src.height, 0, 0, size, size);
-                    }
-
-                    window.top.postMessage(c.toDataURL(), "*");
-                } catch (e) {
-                    alert("Thumbnail Script Error: " + e);
-                    window.top.postMessage(document.createElement("canvas").toDataURL(), "*");
-                }
-            };
         </script>
     </body>
 </html>

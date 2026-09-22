@@ -1,6 +1,6 @@
 {
   "name": "axion",
-  "version": "0.6.0",
+  "version": "0.6.2",
   "description": "A WebGPU, data-oriented 3D engine.",
   "type": "module",
   "main": "src/index.js",
@@ -32,6 +32,7 @@
   "license": "MIT",
   "sideEffects": false,
   "devDependencies": {
+    "acorn": "^8.18.0",
     "esbuild": "^0.28.2",
     "playwright": "^1.49.1",
     "sharp": "^0.35.4"

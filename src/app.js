@@ -20,8 +20,24 @@ import * as primitives from './geometry/primitives.js';
  */
 export class App {
   static async create(canvas, options = {}) {
+    // Tear down earlier apps first, so their GPU memory is free before the
+    // new device asks for its own.
+    App.disposeStale(canvas);
     const gpu = await createDevice(canvas, options);
     return new App(canvas, gpu, options);
+  }
+
+  /**
+   * Dispose every live app whose canvas is gone from the page or is the one
+   * about to be reused. Live editors (Khan Academy, CodePen) re-run the page
+   * on every edit or reload without always giving the GPU a clean slate; the
+   * previous app's loop, device and render targets would otherwise pile up
+   * and each run would be slower than the last.
+   */
+  static disposeStale(canvas) {
+    for (const app of [...liveApps()]) {
+      if (app.canvas === canvas || !app.canvas.isConnected) app.dispose();
+    }
   }
 
   constructor(canvas, gpu, options = {}) {
@@ -50,6 +66,11 @@ export class App {
     this.world.addSystem(transformSystem, { order: 20, name: 'transform' });
 
     this._resize();
+
+    liveApps().add(this);
+    this._onPageHide = () => this.dispose();
+    addEventListener('pagehide', this._onPageHide);
+    addEventListener('beforeunload', this._onPageHide);
   }
 
   /* --------------------------------------------------------- resources */
@@ -216,6 +237,7 @@ export class App {
     let last = performance.now();
     const tick = (now) => {
       if (!this.running) return;
+      if (!this.canvas.isConnected) { this.dispose(); return; }   // page was replaced
       const dt = Math.min((now - last) / 1000, 0.1);
       last = now;
       this.time += dt;
@@ -264,11 +286,25 @@ export class App {
   get stats() { return this.renderer.stats; }
 
   dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
     this.stop();
+    liveApps().delete(this);
+    removeEventListener('pagehide', this._onPageHide);
+    removeEventListener('beforeunload', this._onPageHide);
     this.controls?.dispose();
     this.fly?.dispose();
-    this.renderer.destroy();
+    try { this.renderer.destroy(); } catch { /* already lost */ }
+    try { this.renderer.context?.unconfigure?.(); } catch { /* ignore */ }
+    // Destroying the device frees every buffer and texture at once, even ones
+    // user code created and forgot about.
+    try { this.device.destroy(); } catch { /* ignore */ }
   }
+}
+
+/** Shared across bundle copies: a re-run page may load the script again. */
+function liveApps() {
+  return (globalThis.__axionLiveApps ??= new Set());
 }
 
 export { composeRange };

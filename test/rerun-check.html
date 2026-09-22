@@ -1,0 +1,30 @@
+<!doctype html><meta charset="utf-8">
+<!-- Simulates a live editor (Khan Academy) re-running the page: the canvas is
+     replaced and the script runs again. Old apps must be torn down. -->
+<body></body>
+<script src="../dist/axion.min.js"></script>
+<script>
+var out = { ok: false, errors: [], measured: { live: [] } };
+window.__result = out;
+function run(i) {
+  document.body.innerHTML = '<canvas width="320" height="200" style="width:320px;height:200px"></canvas>';
+  var c = document.querySelector('canvas');
+  return Axion.App.create(c).then(function (app) {
+    app.add({ mesh: app.mesh(Axion.box(1, 1, 1)), material: app.material({ color: [0.8, 0.8, 0.8] }) });
+    app.light([2, 3, 2], { intensity: 30, range: 20 });
+    app.start();
+    return new Promise(function (r) { setTimeout(r, 400); });
+  }).then(function () {
+    var live = 0; globalThis.__axionLiveApps.forEach(function (a) { if (a.running) live++; });
+    out.measured.live.push(live);
+  });
+}
+var p = Promise.resolve();
+for (var i = 0; i < 6; i++) (function (i) { p = p.then(function () { return run(i); }); })(i);
+p.then(function () {
+  var last = out.measured.live[out.measured.live.length - 1];
+  if (last !== 1) out.errors.push('expected 1 running app after re-runs, got ' + last);
+  if (globalThis.__axionLiveApps.size !== 1) out.errors.push('registry holds ' + globalThis.__axionLiveApps.size + ' apps');
+  out.ok = out.errors.length === 0; out.done = true;
+}).catch(function (e) { out.errors.push(String(e.stack || e)); out.done = true; });
+</script>

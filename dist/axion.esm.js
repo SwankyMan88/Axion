@@ -1,4 +1,4 @@
-/*! Axion 0.4.1 — WebGPU, data-oriented 3D engine. MIT. */
+/*! Axion 0.4.2 — WebGPU, data-oriented 3D engine. MIT. */
 var __defProp = Object.defineProperty;
 var __export = (target, all) => {
   for (var name in all)
@@ -3686,8 +3686,21 @@ function composeRange(archetype, first, count) {
 // src/app.js
 var App = class _App {
   static async create(canvas, options = {}) {
+    _App.disposeStale(canvas);
     const gpu = await createDevice(canvas, options);
     return new _App(canvas, gpu, options);
+  }
+  /**
+   * Dispose every live app whose canvas is gone from the page or is the one
+   * about to be reused. Live editors (Khan Academy, CodePen) re-run the page
+   * on every edit or reload without always giving the GPU a clean slate; the
+   * previous app's loop, device and render targets would otherwise pile up
+   * and each run would be slower than the last.
+   */
+  static disposeStale(canvas) {
+    for (const app of [...liveApps()]) {
+      if (app.canvas === canvas || !app.canvas.isConnected) app.dispose();
+    }
   }
   constructor(canvas, gpu, options = {}) {
     this.canvas = canvas;
@@ -3710,6 +3723,10 @@ var App = class _App {
     this.world.addSystem(motionSystem, { order: 10, name: "motion" });
     this.world.addSystem(transformSystem, { order: 20, name: "transform" });
     this._resize();
+    liveApps().add(this);
+    this._onPageHide = () => this.dispose();
+    addEventListener("pagehide", this._onPageHide);
+    addEventListener("beforeunload", this._onPageHide);
   }
   /* --------------------------------------------------------- resources */
   /** app.mesh(Axion.box(1,1,1)) or app.mesh('sphere', { radius: 0.4 }) */
@@ -3902,6 +3919,10 @@ var App = class _App {
     let last = performance.now();
     const tick = (now) => {
       if (!this.running) return;
+      if (!this.canvas.isConnected) {
+        this.dispose();
+        return;
+      }
       const dt = Math.min((now - last) / 1e3, 0.1);
       last = now;
       this.time += dt;
@@ -3947,12 +3968,31 @@ var App = class _App {
     return this.renderer.stats;
   }
   dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
     this.stop();
+    liveApps().delete(this);
+    removeEventListener("pagehide", this._onPageHide);
+    removeEventListener("beforeunload", this._onPageHide);
     this.controls?.dispose();
     this.fly?.dispose();
-    this.renderer.destroy();
+    try {
+      this.renderer.destroy();
+    } catch {
+    }
+    try {
+      this.renderer.context?.unconfigure?.();
+    } catch {
+    }
+    try {
+      this.device.destroy();
+    } catch {
+    }
   }
 };
+function liveApps() {
+  return globalThis.__axionLiveApps ??= /* @__PURE__ */ new Set();
+}
 
 // src/debug/frame-trap.js
 var aces = (x) => Math.min(1, Math.max(
@@ -4518,7 +4558,7 @@ async function loadGLTF(app, source, { onProgress = () => {
 }
 
 // src/index.js
-var VERSION = "0.4.1";
+var VERSION = "0.4.2";
 export {
   AO_BLUR_WGSL,
   AO_WGSL,

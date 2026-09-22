@@ -242,8 +242,8 @@
             <div id="bar"><div id="thumb"></div></div>
         </div>
 
-        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.6.3/dist/axion.min.js"></script><!-- My 3D engine Axion -->
-        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.6.3/assets/sponza.js"></script><!-- The Sponza test in JS form -->
+        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.7.0/dist/axion.min.js"></script><!-- My 3D engine Axion -->
+        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.7.0/assets/sponza.js"></script><!-- The Sponza test in JS form -->
 
         <!-- Shared state -->
         <script>
@@ -387,81 +387,104 @@
                     return (ix + 2048) * 4096 + (iz + 2048);
                 }
 
-                // Build from Axion's parsed glTF primitives (world-space vertices)
-                phys.build = function (prims) {
-                    var count = 0;
-                    for (var i = 0; i < prims.length; i++) {
-                        count += prims[i].geometry.indices.length / 3;
+                // Add one triangle (vertex indices i0, i1, i2 into v) to the grid
+                function addTri(v, i0, i1, i2) {
+                    var n = phys.count;
+                    var o = n * 9;
+                    var tris = phys.tris;
+                    var ids = [i0, i1, i2];
+                    for (var c = 0; c < 3; c++) {
+                        var src = ids[c] * 8;
+                        tris[o + c * 3] = v[src];
+                        tris[o + c * 3 + 1] = v[src + 1];
+                        tris[o + c * 3 + 2] = v[src + 2];
                     }
 
-                    var tris = new Float32Array(count * 9);
-                    var box = new Float32Array(count * 6);
-                    var up = new Float32Array(count);
-                    var n = 0;
+                    var ax = tris[o], ay = tris[o + 1], az = tris[o + 2];
+                    var bx = tris[o + 3], by = tris[o + 4], bz = tris[o + 5];
+                    var cx = tris[o + 6], cy = tris[o + 7], cz = tris[o + 8];
 
-                    for (var p = 0; p < prims.length; p++) {
-                        var g = prims[p].geometry;
-                        var v = g.vertices;
-                        var idx = g.indices;
+                    // Normal, to tell floors from walls
+                    var ux = bx - ax, uy = by - ay, uz = bz - az;
+                    var wx = cx - ax, wy = cy - ay, wz = cz - az;
+                    var nx = uy * wz - uz * wy;
+                    var ny = uz * wx - ux * wz;
+                    var nz = ux * wy - uy * wx;
+                    var len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+                    if (len < 1e-9) {
+                        return;
+                    }
+                    phys.up[n] = Math.abs(ny) / len;
 
-                        for (var t = 0; t < idx.length; t += 3) {
-                            var o = n * 9;
-                            for (var c = 0; c < 3; c++) {
-                                var src = idx[t + c] * 8;
-                                tris[o + c * 3] = v[src];
-                                tris[o + c * 3 + 1] = v[src + 1];
-                                tris[o + c * 3 + 2] = v[src + 2];
+                    var box = phys.box;
+                    var b = n * 6;
+                    box[b] = Math.min(ax, bx, cx);
+                    box[b + 1] = Math.min(ay, by, cy);
+                    box[b + 2] = Math.min(az, bz, cz);
+                    box[b + 3] = Math.max(ax, bx, cx);
+                    box[b + 4] = Math.max(ay, by, cy);
+                    box[b + 5] = Math.max(az, bz, cz);
+
+                    var x0 = Math.floor(box[b] / phys.cell);
+                    var x1 = Math.floor(box[b + 3] / phys.cell);
+                    var z0 = Math.floor(box[b + 2] / phys.cell);
+                    var z1 = Math.floor(box[b + 5] / phys.cell);
+                    for (var ix = x0; ix <= x1; ix++) {
+                        for (var iz = z0; iz <= z1; iz++) {
+                            var k = key(ix, iz);
+                            var list = phys.grid[k];
+                            if (!list) {
+                                list = [];
+                                phys.grid[k] = list;
                             }
-
-                            var ax = tris[o], ay = tris[o + 1], az = tris[o + 2];
-                            var bx = tris[o + 3], by = tris[o + 4], bz = tris[o + 5];
-                            var cx = tris[o + 6], cy = tris[o + 7], cz = tris[o + 8];
-
-                            // Normal, to tell floors from walls
-                            var ux = bx - ax, uy = by - ay, uz = bz - az;
-                            var wx = cx - ax, wy = cy - ay, wz = cz - az;
-                            var nx = uy * wz - uz * wy;
-                            var ny = uz * wx - ux * wz;
-                            var nz = ux * wy - uy * wx;
-                            var len = Math.sqrt(nx * nx + ny * ny + nz * nz);
-                            if (len < 1e-9) {
-                                continue;
-                            }
-                            up[n] = Math.abs(ny) / len;
-
-                            var b = n * 6;
-                            box[b] = Math.min(ax, bx, cx);
-                            box[b + 1] = Math.min(ay, by, cy);
-                            box[b + 2] = Math.min(az, bz, cz);
-                            box[b + 3] = Math.max(ax, bx, cx);
-                            box[b + 4] = Math.max(ay, by, cy);
-                            box[b + 5] = Math.max(az, bz, cz);
-
-                            var x0 = Math.floor(box[b] / phys.cell);
-                            var x1 = Math.floor(box[b + 3] / phys.cell);
-                            var z0 = Math.floor(box[b + 2] / phys.cell);
-                            var z1 = Math.floor(box[b + 5] / phys.cell);
-                            for (var ix = x0; ix <= x1; ix++) {
-                                for (var iz = z0; iz <= z1; iz++) {
-                                    var k = key(ix, iz);
-                                    var list = phys.grid[k];
-                                    if (!list) {
-                                        list = [];
-                                        phys.grid[k] = list;
-                                    }
-                                    list.push(n);
-                                }
-                            }
-                            n++;
+                            list.push(n);
                         }
                     }
+                    phys.count = n + 1;
+                }
 
-                    phys.tris = tris;
-                    phys.box = box;
-                    phys.up = up;
-                    phys.stamp = new Uint32Array(n);
-                    phys.ready = true;
-                    return n;
+                // Build from Axion's parsed glTF primitives (world-space vertices).
+                // Runs in small slices between frames, so the page never stalls
+                // (and Khan Academy never mistakes a long loop for a frozen one).
+                phys.build = function (prims, done) {
+                    var total = 0;
+                    for (var i = 0; i < prims.length; i++) {
+                        total += prims[i].geometry.indices.length / 3;
+                    }
+                    phys.tris = new Float32Array(total * 9);
+                    phys.box = new Float32Array(total * 6);
+                    phys.up = new Float32Array(total);
+                    phys.count = 0;
+
+                    var p = 0;
+                    var t = 0;
+
+                    function slice() {
+                        var until = Date.now() + 6;
+                        while (p < prims.length && Date.now() < until) {
+                            var g = prims[p].geometry;
+                            var idx = g.indices;
+                            var stop = Math.min(t + 1500, idx.length);
+                            for (; t < stop; t += 3) {
+                                addTri(g.vertices, idx[t], idx[t + 1], idx[t + 2]);
+                            }
+                            if (t >= idx.length) {
+                                p++;
+                                t = 0;
+                            }
+                        }
+
+                        if (p < prims.length) {
+                            setTimeout(slice, 0);
+                            return;
+                        }
+                        phys.stamp = new Uint32Array(phys.count);
+                        phys.ready = true;
+                        if (done) {
+                            done();
+                        }
+                    }
+                    slice();
                 };
 
                 // Triangles whose cells touch the square around x, z
@@ -853,6 +876,129 @@
             })();
         </script>
 
+        <!-- Fullscreen -->
+        <script>
+            (function () {
+                var sz = window.sz;
+                var full = sz.full = {
+                    // True in the copy of the page opened in its own tab
+                    popped: !!window.szPopped,
+                    tab: null
+                };
+
+                function isFull() {
+                    return !!(document.fullscreenElement || document.webkitFullscreenElement);
+                }
+
+                function enter(onFail) {
+                    var el = document.documentElement;
+                    var req = el.requestFullscreen || el.webkitRequestFullscreen;
+                    var allowed = document.fullscreenEnabled || document.webkitFullscreenEnabled;
+                    if (!req || !allowed) {
+                        onFail();
+                        return;
+                    }
+                    try {
+                        var p = req.call(el);
+                        if (p && p.catch) {
+                            p.catch(onFail);
+                        }
+                    } catch (e) {
+                        onFail();
+                    }
+                }
+
+                function leave() {
+                    var exit = document.exitFullscreen || document.webkitExitFullscreen;
+                    if (exit) {
+                        exit.call(document);
+                    }
+                }
+
+                // Khan Academy's frame doesn't allow fullscreen, so open this page
+                // in its own tab, where it can go fullscreen for real.
+                function popOut() {
+                    if (window.top === window) {
+                        sz.msg.textContent = "The browser blocked fullscreen here. Press F11 instead.";
+                        return;
+                    }
+
+                    var w = null;
+                    try {
+                        w = window.open("", "_blank");
+                    } catch (e) {
+                        w = null;
+                    }
+                    if (!w) {
+                        sz.msg.textContent = "Couldn't open a new tab (popups blocked). Allow popups, or press F11.";
+                        return;
+                    }
+
+                    var html = sz.pageHtml || "<!DOCTYPE html>" + document.documentElement.outerHTML;
+                    html = html.replace("<head>", "<head><script>window.szPopped = true;<\/script>");
+                    try {
+                        w.document.open();
+                        w.document.write(html);
+                        w.document.close();
+                    } catch (e) {
+                        w.close();
+                        sz.msg.textContent = "Couldn't open the fullscreen tab here. Press F11 instead.";
+                        return;
+                    }
+
+                    // Two copies rendering at once is too much: pause this one until the tab closes
+                    full.tab = w;
+                    if (sz.app) {
+                        sz.app.stop();
+                    }
+                    sz.msg.textContent = "Running in the new tab. Close it to come back here.";
+                    var watch = setInterval(function () {
+                        if (!w.closed) {
+                            return;
+                        }
+                        clearInterval(watch);
+                        full.tab = null;
+                        if (sz.app) {
+                            sz.app.start();
+                        }
+                        sz.hint();
+                    }, 500);
+                }
+
+                full.toggle = function () {
+                    if (isFull()) {
+                        leave();
+                        return;
+                    }
+                    enter(popOut);
+                };
+
+                // In the popped-out tab: one click to go fullscreen
+                // (browsers only allow it right after a click)
+                full.prompt = function () {
+                    var b = document.createElement("button");
+                    b.className = "btn";
+                    b.textContent = "Click for fullscreen";
+                    b.style.position = "fixed";
+                    b.style.left = "50%";
+                    b.style.top = "50%";
+                    b.style.width = "220px";
+                    b.style.marginLeft = "-110px";
+                    b.style.zIndex = "5";
+                    b.style.fontSize = "15px";
+                    b.onclick = function () {
+                        b.parentNode.removeChild(b);
+                        enter(function () {
+                            sz.msg.textContent = "The browser blocked fullscreen. Press F11 instead.";
+                        });
+                    };
+                    document.body.appendChild(b);
+                };
+
+                full.isFull = isFull;
+            })();
+        </script>
+
         <!-- Menu -->
         <script>
             (function () {
@@ -1072,29 +1218,13 @@
 
                     section("Window");
                     var fsBtn = button("Fullscreen", function () {
-                        // Inside Khan Academy's frame: reopen the page in its own window
-                        if (window.top !== window) {
-                            var w = window.open();
-                            w.document.write(sz.pageHtml || "<!DOCTYPE html>" + document.documentElement.outerHTML);
-                            w.document.close();
-                            return;
-                        }
-
-                        // Own window: real fullscreen
-                        if (document.fullscreenElement) {
-                            document.exitFullscreen();
-                            return;
-                        }
-                        var req = document.documentElement.requestFullscreen();
-                        if (req && req.catch) {
-                            req.catch(function () {
-                                sz.msg.textContent = "Fullscreen isn't allowed here";
-                            });
-                        }
+                        sz.full.toggle();
                     });
-                    document.addEventListener("fullscreenchange", function () {
-                        fsBtn.textContent = document.fullscreenElement ? "Exit fullscreen" : "Fullscreen";
-                    });
+                    function showFull() {
+                        fsBtn.textContent = sz.full.isFull() ? "Exit fullscreen" : "Fullscreen";
+                    }
+                    document.addEventListener("fullscreenchange", showFull);
+                    document.addEventListener("webkitfullscreenchange", showFull);
                     slider("Resolution scale", 0.5, 2, 0.25,
                         function () { return app.maxDpr; },
                         function (v) { app.maxDpr = v; });
@@ -1266,6 +1396,32 @@
                         function () { return r.volumetric.steps; },
                         function (v) { r.volumetric.steps = v; });
 
+                    section("Depth of field");
+                    toggle("Enabled",
+                        function () { return r.dof.enabled; },
+                        function (v) { r.dof.enabled = v; });
+                    toggle("Auto focus (center of screen)",
+                        function () { return r.dof.autoFocus; },
+                        function (v) { r.dof.autoFocus = v; });
+                    slider("Focus distance (m)", 0.5, 40, 0.5,
+                        function () { return r.dof.focus; },
+                        function (v) { r.dof.focus = v; });
+                    slider("In-focus range (m)", 0, 10, 0.1,
+                        function () { return r.dof.range; },
+                        function (v) { r.dof.range = v; });
+                    slider("Transition (m)", 0.5, 20, 0.5,
+                        function () { return r.dof.transition; },
+                        function (v) { r.dof.transition = v; });
+                    slider("Blur amount (px)", 1, 24, 1,
+                        function () { return r.dof.amount; },
+                        function (v) { r.dof.amount = v; });
+                    toggle("Blur near",
+                        function () { return r.dof.near; },
+                        function (v) { r.dof.near = v; });
+                    toggle("Blur far",
+                        function () { return r.dof.far; },
+                        function (v) { r.dof.far = v; });
+
                     section("Bloom and haze");
                     slider("Bloom", 0, 1.5, 0.05,
                         function () { return r.bloom.strength; },
@@ -1333,6 +1489,7 @@
                         volumetric: { enabled: true, density: 0.01, heightFalloff: 0.1, anisotropy: 0.3, ambient: 0.6 },
                         tonemap: { mode: "aces" },
                         autoExposure: { enabled: false, key: 0.15 },
+                        dof: { enabled: false, autoFocus: true, focus: 6, range: 1.5, transition: 4, amount: 8 },
                         physical: { enabled: false, aperture: 2.8, shutter: 1 / 30, iso: 400 }
                     }).then(function (app) {
                         sz.app = app;
@@ -1416,13 +1573,19 @@
                             sz.ready = true;
                             sz.hint();
                             app.start();
+                            if (sz.full.popped) {
+                                sz.full.prompt();
+                            }
 
-                            // Collision reads the same model's triangles on the CPU
-                            return Axion.unpackAsset(AxionAssets.sponza).then(function (bytes) {
-                                var glb = Axion.parseGLB(bytes);
-                                var model = Axion.parseGLTF(glb.json, [glb.bin]);
-                                sz.phys.build(model.primitives);
-                            });
+                            // Collision reads the same model's triangles on the CPU.
+                            // Wait a moment so the first frames get the machine to themselves.
+                            setTimeout(function () {
+                                Axion.unpackAsset(AxionAssets.sponza).then(function (bytes) {
+                                    var glb = Axion.parseGLB(bytes);
+                                    var model = Axion.parseGLTF(glb.json, [glb.bin]);
+                                    sz.phys.build(model.primitives);
+                                });
+                            }, 1500);
                         });
                     }).catch(function (e) {
                         msg.textContent = "Error: " + (e.message || e);

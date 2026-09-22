@@ -9,7 +9,7 @@
  *   app.start();
  */
 
-export const VERSION = '0.6.3';
+export const VERSION = '0.7.0';
 
 export { App } from './app.js';
 export { World, defineComponent, entityIndex, entityGen, NULL_ENTITY } from './core/ecs.js';
@@ -18,7 +18,7 @@ export * as math from './core/math.js';
 export { Camera } from './render/camera.js';
 export { Renderer } from './render/renderer.js';
 export {
-  STANDARD_WGSL, SHADOW_WGSL, AO_WGSL, AO_BLUR_WGSL, RESOLVE_WGSL, VOLUME_WGSL, EXPOSURE_WGSL,
+  STANDARD_WGSL, SHADOW_WGSL, AO_WGSL, AO_BLUR_WGSL, RESOLVE_WGSL, VOLUME_WGSL, EXPOSURE_WGSL, DOF_WGSL,
   BLOOM_PREFILTER_WGSL, BLOOM_DOWN_WGSL, BLOOM_UP_WGSL, FINAL_WGSL, CUBE_FACES,
 } from './render/shaders.js';
 export { createDevice, resizeCanvas, UnsupportedError } from './gpu/device.js';

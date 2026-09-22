@@ -149,9 +149,44 @@ try {
   const bright = await measure('brightness', () => { r.tonemap.brightness = 1.5; }, () => { r.tonemap.brightness = 1; });
   if (!(bright.display > base.display + 5)) out.errors.push('brightness did nothing');
 
+  // Depth of field: blur measured as lost edge energy, in two regions.
+  function edges(c, x0, x1) {
+    const x = c.getContext('2d'), w = c.width, h = c.height, d = x.getImageData(0, 0, w, h).data; let e = 0;
+    // The middle band is the far end of the nave; the edges are the arches beside the camera.
+    const y0 = x0 > 0.3 ? Math.floor(h * 0.2) : 1, y1 = x0 > 0.3 ? Math.floor(h * 0.5) : h;
+    for (let y = y0; y < y1; y++) for (let i = Math.floor(x0 * w) + 1; i < Math.floor(x1 * w); i++) {
+      const o = (y * w + i) * 4; e += Math.abs(d[o + 1] - d[o - 3]) + Math.abs(d[o + 1] - d[o + 1 - w * 4]);
+    }
+    return e;
+  }
+  const frameSnap = async () => { await frame(); return app.snapshot(480, 300); };
+  const sharp = await frameSnap();
+  // Focus far down the nave: the arches right beside the camera must soften.
+  Object.assign(r.dof, { enabled: true, focus: 12, range: 2, transition: 3, amount: 10, near: true, far: false, autoFocus: false });
+  const nearBlur = await frameSnap();
+  // Focus close: the far end of the nave must soften instead.
+  Object.assign(r.dof, { focus: 2, range: 0.5, transition: 2, near: true, far: true });
+  const farBlur = await frameSnap();
+  r.dof.autoFocus = true;
+  const auto = await frameSnap();
+  r.dof.enabled = false;
+  const e = {
+    sharpEdge: edges(sharp, 0, 0.12), sharpMid: edges(sharp, 0.4, 0.6),
+    nearEdge: edges(nearBlur, 0, 0.12), nearMid: edges(nearBlur, 0.4, 0.6),
+    farEdge: edges(farBlur, 0, 0.12), farMid: edges(farBlur, 0.4, 0.6),
+    autoMid: edges(auto, 0.4, 0.6),
+  };
+  out.measured.dof = e;
+  out.shots.dofNear = nearBlur.toDataURL('image/jpeg', 0.8);
+  out.shots.dofFar = farBlur.toDataURL('image/jpeg', 0.8);
+  if (!(e.nearEdge < e.sharpEdge * 0.8)) out.errors.push('DOF: near field not blurred');
+  if (!(e.nearMid > e.sharpMid * 0.8)) out.errors.push('DOF: focused far field got blurred');
+  if (!(e.farMid < e.sharpMid * 0.8)) out.errors.push('DOF: far field not blurred');
+  if (!(e.autoMid > e.farMid * 1.2)) out.errors.push('DOF: auto focus did not refocus on the centre');
+
   // Everything at once, for the cost ceiling.
   const all = await measure('everything', () => {
-    r.ssil.intensity = 1; r.volumetric.enabled = true; r.autoExposure.enabled = true; r.tonemap.mode = 'agx';
+    r.ssil.intensity = 1; r.volumetric.enabled = true; r.autoExposure.enabled = true; r.tonemap.mode = 'agx'; r.dof.enabled = true;
   });
   out.measured.costRatio = +(all.ms / base.ms).toFixed(2);
 

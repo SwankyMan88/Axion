@@ -1,7 +1,7 @@
 import { Arena, DynamicBuffer, retire, sweepRetired } from '../gpu/buffers.js';
 import { solidTexture } from '../gpu/textures.js';
 import {
-  STANDARD_WGSL, SHADOW_WGSL, AO_WGSL, AO_BLUR_WGSL, RESOLVE_WGSL, VOLUME_WGSL, EXPOSURE_WGSL,
+  STANDARD_WGSL, SHADOW_WGSL, AO_WGSL, AO_BLUR_WGSL, RESOLVE_WGSL, VOLUME_WGSL, EXPOSURE_WGSL, DOF_WGSL,
   BLOOM_PREFILTER_WGSL, BLOOM_DOWN_WGSL, BLOOM_UP_WGSL, FINAL_WGSL, CUBE_FACES,
 } from './shaders.js';
 import { VERTEX_STRIDE_BYTES } from '../geometry/primitives.js';
@@ -13,7 +13,7 @@ import { frustumFromMatrix, sphereInFrustum } from '../core/math.js';
 
 const INSTANCE_FLOATS = 28;   // mat4(16) + color(4) + pbr(4) + surface(4)
 const LIGHT_FLOATS = 12;      // posRange(4) + colorPower(4) + shadowInfo(4)
-const CAMERA_FLOATS = 128;
+const CAMERA_FLOATS = 132;
 const MAX_LIGHTS = 256;
 const FACE_SLOT_BYTES = 256;  // uniform dynamic offsets must be 256-aligned
 
@@ -125,6 +125,22 @@ export class Renderer {
      * adapting at `speed`. `exposure` (or the physical camera) still applies on
      * top as compensation. min/max are limits in stops.
      */
+    /**
+     * Depth of field. Everything within `range` metres of `focus` is sharp;
+     * blur ramps up over `transition` metres beyond that, to `amount` pixels.
+     * `autoFocus` focuses on whatever is at the centre of the screen.
+     */
+    this.dof = {
+      enabled: options.dof?.enabled ?? false,
+      focus: options.dof?.focus ?? 5,
+      range: options.dof?.range ?? 1.5,
+      transition: options.dof?.transition ?? 4,
+      amount: options.dof?.amount ?? 8,
+      near: options.dof?.near ?? true,
+      far: options.dof?.far ?? true,
+      autoFocus: options.dof?.autoFocus ?? false,
+    };
+
     /** Stops added after everything else: manual, physical or auto exposure. */
     this.exposureCompensation = options.exposureCompensation ?? 0;
 
@@ -209,6 +225,7 @@ export class Renderer {
       final: device.createShaderModule({ code: FINAL_WGSL, label: 'axion-final' }),
       volume: device.createShaderModule({ code: VOLUME_WGSL, label: 'axion-volume' }),
       exposure: device.createShaderModule({ code: EXPOSURE_WGSL, label: 'axion-exposure' }),
+      dof: device.createShaderModule({ code: DOF_WGSL, label: 'axion-dof' }),
     };
 
     this._buildLayouts();
@@ -408,6 +425,16 @@ export class Renderer {
     this.exposureBuffer = this.device.createBuffer({
       size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, label: 'axion-exposure-state',
     });
+    this._dofLayout = this.device.createBindGroupLayout({
+      label: 'axion-dof',
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
+      ],
+    });
+    this._dofPipeline = this._fullscreenPipeline('axion-dof', this._dofLayout, m.dof, HDR_FORMAT);
     this._resolvePipeline = this._fullscreenPipeline('axion-resolve', this._resolveLayout, m.resolve, HDR_FORMAT);
     this._bloomPrefilterPipeline = this._fullscreenPipeline('axion-bloom-prefilter', this._bloomLayout, m.bloomPrefilter, HDR_FORMAT);
     this._bloomDownPipeline = this._fullscreenPipeline('axion-bloom-down', this._bloomLayout, m.bloomDown, HDR_FORMAT);
@@ -643,7 +670,7 @@ export class Renderer {
     const make = (format, w, h, label) => this.device.createTexture({
       size: [Math.max(1, w), Math.max(1, h)], format, label,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
-        | GPUTextureUsage.COPY_SRC,
+        | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,
     });
 
     const color = make(HDR_FORMAT, width, height, 'axion-scene-color');
@@ -688,6 +715,9 @@ export class Renderer {
 
     this.aoBindGroup = bg(this._aoLayout, [camRes, this._sampler, t.depthView, t.surfaceView, t.colorView], 'axion-ao');
     this.volBlurBindGroup = bg(this._aoBlurLayout, [camRes, this._sampler, t.volView, t.depthView], 'axion-volume-blur');
+    // Depth of field reads the resolved frame and writes into the scene colour
+    // target, which is free by then; the result is copied back over the frame.
+    this.dofBindGroup = bg(this._dofLayout, [camRes, this._sampler, t.hdrView, t.depthView], 'axion-dof');
     this.exposureBindGroup = bg(this._exposureLayout, [camRes, t.hdrView, { buffer: this.exposureBuffer }], 'axion-exposure');
     this._volumeBindGroup = null;
     this.aoBlurBindGroup = bg(this._aoBlurLayout, [camRes, this._sampler, t.aoView, t.depthView], 'axion-ao-blur');
@@ -1008,6 +1038,9 @@ export class Renderer {
     const ae = this.autoExposure;
     cd[112] = tm.brightness; cd[113] = ae.enabled ? 1 : 0; cd[114] = this.exposureCompensation; cd[115] = ae.key;
     cd[116] = ae.min; cd[117] = ae.max; cd[118] = ae.speed; cd[119] = dtFrame;
+    const df = this.dof;
+    cd[120] = df.focus; cd[121] = df.range; cd[122] = df.transition; cd[123] = df.amount;
+    cd[124] = df.near ? 1 : 0; cd[125] = df.far ? 1 : 0; cd[126] = df.autoFocus ? 1 : 0; cd[127] = df.enabled ? 1 : 0;
     this.device.queue.writeBuffer(this.cameraBuffer, 0, cd);
 
     if (this.frustumCulling) frustumFromMatrix(this._frustum, 0, camera.viewProj, 0);
@@ -1223,6 +1256,15 @@ export class Renderer {
     /* ---- 4. resolve ---- */
     fullscreen('axion-resolve', t.hdrView, this._resolvePipeline, this.resolveBindGroup);
 
+    /* ---- 4a. depth of field ---- */
+    const dof = this.dof;
+    let dofPasses = 0;
+    if (dof.enabled && dof.amount > 0 && (dof.near || dof.far)) {
+      fullscreen('axion-dof', t.colorView, this._dofPipeline, this.dofBindGroup);
+      enc.copyTextureToTexture({ texture: t.color }, { texture: t.hdr }, [width, height, 1]);
+      dofPasses = 1;
+    }
+
     /* ---- 4b. auto exposure: measure the resolved frame on the GPU ---- */
     if (this.autoExposure.enabled) {
       const cp = enc.beginComputePass({ label: 'axion-exposure' });
@@ -1265,7 +1307,7 @@ export class Renderer {
 
     const bloomPasses = t.bloom.length > 0 && this.bloom.strength > 0
       ? t.bloom.length * 2 - 1 : 0;
-    this.stats.drawCalls = draws + shadowDraws + 3 + volumePasses + bloomPasses + 1;
+    this.stats.drawCalls = draws + shadowDraws + 3 + volumePasses + dofPasses + bloomPasses + 1;
     this.stats.batches = batches;
     this.stats.instances = visible;
     this.stats.culled = culled;

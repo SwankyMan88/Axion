@@ -302,6 +302,7 @@ r.ssil.intensity = 1;  r.ssil.radius = 3;          // screen-space indirect ligh
 r.volumetric.enabled = true;                          // volumetric fog with shadowed light shafts
 Object.assign(r.volumetric, { density: 0.015, heightFalloff: 0.1, anisotropy: 0.3, steps: 24 });
 r.autoExposure.enabled = true;                        // GPU-metered, eases to middle grey
+Object.assign(r.dof, { enabled: true, autoFocus: true, range: 1.5, transition: 4, amount: 8 });  // depth of field
 r.tonemap.mode = 'agx';                               // 'linear' | 'reinhard' | 'filmic' | 'aces' | 'agx'
 Object.assign(r.tonemap, { white: 6, brightness: 1, contrast: 1, saturation: 1 });
 // Physical units: light intensity in lumens, exposure from a real camera.
@@ -431,8 +432,7 @@ Real-time global illumination beyond SSIL (Godot's SDFGI or VoxelGI): both
 need a 3D distance-field or voxel representation of the scene rebuilt in
 compute as the camera moves — a subsystem on the scale of the whole renderer.
 SSIL covers the near-field bounce you can see; off-screen and multi-bounce
-light is what those add. Depth of field, sky/atmosphere, and reflection
-probes are the other big gaps against Godot.
+light is what those add. A sky/atmosphere system and reflection probes are the other big gaps against Godot.
 
 Honest list, in the order they'd matter: a directional sun with cascaded
 shadows (Sponza is lit here by a distant point light standing in for one); temporal anti-aliasing and reprojection

@@ -44,6 +44,8 @@ struct Camera {
   tone     : vec4<f32>,   // x = mode (0 linear, 1 reinhard, 2 filmic, 3 aces, 4 agx), y = white, z = contrast, w = saturation
   grade    : vec4<f32>,   // x = brightness, y = auto exposure on, z = compensation (stops), w = auto key
   expo     : vec4<f32>,   // x = min log2 exposure, y = max log2 exposure, z = adapt speed, w = frame dt
+  dof      : vec4<f32>,   // x = focus distance, y = in-focus half range, z = transition, w = max blur px
+  dof2     : vec4<f32>,   // x = near on, y = far on, z = auto focus, w = enabled
   pad      : vec4<f32>,
 };
 
@@ -924,6 +926,88 @@ fn main(@builtin(local_invocation_index) li : u32,
       state[0] = state[0] + (goal - state[0]) * k;
     }
   }
+}
+`;
+
+/* ------------------------------------------------------- depth of field -- */
+
+export const DOF_WGSL = /* wgsl */`
+${COMMON}
+
+@group(0) @binding(0) var<uniform> camera : Camera;
+@group(0) @binding(1) var texSampler : sampler;
+@group(0) @binding(2) var hdrTex : texture_2d<f32>;
+@group(0) @binding(3) var depthTex : texture_depth_2d;
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
+
+fn viewDist(uv : vec2<f32>) -> f32 {
+  let d = textureLoad(depthTex, pixelOf(uv), 0);
+  if (d <= 1e-7) { return 1e5; }            // sky: infinitely far
+  return length(viewPosFromUV(uv, d, camera.proj));
+}
+
+/** Where the lens is focused: fixed, or the median-ish of five centre taps. */
+fn focusDistance() -> f32 {
+  if (camera.dof2.z < 0.5) { return camera.dof.x; }
+  let o = 0.03;
+  let a = viewDist(vec2<f32>(0.5, 0.5));
+  let b = viewDist(vec2<f32>(0.5 - o, 0.5));
+  let c = viewDist(vec2<f32>(0.5 + o, 0.5));
+  let d = viewDist(vec2<f32>(0.5, 0.5 - o));
+  let e = viewDist(vec2<f32>(0.5, 0.5 + o));
+  // Nearest of the five: focusing on a thin foreground edge beats focusing
+  // on the wall behind it, which is what a photographer would pick.
+  return min(min(min(a, b), min(c, d)), e);
+}
+
+/** Signed circle of confusion in [-1, 1]: negative = near blur, positive = far. */
+fn coc(dist : f32, focus : f32) -> f32 {
+  let half = camera.dof.y;
+  let t = max(camera.dof.z, 0.01);
+  var c = 0.0;
+  if (camera.dof2.y > 0.5) { c = clamp((dist - (focus + half)) / t, 0.0, 1.0); }
+  if (camera.dof2.x > 0.5 && dist < focus - half) { c = -clamp(((focus - half) - dist) / t, 0.0, 1.0); }
+  return c;
+}
+
+/**
+ * Depth of field as a scatter-as-gather disk blur.
+ *
+ * Every pixel gathers a golden-angle disk out to the maximum blur radius; a
+ * sample counts if ITS OWN circle of confusion reaches this pixel. That is
+ * what lets a blurry foreground spill over a sharp background (near field),
+ * while a background sample is clipped to this pixel's own radius so a
+ * blurred wall can never bleed across an in-focus object in front of it.
+ */
+@fragment
+fn fs(in : FSOut) -> @location(0) vec4<f32> {
+  let center = textureSampleLevel(hdrTex, texSampler, in.uv, 0.0).rgb;
+  let focus = focusDistance();
+  let dC = viewDist(in.uv);
+  let cocC = coc(dC, focus);
+  let maxPx = camera.dof.w;
+  let rC = abs(cocC) * maxPx;
+
+  let TAPS = 40;
+  let rot = f32(interleavedIndex(in.clip.xy)) * 0.3927;   // 4x4 rotation, hides the pattern
+  var sum = center;
+  var wsum = 1.0;
+  for (var i = 0; i < TAPS; i = i + 1) {
+    let r = sqrt((f32(i) + 0.5) / f32(TAPS)) * maxPx;
+    let a = f32(i) * 2.39996323 + rot;
+    let uv = in.uv + vec2<f32>(cos(a), sin(a)) * r * camera.screen.zw;
+    let dS = viewDist(uv);
+    let cocS = coc(dS, focus);
+    var rS = abs(cocS) * maxPx;
+    // Behind the centre pixel: may not spread further than the centre's own blur.
+    if (dS > dC) { rS = min(rS, rC); }
+    let w = clamp(rS - r + 1.0, 0.0, 1.0);
+    sum = sum + textureSampleLevel(hdrTex, texSampler, uv, 0.0).rgb * w;
+    wsum = wsum + w;
+  }
+  return vec4<f32>(sanitize(sum / wsum), 1.0);
 }
 `;
 

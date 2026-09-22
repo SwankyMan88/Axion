@@ -1,6 +1,6 @@
 {
   "name": "axion",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "A WebGPU, data-oriented 3D engine.",
   "type": "module",
   "main": "src/index.js",
@@ -20,7 +20,7 @@
     "dev": "node test/serve.mjs",
     "build": "node build.mjs",
     "test": "node test/smoke.mjs",
-    "test:gpu": "node test/gpu-validate.mjs && node test/gpu-validate.mjs test/regressions.html && node test/gpu-validate.mjs test/trap-check.html && node test/gpu-validate.mjs test/robustness.html && node test/gpu-validate.mjs test/rerun-check.html",
+    "test:gpu": "node test/gpu-validate.mjs && node test/gpu-validate.mjs test/regressions.html && node test/gpu-validate.mjs test/trap-check.html && node test/gpu-validate.mjs test/robustness.html && node test/gpu-validate.mjs test/rerun-check.html && node test/gpu-validate.mjs test/snapshot-check.html",
     "test:bundle": "node build.mjs && node test/gpu-validate.mjs test/bundle-check.html",
     "prepublishOnly": "node build.mjs",
     "fetch:sponza": "node scripts/fetch-sponza.mjs",

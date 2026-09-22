@@ -1,4 +1,4 @@
-/*! Axion 0.4.2 — WebGPU, data-oriented 3D engine. MIT. */
+/*! Axion 0.4.3 — WebGPU, data-oriented 3D engine. MIT. */
 var __defProp = Object.defineProperty;
 var __export = (target, all) => {
   for (var name in all)
@@ -3959,6 +3959,38 @@ var App = class _App {
     else this.fly?.setEnabled(false);
     return this;
   }
+  /**
+   * Copy the current view into a new 2D canvas (for thumbnails, screenshots).
+   *
+   * A WebGPU canvas only holds its image during the task that drew it; once
+   * the frame is presented, drawImage() and toDataURL() on it read black. So
+   * this renders a fresh frame and copies it in the same task. Unset sizes
+   * follow the canvas; `fit: 'cover'` crops to the target aspect instead of
+   * stretching.
+   */
+  snapshot(width = this.canvas.width, height = this.canvas.height, { fit = "cover" } = {}) {
+    this.renderer.render(this.world, this.camera, this.time);
+    const out = document.createElement("canvas");
+    out.width = width;
+    out.height = height;
+    const src = this.canvas;
+    let sx = 0, sy = 0, sw = src.width, sh = src.height;
+    if (fit === "cover") {
+      const k = Math.min(sw / width, sh / height);
+      sx = (sw - width * k) / 2;
+      sy = (sh - height * k) / 2;
+      sw = width * k;
+      sh = height * k;
+    }
+    out.getContext("2d").drawImage(src, sx, sy, sw, sh, 0, 0, width, height);
+    return out;
+  }
+  /** The most recently created app that is still alive, or null. */
+  static get current() {
+    let last = null;
+    for (const a of liveApps()) last = a;
+    return last;
+  }
   stop() {
     this.running = false;
     cancelAnimationFrame(this._raf);
@@ -4558,7 +4590,7 @@ async function loadGLTF(app, source, { onProgress = () => {
 }
 
 // src/index.js
-var VERSION = "0.4.2";
+var VERSION = "0.4.3";
 export {
   AO_BLUR_WGSL,
   AO_WGSL,

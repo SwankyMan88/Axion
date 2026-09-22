@@ -291,8 +291,8 @@ base64'd into one script (~16 MB, under jsDelivr's 20 MB per-file cap). Load it
 with a script tag and hand it to the loader:
 
 ```html
-<script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.4.2/dist/axion.min.js"></script>
-<script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.4.2/assets/sponza.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.4.3/dist/axion.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.4.3/assets/sponza.js"></script>
 <script>
   const app = await Axion.App.create(canvas);
   await Axion.loadGLTF(app, AxionAssets.sponza);
@@ -334,7 +334,7 @@ The IIFE builds expose a global `Axion`, for pages that cannot use modules.
 Push a tag to GitHub and jsDelivr serves it with no publishing step:
 
 ```html
-<script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.4.2/dist/axion.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.4.3/dist/axion.min.js"></script>
 <script>
   const app = await Axion.App.create(document.querySelector('canvas'));
 </script>

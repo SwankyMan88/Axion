@@ -1,0 +1,13 @@
+<!doctype html><meta charset="utf-8"><canvas id="c" width="300" height="150" style="width:300px;height:150px"></canvas>
+<script src="../dist/axion.min.js"></script>
+<script>
+Axion.App.create(document.getElementById('c')).then(function(app){
+  app.add({mesh:app.mesh(Axion.box(1,1,1)),material:app.material({color:[0.9,0.9,0.9]})}); app.light([2,3,2],{intensity:40,range:20}); app.start();
+  setTimeout(function(){
+    var c=Axion.App.current.snapshot(600,600), x=c.getContext('2d'), d=x.getImageData(0,0,600,600).data, s=0;
+    for(var i=0;i<d.length;i+=4)s+=d[i]+d[i+1]+d[i+2];
+    var m=s/(600*600*3), url=c.toDataURL();
+    window.__result={ok:m>5 && url.length>1000,errors:[],measured:{mean:m,urlLen:url.length},done:true};
+  },1500);
+});
+</script>

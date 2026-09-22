@@ -37,6 +37,14 @@ struct Camera {
   bloom    : vec4<f32>,   // x = threshold, y = knee, z = strength, w = unused
   shadow   : vec4<f32>,   // x = map size, y = pcf radius, z = normal bias, w = unused
   fade     : vec4<f32>,   // x = AO fade distance, y = SSR fade distance, zw = unused
+  ssil     : vec4<f32>,   // x = indirect light intensity, y = radius, zw = unused
+  vol      : vec4<f32>,   // x = density, y = steps, z = anisotropy g, w = max distance
+  vol2     : vec4<f32>,   // x = height base, y = height falloff, z = ambient scatter, w = light scatter
+  volColor : vec4<f32>,   // rgb = scattering albedo, a = enabled
+  tone     : vec4<f32>,   // x = mode (0 linear, 1 reinhard, 2 filmic, 3 aces, 4 agx), y = white, z = contrast, w = saturation
+  grade    : vec4<f32>,   // x = brightness, y = auto exposure on, zw = unused
+  expo     : vec4<f32>,   // x = min log2 exposure, y = max log2 exposure, z = adapt speed, w = frame dt
+  pad      : vec4<f32>,
 };
 
 const PI : f32 = 3.14159265359;
@@ -581,6 +589,7 @@ ${COMMON}
 @group(0) @binding(1) var texSampler : sampler;
 @group(0) @binding(2) var depthTex : texture_depth_2d;
 @group(0) @binding(3) var surfaceTex : texture_2d<f32>;
+@group(0) @binding(4) var sceneColor : texture_2d<f32>;
 
 fn loadDepth(uv : vec2<f32>) -> f32 {
   return textureLoad(depthTex, pixelOf(uv), 0);
@@ -590,7 +599,13 @@ fn loadDepth(uv : vec2<f32>) -> f32 {
 fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
 
 /**
- * Horizon-based ambient occlusion.
+ * Horizon-based ambient occlusion, plus screen-space indirect light (SSIL).
+ *
+ * Output: rgb = one bounce of indirect light arriving at this pixel, a = AO.
+ * The indirect term reuses the occlusion march: every sample that raises the
+ * horizon is also a surface facing this one, and its direct lighting from the
+ * geometry pass is light it bounces back. Gathering it costs one extra fetch
+ * per step, and only when SSIL is on.
  *
  * For each of six directions the march finds the steepest horizon the
  * neighbourhood raises against the surface, and integrates the cosine-weighted
@@ -599,9 +614,9 @@ fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
  * that sparse sampling into a smooth term.
  */
 @fragment
-fn fs(in : FSOut) -> @location(0) f32 {
+fn fs(in : FSOut) -> @location(0) vec4<f32> {
   let d = loadDepth(in.uv);
-  if (d <= 1e-7) { return 1.0; }
+  if (d <= 1e-7) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
 
   let P = viewPosFromUV(in.uv, d, camera.proj);
   let N = octDecode(textureSampleLevel(surfaceTex, texSampler, in.uv, 0.0).xy);
@@ -619,9 +634,9 @@ fn fs(in : FSOut) -> @location(0) f32 {
   // Fading out is honest: no occlusion beats invented occlusion.
   let dist = -P.z;
   let distanceFade = 1.0 - smoothstep(camera.fade.x * 0.35, camera.fade.x, dist);
-  if (distanceFade <= 0.001) { return 1.0; }
+  if (distanceFade <= 0.001) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
   let grazeFade = smoothstep(0.12, 0.38, abs(dot(N, normalize(-P))));
-  if (grazeFade <= 0.001) { return 1.0; }
+  if (grazeFade <= 0.001) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
 
   let radius = camera.ao.y;
   // Project the world-space radius to screen: distant geometry must not be
@@ -639,6 +654,11 @@ fn fs(in : FSOut) -> @location(0) f32 {
   let radialOffset = (f32(tile & 3) + 0.5) * 0.25;
 
   var occlusion = 0.0;
+  var bounce = vec3<f32>(0.0);
+  let gather = camera.ssil.x > 0.0;
+  let GI_STEPS = 4;
+  let giRadius = max(camera.ssil.y, 0.1);
+  let giRadiusUV = clamp(giRadius * camera.proj.x / max(-P.z, 1e-3) * 0.5, 0.004, 0.35);
 
   for (var s = 0; s < SLICES; s = s + 1) {
     let theta = rot + f32(s) * (PI / f32(SLICES));
@@ -662,12 +682,33 @@ fn fs(in : FSOut) -> @location(0) f32 {
       let falloff = 1.0 - clamp(len / radius, 0.0, 1.0);
       best = max(best, horizon * falloff);
     }
+
+    // Indirect: light leaving nearby surfaces toward this pixel, gathered
+    // along the same slice direction but over its own, wider radius — bounce
+    // light carries much further than contact shadowing does.
+    if (gather) {
+      for (var t = 1; t <= GI_STEPS; t = t + 1) {
+        let frac = (f32(t) - 1.0 + radialOffset) / f32(GI_STEPS);
+        let uv = in.uv + dir * giRadiusUV * frac;
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { break; }
+        let sd = loadDepth(uv);
+        if (sd <= 1e-7) { continue; }
+        let v = viewPosFromUV(uv, sd, camera.proj) - P;
+        let len = length(v);
+        if (len < 1e-3 || len > giRadius) { continue; }
+        let cosR = max(dot(v / len, N), 0.0);
+        let falloff = 1.0 - len / giRadius;
+        let Ls = textureSampleLevel(sceneColor, texSampler, uv, 0.0).rgb;
+        bounce = bounce + sanitize(Ls) * cosR * falloff;
+      }
+    }
     occlusion = occlusion + max(best, 0.0);
   }
 
   let strength = camera.ao.x * distanceFade * grazeFade;
   let ao = clamp(1.0 - occlusion / f32(SLICES) * strength, 0.0, 1.0);
-  return pow(ao, camera.ao.z);
+  let gi = bounce / f32(SLICES * GI_STEPS) * camera.ssil.x * 4.0 * distanceFade;
+  return vec4<f32>(gi, pow(ao, camera.ao.z));
 }
 `;
 
@@ -687,17 +728,18 @@ fn loadDepth(uv : vec2<f32>) -> f32 {
 fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
 
 /**
- * Depth-aware box blur. Weighting each tap by how close its depth is to the
+ * Depth-aware box blur, four channels: AO + indirect light, or the
+ * volumetric fog buffer, which shares the same 4x4 interleaved jitter. Weighting each tap by how close its depth is to the
  * centre's is what stops AO from bleeding across a silhouette and drawing a
  * dark halo around every object.
  */
 @fragment
-fn fs(in : FSOut) -> @location(0) f32 {
+fn fs(in : FSOut) -> @location(0) vec4<f32> {
   let dims = vec2<f32>(textureDimensions(aoTex, 0));
   let texel = 1.0 / dims;
   let centerZ = linearDepth(loadDepth(in.uv), camera.proj.z);
 
-  var sum = 0.0;
+  var sum = vec4<f32>(0.0);
   var weight = 0.0;
   // Exactly four pixels on each axis, matching the 4x4 rotation tile. Any four
   // consecutive pixels contain one of every rotation, so this kernel averages
@@ -708,11 +750,178 @@ fn fs(in : FSOut) -> @location(0) f32 {
       let uv = in.uv + vec2<f32>(f32(x), f32(y)) * texel;
       let z = linearDepth(loadDepth(uv), camera.proj.z);
       let w = exp(-abs(z - centerZ) * 2.0);
-      sum = sum + textureSampleLevel(aoTex, texSampler, uv, 0.0).r * w;
+      sum = sum + textureSampleLevel(aoTex, texSampler, uv, 0.0) * w;
       weight = weight + w;
     }
   }
   return sum / max(weight, 1e-4);
+}
+`;
+
+/* ---------------------------------------------------------- volumetric -- */
+
+export const VOLUME_WGSL = /* wgsl */`
+${COMMON}
+${CUBE_WGSL}
+
+struct Light {
+  posRange   : vec4<f32>,
+  colorPower : vec4<f32>,
+  shadowInfo : vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> camera : Camera;
+@group(0) @binding(1) var texSampler : sampler;
+@group(0) @binding(2) var depthTex : texture_depth_2d;
+@group(0) @binding(3) var<storage, read> lights : array<Light>;
+@group(0) @binding(4) var shadowMaps : texture_depth_2d_array;
+@group(0) @binding(5) var shadowSampler : sampler_comparison;
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
+
+/** Henyey-Greenstein: g > 0 scatters forward, toward the viewer looking at a light. */
+fn phaseHG(cosT : f32, g : f32) -> f32 {
+  let g2 = g * g;
+  let denom = max(1.0 + g2 - 2.0 * g * cosT, 1e-4);
+  return (1.0 - g2) / (4.0 * PI * denom * sqrt(denom));
+}
+
+/** One hardware-filtered shadow tap: in a medium, soft PCF is invisible. */
+fn shadowTap(slot : i32, toFrag : vec3<f32>, near : f32, far : f32) -> f32 {
+  let face = faceIndex(toFrag);
+  let F = FACE_F[face];
+  let U = FACE_U[face];
+  let R = cross(F, U);
+  let ma = dot(toFrag, F);
+  if (ma <= near) { return 1.0; }
+  let uv = vec2<f32>(dot(toFrag, R) / ma * 0.5 + 0.5, 0.5 - dot(toFrag, U) / ma * 0.5);
+  let A = far / (far - near);
+  let B = near * far / (far - near);
+  let refDepth = A - B / (ma * 1.01);
+  return textureSampleCompareLevel(shadowMaps, shadowSampler, uv, slot * 6 + face, refDepth);
+}
+
+/**
+ * Volumetric fog: march the view ray through a height-falling medium and
+ * integrate light scattered toward the eye, with each point light's shadow
+ * map deciding where its shafts are. Half resolution, 4x4 interleaved start
+ * offsets, then the shared depth-aware blur — the same budget trick as AO.
+ *
+ * Output: rgb = in-scattered light, a = transmittance to the surface.
+ */
+@fragment
+fn fs(in : FSOut) -> @location(0) vec4<f32> {
+  let d = textureLoad(depthTex, pixelOf(in.uv), 0);
+  let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
+  let dirView = normalize(vec3<f32>(ndc.x / camera.proj.x, ndc.y / camera.proj.y, -1.0));
+  let dir = normalize((camera.invView * vec4<f32>(dirView, 0.0)).xyz);
+
+  var dist = camera.vol.w;
+  if (d > 1e-7) {
+    dist = min(length(viewPosFromUV(in.uv, d, camera.proj)), camera.vol.w);
+  }
+
+  let steps = max(i32(camera.vol.y), 1);
+  let dt = dist / f32(steps);
+  let jitter = (f32(interleavedIndex(in.clip.xy)) + 0.5) / 16.0;
+  let origin = camera.position.xyz;
+  let count = u32(camera.params.x);
+  let ambient = camera.ambient.rgb * camera.vol2.z;
+
+  var T = 1.0;
+  var L = vec3<f32>(0.0);
+
+  for (var i = 0; i < steps; i = i + 1) {
+    let t = (f32(i) + jitter) * dt;
+    let X = origin + dir * t;
+    let density = camera.vol.x * exp(-max(X.y - camera.vol2.x, 0.0) * camera.vol2.y);
+    if (density < 1e-6) { continue; }
+
+    var light = ambient;
+    for (var li : u32 = 0u; li < count; li = li + 1u) {
+      let l = lights[li];
+      let toL = l.posRange.xyz - X;
+      let ld = length(toL);
+      if (ld > l.posRange.w) { continue; }
+      let ratio = ld / l.posRange.w;
+      let window = clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);
+      let atten = (window * window) / (ld * ld + 1.0);
+
+      var vis = 1.0;
+      let slot = i32(l.shadowInfo.x);
+      if (slot >= 0) {
+        vis = shadowTap(slot, X - l.posRange.xyz, l.shadowInfo.y, l.shadowInfo.w);
+      }
+      let phase = phaseHG(dot(dir, toL / max(ld, 1e-4)), camera.vol.z);
+      light = light + l.colorPower.rgb * l.colorPower.a * atten * phase * vis * camera.vol2.w;
+    }
+
+    // Energy-conserving step integration (Hillaire 2015): exact for a
+    // constant medium across the step, so the result does not change with the
+    // step count, only its noise does.
+    let sampleT = exp(-density * dt);
+    let S = light * camera.volColor.rgb;
+    L = L + T * S * (1.0 - sampleT);
+    T = T * sampleT;
+    if (T < 0.003) { break; }
+  }
+
+  return vec4<f32>(sanitize(L), T);
+}
+`;
+
+/* -------------------------------------------------------- auto exposure -- */
+
+/**
+ * Average scene luminance (log2, centre-weighted) and ease the stored value
+ * toward it. One 16x16 workgroup reads a 32x32 grid of the HDR target; the
+ * result lives in a tiny storage buffer the final pass reads, so exposure
+ * never makes a round trip to the CPU.
+ */
+export const EXPOSURE_WGSL = /* wgsl */`
+${COMMON}
+
+@group(0) @binding(0) var<uniform> camera : Camera;
+@group(0) @binding(1) var hdrTex : texture_2d<f32>;
+@group(0) @binding(2) var<storage, read_write> state : array<f32, 4>;
+
+var<workgroup> sums : array<vec2<f32>, 256>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(local_invocation_index) li : u32,
+        @builtin(local_invocation_id) lid : vec3<u32>) {
+  let dims = vec2<f32>(textureDimensions(hdrTex, 0));
+  var acc = vec2<f32>(0.0);
+  for (var k = 0u; k < 4u; k = k + 1u) {
+    let cell = vec2<f32>(f32(lid.x * 2u + (k & 1u)), f32(lid.y * 2u + (k >> 1u)));
+    let uv = (cell + 0.5) / 32.0;
+    let c = textureLoad(hdrTex, vec2<i32>(uv * dims), 0).rgb;
+    let lum = dot(sanitize(c), vec3<f32>(0.2126, 0.7152, 0.0722));
+    // Centre-weighted: the middle of the frame is what you are looking at.
+    let w = 1.0 - 0.7 * length(uv - 0.5) * 1.41421;
+    acc = acc + vec2<f32>(log2(lum + 1e-4) * w, w);
+  }
+  sums[li] = acc;
+  workgroupBarrier();
+
+  var stride = 128u;
+  while (stride > 0u) {
+    if (li < stride) { sums[li] = sums[li] + sums[li + stride]; }
+    workgroupBarrier();
+    stride = stride >> 1u;
+  }
+
+  if (li == 0u) {
+    let goal = sums[0].x / max(sums[0].y, 1e-4);
+    if (state[1] < 0.5) {
+      state[0] = goal;
+      state[1] = 1.0;
+    } else {
+      let k = 1.0 - exp(-camera.expo.w * camera.expo.z);
+      state[0] = state[0] + (goal - state[0]) * k;
+    }
+  }
 }
 `;
 
@@ -728,6 +937,7 @@ ${COMMON}
 @group(0) @binding(4) var albedoTex : texture_2d<f32>;
 @group(0) @binding(5) var depthTex : texture_depth_2d;
 @group(0) @binding(6) var aoTex : texture_2d<f32>;
+@group(0) @binding(7) var volTex : texture_2d<f32>;
 
 fn loadDepth(uv : vec2<f32>) -> f32 {
   return textureLoad(depthTex, pixelOf(uv), 0);
@@ -735,6 +945,13 @@ fn loadDepth(uv : vec2<f32>) -> f32 {
 
 @vertex
 fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
+
+/** Volumetric fog over whatever is behind it: attenuate, then add the glow. */
+fn applyVolume(c : vec3<f32>, uv : vec2<f32>) -> vec3<f32> {
+  if (camera.volColor.a < 0.5) { return c; }
+  let v = textureSampleLevel(volTex, texSampler, uv, 0.0);
+  return c * v.a + v.rgb;
+}
 
 fn viewToUV(p : vec3<f32>) -> vec2<f32> {
   let dist = max(-p.z, 1e-5);
@@ -890,12 +1107,14 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   let viewDirWorld = normalize((camera.invView * vec4<f32>(dirView, 0.0)).xyz);
 
   if (d <= 1e-7) {
-    return vec4<f32>(sampleEnvironment(viewDirWorld, 0.0, camera.ambient.rgb) * 0.8, 1.0);
+    let sky = sampleEnvironment(viewDirWorld, 0.0, camera.ambient.rgb) * 0.8;
+    return vec4<f32>(sanitize(applyVolume(sky, in.uv)), 1.0);
   }
 
   let surf = textureSampleLevel(surfaceTex, texSampler, in.uv, 0.0);
   let albedo = textureSampleLevel(albedoTex, texSampler, in.uv, 0.0).rgb;
-  let ao = textureSampleLevel(aoTex, texSampler, in.uv, 0.0).r;
+  let aoGi = textureSampleLevel(aoTex, texSampler, in.uv, 0.0);
+  let ao = aoGi.a;
 
   let N = octDecode(surf.xy);
   let roughness = surf.z;
@@ -913,6 +1132,10 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   let ground = camera.ambient.rgb * camera.ambient.a;
   let ambient = mix(ground, camera.ambient.rgb, up) * albedo * (1.0 - metallic * 0.6) * ao;
   hdr = hdr + ambient;
+
+  // Screen-space indirect light: one bounce, tinted by this surface's albedo.
+  // Metals have no diffuse response to bounce light into.
+  hdr = hdr + aoGi.rgb * albedo * (1.0 - metallic);
 
   // Same 4x4 tile as the occlusion pass: sixteen fixed step phases rather than
   // per-pixel white noise, so what undersampling remains is a faint regular
@@ -954,6 +1177,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   let aerial = sampleEnvironment(viewDirWorld, 0.85, camera.ambient.rgb) * 0.8;
   let fogTarget = mix(camera.fog.rgb, aerial, camera.fog.a);
   hdr = mix(hdr, fogTarget, fogAmount);
+  hdr = applyVolume(hdr, in.uv);
 
   return vec4<f32>(sanitize(hdr), 1.0);
 }
@@ -997,13 +1221,17 @@ fn downsample13(uv : vec2<f32>, texel : vec2<f32>) -> vec3<f32> {
 export const BLOOM_PREFILTER_WGSL = /* wgsl */`
 ${BLOOM_COMMON}
 
-/** Soft-knee threshold: a hard cut makes bloom flicker on moving highlights. */
+/**
+ * Soft-knee threshold: a hard cut makes bloom flicker on moving highlights.
+ * The threshold is measured after exposure, so it means the same thing
+ * whether lights are in arbitrary units or in lumens with a physical camera.
+ */
 @fragment
 fn fs(in : FSOut) -> @location(0) vec4<f32> {
   let texel = 1.0 / vec2<f32>(textureDimensions(src, 0));
   let c = downsample13(in.uv, texel);
 
-  let brightness = max(c.r, max(c.g, c.b));
+  let brightness = max(c.r, max(c.g, c.b)) * camera.params.y;
   let knee = camera.bloom.y;
   let threshold = camera.bloom.x;
   var soft = brightness - threshold + knee;
@@ -1062,6 +1290,7 @@ ${COMMON}
 @group(0) @binding(1) var texSampler : sampler;
 @group(0) @binding(2) var hdrTex : texture_2d<f32>;
 @group(0) @binding(3) var bloomTex : texture_2d<f32>;
+@group(0) @binding(4) var<storage, read> exposureState : array<f32, 4>;
 
 @vertex
 fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
@@ -1073,11 +1302,84 @@ fn tonemapACES(x : vec3<f32>) -> vec3<f32> {
 
 fn luma(c : vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722)); }
 
-/** Graded pixel: HDR + bloom, tonemapped and gamma-encoded. FXAA runs on this. */
+/** Reinhard, extended: white is the input that maps to 1. */
+fn tonemapReinhard(x : vec3<f32>, white : f32) -> vec3<f32> {
+  let w2 = white * white;
+  return clamp(x * (1.0 + x / w2) / (1.0 + x), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+/** Hable's filmic curve, normalised so white maps to 1. */
+fn hable(x : vec3<f32>) -> vec3<f32> {
+  let A = 0.15; let B = 0.50; let C = 0.10; let D = 0.20; let E = 0.02; let F = 0.30;
+  return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+}
+fn tonemapFilmic(x : vec3<f32>, white : f32) -> vec3<f32> {
+  return clamp(hable(x * 2.0) / hable(vec3<f32>(white)), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+/**
+ * AgX (Troy Sobotka), minimal form: an inset into a wider working space, a
+ * log2 encode, a fitted sigmoid, and back out. Bright saturated light
+ * desaturates toward white the way film does, instead of clipping to a hue.
+ */
+fn agxContrast(x : vec3<f32>) -> vec3<f32> {
+  let x2 = x * x;
+  let x4 = x2 * x2;
+  return 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x
+       + 0.4298 * x2 + 0.1191 * x - 0.00232;
+}
+fn tonemapAgX(c : vec3<f32>) -> vec3<f32> {
+  let inset = mat3x3<f32>(
+    vec3<f32>(0.842479062253094, 0.0423282422610123, 0.0423756549057051),
+    vec3<f32>(0.0784335999999992, 0.878468636469772, 0.0784336),
+    vec3<f32>(0.0792237451477643, 0.0791661274605434, 0.879142973793104));
+  let outset = mat3x3<f32>(
+    vec3<f32>(1.19687900512017, -0.0528968517574562, -0.0529716355144438),
+    vec3<f32>(-0.0980208811401368, 1.15190312990417, -0.0980434501171241),
+    vec3<f32>(-0.0990297440797205, -0.0989611768448433, 1.15107367264116));
+  let minEv = -12.47393;
+  let maxEv = 4.026069;
+  var x = inset * max(c, vec3<f32>(1e-10));
+  x = clamp((log2(x) - minEv) / (maxEv - minEv), vec3<f32>(0.0), vec3<f32>(1.0));
+  x = agxContrast(x);
+  x = outset * x;
+  // The curve's output is display-encoded; return linear so gamma applies once.
+  return pow(max(x, vec3<f32>(0.0)), vec3<f32>(2.2));
+}
+
+fn tonemap(x : vec3<f32>) -> vec3<f32> {
+  let mode = i32(camera.tone.x + 0.5);
+  let white = max(camera.tone.y, 0.01);
+  if (mode == 0) { return clamp(x, vec3<f32>(0.0), vec3<f32>(1.0)); }
+  if (mode == 1) { return tonemapReinhard(x, white); }
+  if (mode == 2) { return tonemapFilmic(x, white); }
+  if (mode == 4) { return clamp(tonemapAgX(x), vec3<f32>(0.0), vec3<f32>(1.0)); }
+  return tonemapACES(x);
+}
+
+/** Exposure from the camera, times the auto-exposure factor when it is on. */
+fn exposure() -> f32 {
+  var e = camera.params.y;
+  if (camera.grade.y > 0.5) {
+    // Put the average scene luminance at middle grey (0.18).
+    let ev = clamp(log2(0.18) - exposureState[0], camera.expo.x, camera.expo.y);
+    e = e * exp2(ev);
+  }
+  return e;
+}
+
+/** Graded pixel: HDR + bloom, exposed, tonemapped, adjusted, gamma-encoded. FXAA runs on this. */
 fn gradeAt(uv : vec2<f32>) -> vec3<f32> {
   let hdr = sanitize(textureSampleLevel(hdrTex, texSampler, uv, 0.0).rgb);
   let bloom = sanitize(textureSampleLevel(bloomTex, texSampler, uv, 0.0).rgb);
-  return pow(tonemapACES((hdr + bloom * camera.bloom.z) * camera.params.y), vec3<f32>(1.0 / 2.2));
+  var c = tonemap((hdr + bloom * camera.bloom.z) * exposure());
+
+  // Adjustments, Godot-style: brightness, saturation, then contrast around mid grey.
+  c = c * camera.grade.x;
+  c = max(mix(vec3<f32>(luma(c)), c, camera.tone.w), vec3<f32>(0.0));
+  var g = pow(c, vec3<f32>(1.0 / 2.2));
+  g = (g - 0.5) * camera.tone.z + 0.5;
+  return clamp(g, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 @fragment

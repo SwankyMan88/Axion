@@ -1,7 +1,7 @@
 import { Arena, DynamicBuffer, retire, sweepRetired } from '../gpu/buffers.js';
 import { solidTexture } from '../gpu/textures.js';
 import {
-  STANDARD_WGSL, SHADOW_WGSL, AO_WGSL, AO_BLUR_WGSL, RESOLVE_WGSL,
+  STANDARD_WGSL, SHADOW_WGSL, AO_WGSL, AO_BLUR_WGSL, RESOLVE_WGSL, VOLUME_WGSL, EXPOSURE_WGSL,
   BLOOM_PREFILTER_WGSL, BLOOM_DOWN_WGSL, BLOOM_UP_WGSL, FINAL_WGSL, CUBE_FACES,
 } from './shaders.js';
 import { VERTEX_STRIDE_BYTES } from '../geometry/primitives.js';
@@ -13,12 +13,13 @@ import { frustumFromMatrix, sphereInFrustum } from '../core/math.js';
 
 const INSTANCE_FLOATS = 28;   // mat4(16) + color(4) + pbr(4) + surface(4)
 const LIGHT_FLOATS = 12;      // posRange(4) + colorPower(4) + shadowInfo(4)
-const CAMERA_FLOATS = 96;
+const CAMERA_FLOATS = 128;
 const MAX_LIGHTS = 256;
 const FACE_SLOT_BYTES = 256;  // uniform dynamic offsets must be 256-aligned
 
 const HDR_FORMAT = 'rgba16float';
-const AO_FORMAT = 'r16float';
+const TONEMAP_MODES = { linear: 0, reinhard: 1, filmic: 2, aces: 3, agx: 4 };
+const AO_FORMAT = 'rgba16float';   // rgb = indirect light (SSIL), a = AO
 
 /**
  * Deferred-ambient forward renderer.
@@ -83,6 +84,67 @@ export class Renderer {
       fadeDistance: options.ao?.fadeDistance ?? 55,
     };
 
+    /** Screen-space indirect light: one diffuse bounce gathered by the AO march. 0 = off. */
+    this.ssil = {
+      intensity: options.ssil?.intensity ?? 0,
+      radius: options.ssil?.radius ?? 3,
+    };
+
+    /**
+     * Volumetric fog: a height-falling medium lit by every point light, with
+     * shadowed light shafts. Half resolution. `density` is extinction per metre.
+     */
+    this.volumetric = {
+      enabled: options.volumetric?.enabled ?? false,
+      density: options.volumetric?.density ?? 0.03,
+      steps: options.volumetric?.steps ?? 24,
+      anisotropy: options.volumetric?.anisotropy ?? 0.3,
+      maxDistance: options.volumetric?.maxDistance ?? 60,
+      heightBase: options.volumetric?.heightBase ?? 0,
+      heightFalloff: options.volumetric?.heightFalloff ?? 0.15,
+      ambient: options.volumetric?.ambient ?? 1.0,
+      lightScatter: options.volumetric?.lightScatter ?? 1.0,
+      color: options.volumetric?.color ?? [1, 1, 1],
+    };
+
+    /**
+     * Tonemapping and colour adjustments. mode: 'linear' | 'reinhard' |
+     * 'filmic' | 'aces' | 'agx'. `white` is the scene value that maps to
+     * white for reinhard and filmic.
+     */
+    this.tonemap = {
+      mode: options.tonemap?.mode ?? 'aces',
+      white: options.tonemap?.white ?? 6,
+      brightness: options.tonemap?.brightness ?? 1,
+      contrast: options.tonemap?.contrast ?? 1,
+      saturation: options.tonemap?.saturation ?? 1,
+    };
+
+    /**
+     * Auto exposure: the frame's average luminance is brought to middle grey,
+     * adapting at `speed`. `exposure` (or the physical camera) still applies on
+     * top as compensation. min/max are limits in stops.
+     */
+    this.autoExposure = {
+      enabled: options.autoExposure?.enabled ?? false,
+      speed: options.autoExposure?.speed ?? 1.5,
+      min: options.autoExposure?.min ?? -6,
+      max: options.autoExposure?.max ?? 6,
+    };
+
+    /**
+     * Physical camera and light units. When enabled, light `intensity` is in
+     * lumens and exposure comes from aperture (f-stop), shutter (seconds) and
+     * ISO, exactly as a real camera meters it: EV100 = log2(N^2 / t * 100 / ISO).
+     */
+    this.physical = {
+      enabled: options.physical?.enabled ?? false,
+      aperture: options.physical?.aperture ?? 16,
+      shutter: options.physical?.shutter ?? 1 / 100,
+      iso: options.physical?.iso ?? 100,
+      compensation: options.physical?.compensation ?? 0,
+    };
+
     this.bloom = {
       threshold: options.bloom?.threshold ?? 1.0,
       knee: options.bloom?.knee ?? 0.6,
@@ -140,6 +202,8 @@ export class Renderer {
       bloomDown: device.createShaderModule({ code: BLOOM_DOWN_WGSL, label: 'axion-bloom-down' }),
       bloomUp: device.createShaderModule({ code: BLOOM_UP_WGSL, label: 'axion-bloom-up' }),
       final: device.createShaderModule({ code: FINAL_WGSL, label: 'axion-final' }),
+      volume: device.createShaderModule({ code: VOLUME_WGSL, label: 'axion-volume' }),
+      exposure: device.createShaderModule({ code: EXPOSURE_WGSL, label: 'axion-exposure' }),
     };
 
     this._buildLayouts();
@@ -230,19 +294,37 @@ export class Renderer {
     const samp = { binding: 1, visibility: FRAG, sampler: { type: 'filtering' } };
 
     this._aoLayout = d.createBindGroupLayout({
-      label: 'axion-ao', entries: [cam, samp, depthTex(2), tex(3)],
+      label: 'axion-ao', entries: [cam, samp, depthTex(2), tex(3), tex(4)],
+    });
+    this._volumeLayout = d.createBindGroupLayout({
+      label: 'axion-volume',
+      entries: [
+        cam, samp, depthTex(2),
+        { binding: 3, visibility: FRAG, buffer: { type: 'read-only-storage' } },
+        { binding: 4, visibility: FRAG, texture: { sampleType: 'depth', viewDimension: '2d-array' } },
+        { binding: 5, visibility: FRAG, sampler: { type: 'comparison' } },
+      ],
+    });
+    this._exposureLayout = d.createBindGroupLayout({
+      label: 'axion-exposure',
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      ],
     });
     this._aoBlurLayout = d.createBindGroupLayout({
       label: 'axion-ao-blur', entries: [cam, samp, tex(2), depthTex(3)],
     });
     this._resolveLayout = d.createBindGroupLayout({
-      label: 'axion-resolve', entries: [cam, samp, tex(2), tex(3), tex(4), depthTex(5), tex(6)],
+      label: 'axion-resolve', entries: [cam, samp, tex(2), tex(3), tex(4), depthTex(5), tex(6), tex(7)],
     });
     this._bloomLayout = d.createBindGroupLayout({
       label: 'axion-bloom', entries: [cam, samp, tex(2)],
     });
     this._finalLayout = d.createBindGroupLayout({
-      label: 'axion-final', entries: [cam, samp, tex(2), tex(3)],
+      label: 'axion-final',
+      entries: [cam, samp, tex(2), tex(3), { binding: 4, visibility: FRAG, buffer: { type: 'read-only-storage' } }],
     });
 
     this._sampler = d.createSampler({
@@ -311,6 +393,16 @@ export class Renderer {
 
     this._aoPipeline = this._fullscreenPipeline('axion-ao', this._aoLayout, m.ao, AO_FORMAT);
     this._aoBlurPipeline = this._fullscreenPipeline('axion-ao-blur', this._aoBlurLayout, m.aoBlur, AO_FORMAT);
+    this._volumePipeline = this._fullscreenPipeline('axion-volume', this._volumeLayout, m.volume, AO_FORMAT);
+    this._exposurePipeline = this.device.createComputePipeline({
+      label: 'axion-exposure',
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this._exposureLayout] }),
+      compute: { module: m.exposure, entryPoint: 'main' },
+    });
+    // [adapted log2 luminance, initialised flag, -, -]
+    this.exposureBuffer = this.device.createBuffer({
+      size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, label: 'axion-exposure-state',
+    });
     this._resolvePipeline = this._fullscreenPipeline('axion-resolve', this._resolveLayout, m.resolve, HDR_FORMAT);
     this._bloomPrefilterPipeline = this._fullscreenPipeline('axion-bloom-prefilter', this._bloomLayout, m.bloomPrefilter, HDR_FORMAT);
     this._bloomDownPipeline = this._fullscreenPipeline('axion-bloom-down', this._bloomLayout, m.bloomDown, HDR_FORMAT);
@@ -440,6 +532,18 @@ export class Renderer {
     return id;
   }
 
+  /**
+   * The exposure the final pass multiplies by, before auto exposure. With the
+   * physical camera on it is metered from aperture, shutter and ISO (the
+   * standard saturation-based formula, 1.2 * 2^EV100); otherwise `exposure`.
+   */
+  effectiveExposure() {
+    const p = this.physical;
+    if (!p.enabled) return this.exposure;
+    const ev100 = Math.log2((p.aperture * p.aperture) / p.shutter * 100 / p.iso);
+    return Math.pow(2, p.compensation) / (1.2 * Math.pow(2, ev100));
+  }
+
   /** Recreated only when the instance buffer was reallocated by a grow. */
   _rebuildFrameBindGroup() {
     if (this._boundInstanceBuffer === this.instances.buffer) return;
@@ -545,6 +649,8 @@ export class Renderer {
     const aoW = Math.max(1, width >> 1), aoH = Math.max(1, height >> 1);
     const ao = make(AO_FORMAT, aoW, aoH, 'axion-ao');
     const aoBlur = make(AO_FORMAT, aoW, aoH, 'axion-ao-blur');
+    const vol = make(AO_FORMAT, aoW, aoH, 'axion-volume');
+    const volBlur = make(AO_FORMAT, aoW, aoH, 'axion-volume-blur');
 
     const bloom = [];
     let bw = width >> 1, bh = height >> 1;
@@ -554,8 +660,8 @@ export class Renderer {
     }
 
     this._targets = {
-      all: [color, surface, albedo, depth, hdr, ao, aoBlur, ...bloom.map((b) => b.tex)],
-      color, surface, albedo, depth, hdr, ao, aoBlur, bloom,
+      all: [color, surface, albedo, depth, hdr, ao, aoBlur, vol, volBlur, ...bloom.map((b) => b.tex)],
+      color, surface, albedo, depth, hdr, ao, aoBlur, vol, volBlur, bloom,
       colorView: color.createView(),
       surfaceView: surface.createView(),
       albedoView: albedo.createView(),
@@ -563,6 +669,8 @@ export class Renderer {
       hdrView: hdr.createView(),
       aoView: ao.createView(),
       aoBlurView: aoBlur.createView(),
+      volView: vol.createView(),
+      volBlurView: volBlur.createView(),
       bloomViews: bloom.map((b) => b.tex.createView()),
     };
 
@@ -573,12 +681,15 @@ export class Renderer {
     });
     const camRes = { buffer: this.cameraBuffer };
 
-    this.aoBindGroup = bg(this._aoLayout, [camRes, this._sampler, t.depthView, t.surfaceView], 'axion-ao');
+    this.aoBindGroup = bg(this._aoLayout, [camRes, this._sampler, t.depthView, t.surfaceView, t.colorView], 'axion-ao');
+    this.volBlurBindGroup = bg(this._aoBlurLayout, [camRes, this._sampler, t.volView, t.depthView], 'axion-volume-blur');
+    this.exposureBindGroup = bg(this._exposureLayout, [camRes, t.hdrView, { buffer: this.exposureBuffer }], 'axion-exposure');
+    this._volumeBindGroup = null;
     this.aoBlurBindGroup = bg(this._aoBlurLayout, [camRes, this._sampler, t.aoView, t.depthView], 'axion-ao-blur');
     this.resolveBindGroup = bg(this._resolveLayout,
-      [camRes, this._sampler, t.colorView, t.surfaceView, t.albedoView, t.depthView, t.aoBlurView], 'axion-resolve');
+      [camRes, this._sampler, t.colorView, t.surfaceView, t.albedoView, t.depthView, t.aoBlurView, t.volBlurView], 'axion-resolve');
     this.finalBindGroup = bg(this._finalLayout,
-      [camRes, this._sampler, t.hdrView, t.bloomViews[0] ?? t.hdrView], 'axion-final');
+      [camRes, this._sampler, t.hdrView, t.bloomViews[0] ?? t.hdrView, { buffer: this.exposureBuffer }], 'axion-final');
 
     // One bind group per bloom level, made once here rather than every frame.
     this.bloomFromHdr = bg(this._bloomLayout, [camRes, this._sampler, t.hdrView], 'axion-bloom-src');
@@ -837,7 +948,8 @@ export class Renderer {
       this.lightData[o] = l.x; this.lightData[o + 1] = l.y; this.lightData[o + 2] = l.z;
       this.lightData[o + 3] = l.range;
       this.lightData[o + 4] = l.r; this.lightData[o + 5] = l.g; this.lightData[o + 6] = l.b;
-      this.lightData[o + 7] = l.intensity;
+      // Physical units: lumens to candela for an isotropic point light.
+      this.lightData[o + 7] = this.physical.enabled ? l.intensity / (4 * Math.PI) : l.intensity;
       this.lightData[o + 8] = shadowCasters > 0 ? l.slot : -1;
       this.lightData[o + 9] = this.shadows.near;
       this.lightData[o + 10] = this.shadows.bias;
@@ -856,7 +968,7 @@ export class Renderer {
     cd[48] = camera.position[0]; cd[49] = camera.position[1];
     cd[50] = camera.position[2]; cd[51] = time;
     cd[52] = lightList.length;
-    cd[53] = this.exposure;
+    cd[53] = this.effectiveExposure();
     cd[54] = this.fogDensity;
     cd[55] = this.fxaa ? 1 : 0;
     cd.set(this.ambient, 56); cd[59] = this.groundAmbient;
@@ -878,6 +990,19 @@ export class Renderer {
     cd[86] = this.shadows.normalBias; cd[87] = 0;
     cd[88] = this.ao.fadeDistance; cd[89] = this.ssr.fadeDistance;
     cd[90] = 0; cd[91] = 0;
+
+    const dtFrame = this._lastTime === undefined ? 0 : Math.min(Math.max(time - this._lastTime, 0), 0.25);
+    this._lastTime = time;
+    cd[92] = this.ssil.intensity; cd[93] = this.ssil.radius; cd[94] = 0; cd[95] = 0;
+    const v = this.volumetric;
+    cd[96] = v.density; cd[97] = v.steps; cd[98] = v.anisotropy; cd[99] = v.maxDistance;
+    cd[100] = v.heightBase; cd[101] = v.heightFalloff; cd[102] = v.ambient; cd[103] = v.lightScatter;
+    cd[104] = v.color[0]; cd[105] = v.color[1]; cd[106] = v.color[2]; cd[107] = v.enabled ? 1 : 0;
+    const tm = this.tonemap;
+    cd[108] = TONEMAP_MODES[tm.mode] ?? 3; cd[109] = tm.white; cd[110] = tm.contrast; cd[111] = tm.saturation;
+    const ae = this.autoExposure;
+    cd[112] = tm.brightness; cd[113] = ae.enabled ? 1 : 0; cd[114] = 0; cd[115] = 0;
+    cd[116] = ae.min; cd[117] = ae.max; cd[118] = ae.speed; cd[119] = dtFrame;
     this.device.queue.writeBuffer(this.cameraBuffer, 0, cd);
 
     if (this.frustumCulling) frustumFromMatrix(this._frustum, 0, camera.viewProj, 0);
@@ -1068,8 +1193,39 @@ export class Renderer {
     fullscreen('axion-ao', t.aoView, this._aoPipeline, this.aoBindGroup);
     fullscreen('axion-ao-blur', t.aoBlurView, this._aoBlurPipeline, this.aoBlurBindGroup);
 
+    /* ---- 3b. volumetric fog ---- */
+    let volumePasses = 0;
+    if (this.volumetric.enabled && this.volumetric.density > 0) {
+      if (!this._volumeBindGroup || this._volumeShadowView !== this._shadowArrayView) {
+        this._volumeShadowView = this._shadowArrayView;
+        this._volumeBindGroup = this.device.createBindGroup({
+          layout: this._volumeLayout, label: 'axion-volume',
+          entries: [
+            { binding: 0, resource: { buffer: this.cameraBuffer } },
+            { binding: 1, resource: this._sampler },
+            { binding: 2, resource: t.depthView },
+            { binding: 3, resource: { buffer: this.lightBuffer } },
+            { binding: 4, resource: this._shadowArrayView },
+            { binding: 5, resource: this._shadowSampler },
+          ],
+        });
+      }
+      fullscreen('axion-volume', t.volView, this._volumePipeline, this._volumeBindGroup);
+      fullscreen('axion-volume-blur', t.volBlurView, this._aoBlurPipeline, this.volBlurBindGroup);
+      volumePasses = 2;
+    }
+
     /* ---- 4. resolve ---- */
     fullscreen('axion-resolve', t.hdrView, this._resolvePipeline, this.resolveBindGroup);
+
+    /* ---- 4b. auto exposure: measure the resolved frame on the GPU ---- */
+    if (this.autoExposure.enabled) {
+      const cp = enc.beginComputePass({ label: 'axion-exposure' });
+      cp.setPipeline(this._exposurePipeline);
+      cp.setBindGroup(0, this.exposureBindGroup);
+      cp.dispatchWorkgroups(1);
+      cp.end();
+    }
 
     /* ---- 5. bloom ---- */
     if (t.bloom.length > 0 && this.bloom.strength > 0) {
@@ -1104,7 +1260,7 @@ export class Renderer {
 
     const bloomPasses = t.bloom.length > 0 && this.bloom.strength > 0
       ? t.bloom.length * 2 - 1 : 0;
-    this.stats.drawCalls = draws + shadowDraws + 3 + bloomPasses + 1;
+    this.stats.drawCalls = draws + shadowDraws + 3 + volumePasses + bloomPasses + 1;
     this.stats.batches = batches;
     this.stats.instances = visible;
     this.stats.culled = culled;
@@ -1123,6 +1279,7 @@ export class Renderer {
     this.cameraBuffer.destroy();
     this.lightBuffer.destroy();
     this.faceBuffer.destroy();
+    this.exposureBuffer.destroy();
     this._shadowTexture?.destroy();
     for (const tex of this._targets?.all ?? []) tex.destroy();
   }

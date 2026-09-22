@@ -1,6 +1,6 @@
 {
   "name": "axion",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "A WebGPU, data-oriented 3D engine.",
   "type": "module",
   "main": "src/index.js",
@@ -26,7 +26,8 @@
     "fetch:sponza": "node scripts/fetch-sponza.mjs",
     "test:sponza": "node test/gpu-validate.mjs test/sponza-check.html",
     "pack:sponza": "node scripts/pack-sponza.mjs",
-    "test:sponza-packed": "node test/gpu-validate.mjs test/sponza-packed-check.html"
+    "test:sponza-packed": "node test/gpu-validate.mjs test/sponza-packed-check.html",
+    "test:features": "node test/gpu-validate.mjs test/features-check.html"
   },
   "license": "MIT",
   "sideEffects": false,

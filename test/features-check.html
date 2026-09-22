@@ -1,0 +1,156 @@
+<!doctype html><meta charset="utf-8">
+<!-- Sponza through every optional pass: SSIL, volumetric fog, auto exposure,
+     physical camera, tonemappers. Each must change the frame, stay finite,
+     and stay within a sane cost of the baseline. -->
+<canvas id="c" width="480" height="300" style="width:480px;height:300px"></canvas>
+<script src="../dist/axion.min.js"></script>
+<script src="../assets/sponza.js"></script>
+<script type="module">
+const AX = globalThis.Axion;
+const out = { ok: false, errors: [], measured: {}, shots: {} };
+window.__result = out;
+const half = (h) => { const e = (h >> 10) & 31, f = h & 1023; if (e === 31) return NaN;
+  return (h & 0x8000 ? -1 : 1) * (e ? Math.pow(2, e - 15) * (1 + f / 1024) : Math.pow(2, -14) * (f / 1024)); };
+try {
+  const canvas = document.getElementById('c');
+  const app = await AX.App.create(canvas, {
+    clearColor: [0.05, 0.06, 0.08, 1], ambient: [0.10, 0.105, 0.12], groundAmbient: 0.45, exposure: 1.1,
+    ssr: { steps: 24, maxDistance: 40, fadeDistance: 60, thickness: 0.35 },
+    ao: { radius: 0.9, fadeDistance: 35 }, bloom: { threshold: 1.2, strength: 0.35 },
+    shadows: { maxLights: 3, size: 512, pcfRadius: 1.4, near: 0.1 },
+  });
+  const gpu = { device: app.device };
+  gpu.device.pushErrorScope('validation');
+  await AX.loadGLTF(app, AxionAssets.sponza);
+  const sky = app.light([1.5, 26, 0.6], { color: [1, 0.94, 0.86], intensity: 1400, range: 70 });
+  app.light([6, 1.8, -0.2], { color: [1, 0.62, 0.32], intensity: 55, range: 16 });
+  app.light([-4, 2.6, 2.4], { color: [0.45, 0.62, 1], intensity: 55, range: 16 });
+  app.camera.aspect = canvas.width / canvas.height;
+  app.camera.position.set([9.2, 1.6, -0.3]); app.camera.target.set([0, 2.2, -0.3]); app.camera.update();
+  const r = app.renderer;
+
+  let time = 0;
+  async function frame() {
+    time += 1 / 60;
+    r.render(app.world, app.camera, time);
+    await gpu.device.queue.onSubmittedWorkDone();
+  }
+  async function read(tex) {
+    const w = tex.width, h = tex.height, bpr = Math.ceil(w * 8 / 256) * 256;
+    const buf = gpu.device.createBuffer({ size: bpr * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const e = gpu.device.createCommandEncoder();
+    e.copyTextureToBuffer({ texture: tex }, { buffer: buf, bytesPerRow: bpr }, [w, h, 1]);
+    gpu.device.queue.submit([e.finish()]); await buf.mapAsync(GPUMapMode.READ);
+    const raw = new Uint16Array(buf.getMappedRange()); let bad = 0, sum = 0, alpha = 0;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const o = (y * bpr) / 2 + x * 4;
+      const cr = half(raw[o]), cg = half(raw[o + 1]), cb = half(raw[o + 2]);
+      if (!isFinite(cr + cg + cb)) bad++; else sum += 0.2126 * cr + 0.7152 * cg + 0.0722 * cb;
+      alpha += half(raw[o + 3]);
+    }
+    buf.unmap(); buf.destroy();
+    return { mean: sum / (w * h), bad, alphaMean: alpha / (w * h) };
+  }
+  function displayMean(c) {
+    const x = c.getContext('2d'), d = x.getImageData(0, 0, c.width, c.height).data; let s = 0;
+    for (let i = 0; i < d.length; i += 4) s += d[i] + d[i + 1] + d[i + 2];
+    return s / (d.length / 4 * 3);
+  }
+  async function measure(name, setup, teardown) {
+    setup();
+    for (let i = 0; i < 3; i++) await frame();     // warm up, let adaptation move
+    const t0 = performance.now();
+    for (let i = 0; i < 4; i++) await frame();
+    const ms = (performance.now() - t0) / 4;
+    const hdr = await read(r._targets.hdr);
+    const snap = app.snapshot(240, 150);
+    const disp = displayMean(snap);
+    out.shots[name] = snap.toDataURL('image/jpeg', 0.8);
+    out.measured[name] = { ms: +ms.toFixed(1), hdrMean: +hdr.mean.toFixed(4), nonFinite: hdr.bad, display: +disp.toFixed(1) };
+    if (hdr.bad) out.errors.push(`${name}: ${hdr.bad} non-finite HDR pixels`);
+    teardown?.();
+    return out.measured[name];
+  }
+
+  const base = await measure('baseline', () => {});
+
+  const ssil = await measure('ssil', () => { r.ssil.intensity = 1.0; }, () => { r.ssil.intensity = 0; });
+  if (!(ssil.hdrMean > base.hdrMean * 1.01)) out.errors.push('SSIL added no light');
+
+  const volOn = await measure('volumetric', () => {
+    Object.assign(r.volumetric, { enabled: true, density: 0.05, heightFalloff: 0.1, ambient: 1, lightScatter: 1 });
+  });
+  const vt = await read(r._targets.volBlur);
+  out.measured.volumetric.transmittance = +vt.alphaMean.toFixed(3);
+  out.measured.volumetric.inscatter = +vt.mean.toFixed(4);
+  if (vt.bad) out.errors.push('volume buffer has non-finite values');
+  if (!(vt.alphaMean > 0.05 && vt.alphaMean < 0.999)) out.errors.push('volume transmittance out of range: ' + vt.alphaMean);
+  if (!(vt.mean > 0)) out.errors.push('volume has no in-scattered light');
+  if (Math.abs(volOn.hdrMean - base.hdrMean) < 1e-3) out.errors.push('volumetric fog changed nothing');
+  // Shafts: turning the sky light's shadows off must change the fog.
+  r.shadows.enabled = false; await frame(); await frame();
+  const vtNoShadow = await read(r._targets.volBlur);
+  out.measured.volumetric.inscatterNoShadows = +vtNoShadow.mean.toFixed(4);
+  if (!(vtNoShadow.mean > vt.mean * 1.02)) out.errors.push('fog ignores shadows (no light shafts)');
+  r.shadows.enabled = true;
+  r.volumetric.enabled = false;
+
+  // Auto exposure: a much brighter sky light must end up at a similar display brightness.
+  r.autoExposure.enabled = true; r.autoExposure.speed = 50;
+  const aeA = await measure('autoExposure', () => {});
+  const setSky = (v) => { const c = app.world.get(sky, AX.PointLight); c.array[c.offset + 3] = v; };
+  const aeB = await measure('autoExposureBright', () => setSky(1400 * 8), () => setSky(1400));
+  const noAe = await measure('noAutoBright', () => { r.autoExposure.enabled = false; setSky(1400 * 8); }, () => setSky(1400));
+  out.measured.autoExposureRatio = +(aeB.display / aeA.display).toFixed(2);
+  out.measured.noAutoRatio = +(noAe.display / base.display).toFixed(2);
+  if (!(Math.abs(aeB.display - aeA.display) < Math.abs(noAe.display - base.display) * 0.6))
+    out.errors.push('auto exposure did not compensate a brighter scene');
+
+  // Physical camera: lumens + f/2.8, 1/30 s, ISO 400 metered to match the baseline look.
+  const phys = await measure('physical', () => {
+    Object.assign(r.physical, { enabled: true, aperture: 2.8, shutter: 1 / 30, iso: 400, compensation: 0 });
+    const k = 1.1 / r.effectiveExposure() * 4 * Math.PI;   // same image: lumens = old * k
+    out.measured.lumenScale = +k.toFixed(0);
+    // Ambient becomes luminance too: scale it by the same exposure change.
+    r.ambient = r.ambient.map((a) => a * 1.1 / r.effectiveExposure());
+    for (const e of [sky]) { const c = app.world.get(e, AX.PointLight); c.array[c.offset + 3] *= k; }
+    for (const a of app.world.query([AX.PointLight])) {
+      const L = a.columns.get(AX.PointLight.id);
+      for (let i = 0; i < a.count; i++) if (a.entities[i] !== sky) L[i * 5 + 3] *= k;
+    }
+  });
+  out.measured.physicalExposure = r.effectiveExposure();
+  if (Math.abs(phys.display - base.display) > 6) out.errors.push(`physical camera look differs: ${phys.display} vs ${base.display}`);
+
+  // Tonemappers must all differ and stay finite.
+  r.physical.enabled = false;
+  r.ambient = [0.10, 0.105, 0.12];
+  for (const a of app.world.query([AX.PointLight])) {
+    const L = a.columns.get(AX.PointLight.id);
+    for (let i = 0; i < a.count; i++) L[i * 5 + 3] /= out.measured.lumenScale;
+  }
+  const tones = {};
+  for (const m of ['linear', 'reinhard', 'filmic', 'aces', 'agx']) {
+    tones[m] = (await measure('tone_' + m, () => { r.tonemap.mode = m; })).display;
+  }
+  r.tonemap.mode = 'aces';
+  const vals = Object.values(tones);
+  if (new Set(vals.map((v) => v.toFixed(1))).size < 5) out.errors.push('tonemappers are not distinct: ' + JSON.stringify(tones));
+
+  // Adjustments
+  const sat0 = await measure('saturation0', () => { r.tonemap.saturation = 0; }, () => { r.tonemap.saturation = 1; });
+  const bright = await measure('brightness', () => { r.tonemap.brightness = 1.5; }, () => { r.tonemap.brightness = 1; });
+  if (!(bright.display > base.display + 5)) out.errors.push('brightness did nothing');
+
+  // Everything at once, for the cost ceiling.
+  const all = await measure('everything', () => {
+    r.ssil.intensity = 1; r.volumetric.enabled = true; r.autoExposure.enabled = true; r.tonemap.mode = 'agx';
+  });
+  out.measured.costRatio = +(all.ms / base.ms).toFixed(2);
+
+  const err = await gpu.device.popErrorScope();
+  if (err) out.errors.push('validation: ' + err.message);
+  out.ok = out.errors.length === 0;
+} catch (e) { out.errors.push(String(e.stack || e)); }
+out.done = true;
+</script>

@@ -292,6 +292,38 @@ with 512px textures and the unused tangents stripped (10.8 MB). Neither is
 committed. `npm run test:sponza` loads it through the public loader and
 renders it headlessly.
 
+## Lighting and camera features
+
+All off-by-default features are plain fields on `app.renderer`, live-editable:
+
+```js
+const r = app.renderer;
+r.ssil.intensity = 1;  r.ssil.radius = 3;          // screen-space indirect light (1 bounce)
+r.volumetric.enabled = true;                          // volumetric fog with shadowed light shafts
+Object.assign(r.volumetric, { density: 0.015, heightFalloff: 0.1, anisotropy: 0.3, steps: 24 });
+r.autoExposure.enabled = true;                        // GPU-metered, eases to middle grey
+r.tonemap.mode = 'agx';                               // 'linear' | 'reinhard' | 'filmic' | 'aces' | 'agx'
+Object.assign(r.tonemap, { white: 6, brightness: 1, contrast: 1, saturation: 1 });
+// Physical units: light intensity in lumens, exposure from a real camera.
+Object.assign(r.physical, { enabled: true, aperture: 2.8, shutter: 1 / 30, iso: 400, compensation: 0 });
+```
+
+- **SSIL** reuses the AO march's slice directions with its own radius and adds one
+  diffuse bounce of the direct light, tinted by the receiving surface. Half res.
+- **Volumetric fog** marches each view ray through a height-falling medium,
+  Henyey-Greenstein phase, one shadow-map tap per light per step (so light
+  shafts follow the shadows), energy-conserving integration. Half res, 4x4
+  interleaved start offsets, depth-aware blur.
+- **Auto exposure** is a single compute workgroup that measures the resolved
+  frame; the result never leaves the GPU.
+- **Physical camera:** EV100 = log2(N² / t · 100 / ISO), exposure = 1 / (1.2 · 2^EV100).
+  Ambient is then luminance (nits). Bloom's threshold is measured after exposure,
+  so it means the same in either unit system.
+
+`npm run test:features` renders Sponza through each of these and checks that
+each one changes the frame, stays finite, and (for the physical camera) that
+matching settings reproduce the non-physical image.
+
 ## Packed models (one script, no fetch)
 
 `assets/sponza.js` is the whole Sponza scene — quantized geometry
@@ -395,6 +427,13 @@ Requires WebGPU: Chrome/Edge 113+, Safari 18+, or Firefox with
 
 ## Not built yet
 
+Real-time global illumination beyond SSIL (Godot's SDFGI or VoxelGI): both
+need a 3D distance-field or voxel representation of the scene rebuilt in
+compute as the camera moves — a subsystem on the scale of the whole renderer.
+SSIL covers the near-field bounce you can see; off-screen and multi-bounce
+light is what those add. Depth of field, sky/atmosphere, and reflection
+probes are the other big gaps against Godot.
+
 Honest list, in the order they'd matter: a directional sun with cascaded
 shadows (Sponza is lit here by a distant point light standing in for one); temporal anti-aliasing and reprojection
 — it would denoise SSR and AO together and replace FXAA, and it is now the
@@ -402,8 +441,7 @@ single biggest quality win left; GPU-driven culling in a compute pass with
 `drawIndexedIndirect`; clustered light assignment (the fragment loop is still
 over all lights in range); cascaded shadow maps for a directional sun, since
 only point lights cast today; a mip chain on the scene color so rough
-reflections blur instead of staying sharp; glTF loading; textures and a
-sampler/bind-group cache; skinned meshes; a transform hierarchy (transforms are
+reflections blur instead of staying sharp; skinned meshes; a transform hierarchy (transforms are
 flat today); transparency sorting; a worker-parallel system scheduler.
 
 **Known issue: specular highlights on very smooth surfaces are too dim.** The

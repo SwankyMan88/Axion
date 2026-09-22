@@ -13,7 +13,8 @@ try {
                               ['resolve', AX.RESOLVE_WGSL],
                               ['bloomPrefilter', AX.BLOOM_PREFILTER_WGSL],
                               ['bloomDown', AX.BLOOM_DOWN_WGSL], ['bloomUp', AX.BLOOM_UP_WGSL],
-                              ['final', AX.FINAL_WGSL]]) {
+                              ['final', AX.FINAL_WGSL], ['volume', AX.VOLUME_WGSL],
+                              ['exposure', AX.EXPOSURE_WGSL]]) {
     const mod = gpu.device.createShaderModule({ code });
     const info = await mod.getCompilationInfo();
     const bad = info.messages.filter((m) => m.type === 'error');
@@ -85,7 +86,9 @@ try {
     return sign * Math.pow(2, exp - 15) * (1 + frac / 1024);
   };
 
-  async function readMean(texture, channels) {
+  async function readMean(texture, ch) {
+    // ch = -4: read the alpha channel of an rgba16f target
+    const channels = Math.abs(ch);
     const w = texture.width, h = texture.height;
     const bpp = channels * 2;                       // f16 per channel
     const bytesPerRow = Math.ceil((w * bpp) / 256) * 256;
@@ -103,7 +106,7 @@ try {
       const row = (y * bytesPerRow) / 2;
       for (let x = 0; x < w; x++) {
         const o = row + x * channels;
-        const v = channels === 1 ? half(view[o])
+        const v = ch === -4 ? half(view[o + 3]) : channels === 1 ? half(view[o]) : channels === -4 ? half(view[o + 3])
           : 0.2126 * half(view[o]) + 0.7152 * half(view[o + 1]) + 0.0722 * half(view[o + 2]);
         sum += v; if (v < min) min = v;
         n++;
@@ -121,12 +124,12 @@ try {
   app.renderer.bloom.strength = 0;
   app.renderer.ao.intensity = 0;
   await frame();
-  const aoOff = await readMean(app.renderer._targets.aoBlur, 1);
+  const aoOff = await readMean(app.renderer._targets.aoBlur, -4);
   const hdrNoAO = (await readMean(app.renderer._targets.hdr, 4)).mean;
 
   app.renderer.ao.intensity = 3; app.renderer.ao.radius = 3;
   await frame();
-  const aoOn = await readMean(app.renderer._targets.aoBlur, 1);
+  const aoOn = await readMean(app.renderer._targets.aoBlur, -4);
   const hdrWithAO = (await readMean(app.renderer._targets.hdr, 4)).mean;
   app.renderer.ao.intensity = 1; app.renderer.ao.radius = 1.6;
 

@@ -38,7 +38,7 @@
     <canvas id="gpu"></canvas>
     <div id="msg"></div>
 
-    <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.4.3/dist/axion.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.5.0/dist/axion.min.js"></script>
     <script>
       (async function () {
         var canvas = document.getElementById('gpu');
@@ -64,8 +64,7 @@
             ambient: [0.05, 0.062, 0.088],
             fogDensity: 0.0075,
             shadows: { maxLights: 3, size: 512 },
-            bloom: { threshold: 1.1, strength: 0.45 },
-            controls: { distance: 16, autoRotate: 0.08 }
+            bloom: { threshold: 1.1, strength: 0.45 }
           });
         } catch (err) {
           return fail('WebGPU is present but the device could not start: ' + err.message);
@@ -98,6 +97,16 @@
           app.add({ mesh: bulb, material: emitter, position: p, scale: 0.3,
                     color: c, emissive: 9 });
         }
+
+        // Camera: a slow orbit written right here. Axion reads no input and
+        // never moves the camera on its own; that is the page's job.
+        var angle = 0.8;
+        app.onFrame(function (dt) {
+          angle += dt * 0.08;
+          app.camera.position.set([Math.cos(angle) * 16, 5, Math.sin(angle) * 16]);
+          app.camera.target.set([0, 0, 0]);
+          app.camera.update();
+        });
 
         app.start();
       })();

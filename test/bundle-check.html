@@ -14,12 +14,14 @@
     if (typeof Axion !== 'object') throw new Error('global Axion not defined');
     out.steps.push(`global Axion, version ${Axion.VERSION}`);
 
-    const expected = ['App', 'World', 'Renderer', 'Camera', 'OrbitControls',
-                      'FlyControls', 'defineComponent', 'roundedBox', 'icosphere',
+    const expected = ['App', 'World', 'Renderer', 'Camera', 'defineComponent', 'roundedBox', 'icosphere',
                       'plane', 'Transform', 'PointLight', 'math'];
     const missing = expected.filter((k) => !(k in Axion));
     if (missing.length) throw new Error('missing exports: ' + missing.join(', '));
     out.steps.push(`${Object.keys(Axion).length} exports present`);
+    // The engine is render-only: no input handling may ship in it.
+    const leaked = ['OrbitControls', 'FlyControls'].filter((k) => k in Axion);
+    if (leaked.length) throw new Error('input code in the engine: ' + leaked.join(', '));
 
     const canvas = document.getElementById('c');
     const app = await Axion.App.create(canvas, {

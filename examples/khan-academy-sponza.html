@@ -1,67 +1,230 @@
 <!DOCTYPE html>
-<!--
-  Sponza in Axion, for a Khan Academy "Webpage" program. ES5, fullscreen.
-  Controls: WASD move, drag (or click for pointer lock) to look,
-  Space / Shift up and down, Ctrl faster.
-  The model is ~16 MB, so the first load takes a few seconds.
--->
 <html>
 <head>
-  <meta charset="utf-8">
-  <style>
-    html, body { margin: 0; height: 100%; overflow: hidden; background: #070a0f; }
-    canvas { display: block; width: 100%; height: 100%; }
-    #msg { position: fixed; left: 10px; top: 8px; color: #cfd8e3; font: 13px sans-serif; text-shadow: 0 1px 2px #000; }
-  </style>
+    <meta charset="utf-8">
+    <title>Sponza Axion test</title>
+    <style>
+        html, body { margin: 0; height: 100%; overflow: hidden; background: #070a0f; font: 12px sans-serif; }
+        canvas { display: block; width: 100%; height: 100%; }
+        #msg { position: fixed; left: 50px; top: 12px; color: #cfd8e3; font-size: 13px; text-shadow: 0 1px 2px #000; pointer-events: none; }
+
+        /* Settings tab + sliding panel */
+        #tab {
+            position: fixed; left: 10px; top: 8px; width: 30px; height: 26px; z-index: 3;
+            border: 1px solid rgba(255,255,255,0.18); border-radius: 6px; cursor: pointer;
+            background: rgba(14,18,26,0.85); color: #cfd8e3; font-size: 16px; line-height: 24px; padding: 0;
+        }
+        #tab:hover { background: rgba(40,50,68,0.95); }
+        #panel {
+            position: fixed; left: 0; top: 0; bottom: 0; width: 250px; z-index: 2;
+            padding: 44px 14px 14px; box-sizing: border-box; overflow-y: auto;
+            background: rgba(10,13,19,0.92); color: #cfd8e3; border-right: 1px solid rgba(255,255,255,0.1);
+            transform: translateX(-100%); transition: transform 0.25s ease;
+        }
+        #panel.open { transform: translateX(0); }
+        #panel h3 { margin: 14px 0 6px; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #7f8ea3; }
+        .row { margin: 7px 0; }
+        .row label { display: flex; justify-content: space-between; margin-bottom: 2px; }
+        .row label span { color: #8fb3ff; }
+        .row input[type=range] { width: 100%; margin: 0; }
+        .check { display: flex; align-items: center; gap: 6px; margin: 7px 0; cursor: pointer; }
+        #reset { margin-top: 12px; width: 100%; padding: 6px; border-radius: 5px; cursor: pointer;
+                 border: 1px solid rgba(255,255,255,0.18); background: #1a2230; color: #cfd8e3; }
+    </style>
 </head>
 <body>
-  <canvas id="c"></canvas>
-  <div id="msg">loading…</div>
-  <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.4.3/dist/axion.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.4.3/assets/sponza.js"></script>
-  <script>
-    var msg = document.getElementById("msg");
+    <canvas id="c"></canvas>
+    <div id="msg">loading…</div>
+    <button id="tab" title="Visual settings">&#9776;</button>
+    <div id="panel"></div>
 
-    if (!navigator.gpu) {
-      msg.textContent = "This browser doesn't support WebGPU.";
-    } else if (!window.Axion || !window.AxionAssets || !AxionAssets.sponza) {
-      msg.textContent = "Couldn't load the engine or the model from jsDelivr.";
-    } else {
-      Axion.App.create(document.getElementById("c"), {
-        clearColor: [0.05, 0.06, 0.08, 1],
-        ambient: [0.10, 0.105, 0.12],
-        groundAmbient: 0.45,
-        exposure: 1.1,
-        ssr: { steps: 24, maxDistance: 40, fadeDistance: 60, thickness: 0.35 },
-        ao: { radius: 0.9, fadeDistance: 35 },
-        bloom: { threshold: 1.2, strength: 0.35 },
-        shadows: { maxLights: 3, size: 1024, pcfRadius: 1.4, near: 0.1 }
-      }).then(function (app) {
-        msg.textContent = "decoding Sponza…";
-        return Axion.loadGLTF(app, AxionAssets.sponza, {
-          onProgress: function (stage, done, total) {
-            msg.textContent = stage === "textures" ? "textures " + done + " / " + total : stage + "…";
-          }
-        }).then(function () {
-          // Sky light through the open roof, plus two warm and cool fills.
-          app.light([1.5, 26, 0.6], { color: [1, 0.94, 0.86], intensity: 1400, range: 70 });
-          app.light([6, 1.8, -0.2], { color: [1, 0.62, 0.32], intensity: 55, range: 16 });
-          app.light([-4, 2.6, 2.4], { color: [0.45, 0.62, 1], intensity: 55, range: 16 });
+    <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.5.0/dist/axion.min.js"></script><!-- My 3D engine Axion -->
+    <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.5.0/assets/sponza.js"></script><!-- The Sponza test in JS form -->
 
-          // Fly camera, starting at the east end looking down the nave.
-          app.setCameraMode("fly");
-          app.fly.position.set([10.5, 1.7, -0.3]);
-          app.fly.yaw = Math.PI / 2;
-          app.fly.pitch = 0.02;
-          app.fly.speed = 4;
+    <script>
+        var msg = document.getElementById("msg");
 
-          msg.textContent = "WASD to move, drag to look";
-          app.start();
+        /* ---------- settings panel ---------- */
+        // Each setting: label, min, max, step, get(app), set(app, value).
+        function buildPanel(app, sky) {
+            var panel = document.getElementById("panel");
+            var r = app.renderer;
+            var defaults = [];
+
+            function heading(text) {
+                var h = document.createElement("h3");
+                h.textContent = text;
+                panel.appendChild(h);
+            }
+
+            function slider(label, min, max, step, get, set) {
+                var row = document.createElement("div");
+                row.className = "row";
+                var lab = document.createElement("label");
+                var val = document.createElement("span");
+                lab.textContent = label;
+                lab.appendChild(val);
+                var input = document.createElement("input");
+                input.type = "range"; input.min = min; input.max = max; input.step = step;
+                input.value = get();
+                function show() { val.textContent = (+input.value).toFixed(step < 1 ? 2 : 0); }
+                input.oninput = function () { set(+input.value); show(); };
+                show();
+                row.appendChild(lab); row.appendChild(input);
+                panel.appendChild(row);
+                var start = get();
+                defaults.push(function () { input.value = start; set(start); show(); });
+            }
+
+            function toggle(label, get, set) {
+                var lab = document.createElement("label");
+                lab.className = "check";
+                var box = document.createElement("input");
+                box.type = "checkbox"; box.checked = get();
+                box.onchange = function () { set(box.checked); };
+                lab.appendChild(box);
+                lab.appendChild(document.createTextNode(label));
+                panel.appendChild(lab);
+                var start = get();
+                defaults.push(function () { box.checked = start; set(start); });
+            }
+
+            heading("Image");
+            slider("Exposure", 0.2, 3, 0.05, function () { return r.exposure; }, function (v) { r.exposure = v; });
+            slider("Resolution scale", 0.5, 2, 0.25, function () { return app.maxDpr; }, function (v) { app.maxDpr = v; });
+            toggle("Anti-aliasing (FXAA)", function () { return r.fxaa; }, function (v) { r.fxaa = v; });
+
+            heading("Lighting");
+            slider("Sky light", 0, 3000, 50, function () { return sky.get(); }, function (v) { sky.set(v); });
+            slider("Ambient", 0, 3, 0.05, function () { return 1; }, (function () {
+                var base = r.ambient.slice();
+                return function (v) { r.ambient = [base[0] * v, base[1] * v, base[2] * v]; };
+            })());
+            toggle("Shadows", function () { return r.shadows.enabled; }, function (v) { r.shadows.enabled = v; });
+            slider("Shadow softness", 0.5, 4, 0.1, function () { return r.shadows.pcfRadius; }, function (v) { r.shadows.pcfRadius = v; });
+            slider("Shadow resolution", 256, 2048, 256, function () { return r.shadows.size; }, function (v) { r.shadows.size = v; });
+
+            heading("Effects");
+            slider("Reflections", 0, 1, 0.05, function () { return r.ssr.intensity; }, function (v) { r.ssr.intensity = v; });
+            slider("Ambient occlusion", 0, 2, 0.05, function () { return r.ao.intensity; }, function (v) { r.ao.intensity = v; });
+            slider("AO radius", 0.1, 3, 0.05, function () { return r.ao.radius; }, function (v) { r.ao.radius = v; });
+            slider("Bloom", 0, 1.5, 0.05, function () { return r.bloom.strength; }, function (v) { r.bloom.strength = v; });
+            slider("Bloom threshold", 0, 4, 0.05, function () { return r.bloom.threshold; }, function (v) { r.bloom.threshold = v; });
+            slider("Distance haze", 0, 1, 0.05, function () { return r.aerialPerspective; }, function (v) { r.aerialPerspective = v; });
+
+            heading("Camera");
+            slider("Fly speed", 1, 15, 0.5, function () { return cam.speed; }, function (v) { cam.speed = v; });
+
+            var reset = document.createElement("button");
+            reset.id = "reset";
+            reset.textContent = "Reset to defaults";
+            reset.onclick = function () { for (var i = 0; i < defaults.length; i++) { defaults[i](); } };
+            panel.appendChild(reset);
+
+            // Keep WASD from moving the camera while you're dragging a slider.
+            panel.addEventListener("keydown", function (e) { e.stopPropagation(); });
+            panel.addEventListener("mousedown", function (e) { e.stopPropagation(); });
+        }
+
+        document.getElementById("tab").onclick = function () {
+            document.getElementById("panel").classList.toggle("open");
+        };
+
+        /* ---------- fly camera (yours, not the engine's) ---------- */
+        // WASD move, drag to look, Space / Shift up and down, Ctrl faster.
+        var cam = { x: 10.5, y: 1.7, z: -0.3, yaw: Math.PI / 2, pitch: 0.02, speed: 4,
+                    vx: 0, vy: 0, vz: 0, keys: {}, dragging: false };
+
+        window.addEventListener("keydown", function (e) {
+            cam.keys[e.code] = true;
+            if (e.code === "Space") { e.preventDefault(); }
         });
-      }).catch(function (e) {
-        msg.textContent = "Error: " + (e.message || e);
-      });
-    }
-  </script>
+        window.addEventListener("keyup", function (e) { cam.keys[e.code] = false; });
+        window.addEventListener("blur", function () { cam.keys = {}; });
+
+        var canvasEl = document.getElementById("c");
+        canvasEl.addEventListener("mousedown", function (e) { if (e.button === 0) { cam.dragging = true; } });
+        window.addEventListener("mouseup", function () { cam.dragging = false; });
+        window.addEventListener("mousemove", function (e) {
+            if (!cam.dragging) { return; }
+            cam.yaw -= e.movementX * 0.0035;
+            cam.pitch -= e.movementY * 0.0035;
+            if (cam.pitch > 1.55) { cam.pitch = 1.55; }
+            if (cam.pitch < -1.55) { cam.pitch = -1.55; }
+        });
+
+        function updateCamera(app, dt) {
+            var cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+            var cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+            var fx = -sy * cp, fy = sp, fz = -cy * cp;   // forward
+            var rx = cy, rz = -sy;                       // right
+            var k = cam.keys, mx = 0, my = 0, mz = 0;
+
+            if (k.KeyW) { mx += fx; my += fy; mz += fz; }
+            if (k.KeyS) { mx -= fx; my -= fy; mz -= fz; }
+            if (k.KeyD) { mx += rx; mz += rz; }
+            if (k.KeyA) { mx -= rx; mz -= rz; }
+            if (k.Space) { my += 1; }
+            if (k.ShiftLeft || k.ShiftRight) { my -= 1; }
+
+            var len = Math.sqrt(mx * mx + my * my + mz * mz);
+            var speed = cam.speed * (k.ControlLeft ? 3 : 1);
+            if (len > 0) { mx = mx / len * speed; my = my / len * speed; mz = mz / len * speed; }
+
+            // Ease toward the target velocity so starts and stops are smooth.
+            var ease = 1 - Math.exp(-14 * dt);
+            cam.vx += (mx - cam.vx) * ease;
+            cam.vy += (my - cam.vy) * ease;
+            cam.vz += (mz - cam.vz) * ease;
+            cam.x += cam.vx * dt; cam.y += cam.vy * dt; cam.z += cam.vz * dt;
+
+            app.camera.position.set([cam.x, cam.y, cam.z]);
+            app.camera.target.set([cam.x + fx, cam.y + fy, cam.z + fz]);
+            app.camera.update();
+        }
+
+        /* ---------- scene ---------- */
+        if (!navigator.gpu) {
+            msg.textContent = "This browser doesn't support WebGPU.";
+        } else if (!window.Axion || !window.AxionAssets || !AxionAssets.sponza) {
+            msg.textContent = "Couldn't load the engine or the model from jsDelivr.";
+        } else {
+            Axion.App.create(document.getElementById("c"), {
+                clearColor: [0.05, 0.06, 0.08, 1],
+                ambient: [0.10, 0.105, 0.12],
+                groundAmbient: 0.45,
+                exposure: 1.1,
+                ssr: { steps: 24, maxDistance: 40, fadeDistance: 60, thickness: 0.35 },
+                ao: { radius: 0.9, fadeDistance: 35 },
+                bloom: { threshold: 1.2, strength: 0.35 },
+                shadows: { maxLights: 3, size: 1024, pcfRadius: 1.4, near: 0.1 }
+            }).then(function (app) {
+                msg.textContent = "decoding Sponza…";
+                return Axion.loadGLTF(app, AxionAssets.sponza, {
+                    onProgress: function (stage, done, total) {
+                        msg.textContent = stage === "textures" ? "textures " + done + " / " + total : stage + "…";
+                    }
+                }).then(function () {
+                    var skyEntity = app.light([1.5, 26, 0.6], { color: [1, 0.94, 0.86], intensity: 1400, range: 70 });
+                    app.light([6, 1.8, -0.2], { color: [1, 0.62, 0.32], intensity: 55, range: 16 });
+                    app.light([-4, 2.6, 2.4], { color: [0.45, 0.62, 1], intensity: 55, range: 16 });
+
+                    // A light's intensity lives in its PointLight component: [r, g, b, intensity, range].
+                    var sky = {
+                        get: function () { var c = app.world.get(skyEntity, Axion.PointLight); return c.array[c.offset + 3]; },
+                        set: function (v) { var c = app.world.get(skyEntity, Axion.PointLight); c.array[c.offset + 3] = v; }
+                    };
+
+                    app.onFrame(function (dt) { updateCamera(app, dt); });
+
+                    buildPanel(app, sky);
+                    msg.textContent = "WASD to move, drag to look";
+                    app.start();
+                });
+            }).catch(function (e) {
+                msg.textContent = "Error: " + (e.message || e);
+            });
+        }
+    </script>
 </body>
 </html>

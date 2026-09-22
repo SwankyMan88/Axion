@@ -1,6 +1,6 @@
 import { createDevice, resizeCanvas } from './gpu/device.js';
 import { Renderer } from './render/renderer.js';
-import { Camera, OrbitControls, FlyControls } from './render/camera.js';
+import { Camera } from './render/camera.js';
 import { World } from './core/ecs.js';
 import {
   Bounds, Dynamic, Hidden, InstanceColor, LocalToWorld, MeshRef, Motion,
@@ -47,11 +47,11 @@ export class App {
     this.renderer = new Renderer({ ...gpu, canvas }, options);
     this.world = new World({ initialCapacity: options.initialCapacity ?? 4096 });
     this.camera = new Camera({ fov: options.fov ?? 60, near: options.near ?? 0.1 });
-    this.controls = options.controls === false
-      ? null : new OrbitControls(this.camera, canvas, options.controls ?? {});
-    this.fly = options.controls === false
-      ? null : new FlyControls(this.camera, canvas, options.fly ?? {});
-    this.cameraMode = 'orbit';
+    // A view that shows something at the origin. Axion reads no input: the
+    // page moves the camera (camera.position / camera.target, then update()).
+    this.camera.position.set(options.cameraPosition ?? [0, 2, 8]);
+    this.camera.target.set(options.cameraTarget ?? [0, 0, 0]);
+    this.camera.update();
 
     this.time = 0;
     this.frame = 0;
@@ -244,8 +244,6 @@ export class App {
       this.frame++;
 
       this._resize();
-      if (this.cameraMode === 'fly') this.fly?.update(dt);
-      else this.controls?.update(dt);
 
       if (this.fixedStep > 0) {
         this._accumulator += dt;
@@ -266,18 +264,6 @@ export class App {
       this._raf = requestAnimationFrame(tick);
     };
     this._raf = requestAnimationFrame(tick);
-    return this;
-  }
-
-  /**
-   * Switch between orbit and free-fly. The incoming controller adopts the
-   * camera's current placement, so the view never jumps on a toggle.
-   */
-  setCameraMode(mode) {
-    if (mode === this.cameraMode) return this;
-    this.cameraMode = mode;
-    if (mode === 'fly') this.fly?.syncFromCamera().setEnabled(true);
-    else this.fly?.setEnabled(false);
     return this;
   }
 
@@ -322,8 +308,6 @@ export class App {
     liveApps().delete(this);
     removeEventListener('pagehide', this._onPageHide);
     removeEventListener('beforeunload', this._onPageHide);
-    this.controls?.dispose();
-    this.fly?.dispose();
     try { this.renderer.destroy(); } catch { /* already lost */ }
     try { this.renderer.context?.unconfigure?.(); } catch { /* ignore */ }
     // Destroying the device frees every buffer and texture at once, even ones

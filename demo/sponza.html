@@ -293,13 +293,15 @@
 
 <script type="module">
 import * as AX from './src/index.js';
+// Input lives in the page, not the engine: see controls.js.
+import { FlyControls } from './controls.js';
 
 const el = (id) => document.getElementById(id);
 const canvas = el('gpu');
 const fmt = new Intl.NumberFormat('en-US');
 el('ver').textContent = `v${AX.VERSION}`;
 
-let app = null, trap = null;
+let app = null, trap = null, fly = null;
 
 /* Full-resolution originals if they have been fetched locally
    (npm run fetch:sponza), otherwise the packed build shipped with the page. */
@@ -449,7 +451,6 @@ async function boot() {
       ao: { intensity: 1.0, radius: 0.9, power: 1.4, fadeDistance: 35 },
       bloom: { threshold: 1.2, knee: 0.6, strength: 0.35 },
       shadows: { maxLights: 4, size: 1024, pcfRadius: 1.4, near: 0.1 },
-      fly: { speed: 4, position: [10.5, 1.7, -0.3] },
       canvasUsage: GPUTextureUsage.COPY_SRC,
     });
   } catch (err) {
@@ -486,12 +487,9 @@ async function boot() {
   app.world.addSystem(torchSystem, { order: 5, name: 'torches' });
 
   // Fly mode from the start, looking down the nave.
-  app.setCameraMode('fly');
-  // setCameraMode adopts wherever the camera already is — at boot, the origin —
-  // so place the flyer after switching, not before.
-  app.fly.position.set([10.5, 1.7, -0.3]);
-  app.fly.yaw = Math.PI / 2;      // facing -x, down the nave
-  app.fly.pitch = 0.02;
+  fly = new FlyControls(app.camera, canvas,
+    { speed: 4, position: [10.5, 1.7, -0.3], yaw: Math.PI / 2, pitch: 0.02 });   // facing -x, down the nave
+  fly.setEnabled(true);
   document.body.classList.add('flying');
   document.addEventListener('pointerlockchange', () => {
     document.body.classList.toggle('locked', document.pointerLockElement === canvas);
@@ -501,7 +499,8 @@ async function boot() {
   app.onAfterRender(() => trap.capture());
 
   let fpsAccum = 0, fpsFrames = 0, fps = 0, last = performance.now();
-  app.onFrame(() => {
+  app.onFrame((dt) => {
+    fly.update(dt);
     const now = performance.now(), frameMs = now - last;
     last = now;
     history[historyHead] = frameMs; historyHead = (historyHead + 1) % history.length;
@@ -536,7 +535,7 @@ async function boot() {
   slider('aoi', (v) => v.toFixed(2), (v) => { app.renderer.ao.intensity = v; });
   slider('bloom', (v) => v.toFixed(2), (v) => { app.renderer.bloom.strength = v; });
   slider('softness', (v) => v.toFixed(1), (v) => { app.renderer.shadows.pcfRadius = v; });
-  slider('flyspeed', (v) => `${v.toFixed(1)} m/s`, (v) => { app.fly.speed = v; });
+  slider('flyspeed', (v) => `${v.toFixed(1)} m/s`, (v) => { fly.speed = v; });
 
   const toggle = (id, fn) => {
     const b = el(id);

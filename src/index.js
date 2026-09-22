@@ -9,13 +9,13 @@
  *   app.start();
  */
 
-export const VERSION = '0.4.3';
+export const VERSION = '0.5.0';
 
 export { App } from './app.js';
 export { World, defineComponent, entityIndex, entityGen, NULL_ENTITY } from './core/ecs.js';
 export * from './core/components.js';
 export * as math from './core/math.js';
-export { Camera, OrbitControls, FlyControls } from './render/camera.js';
+export { Camera } from './render/camera.js';
 export { Renderer } from './render/renderer.js';
 export {
   STANDARD_WGSL, SHADOW_WGSL, AO_WGSL, AO_BLUR_WGSL, RESOLVE_WGSL,

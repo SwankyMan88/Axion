@@ -1,6 +1,6 @@
 {
   "name": "axion",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "A WebGPU, data-oriented 3D engine.",
   "type": "module",
   "main": "src/index.js",

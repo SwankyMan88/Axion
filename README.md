@@ -144,7 +144,7 @@ const app = await AX.App.create(canvas, {
   ao: { intensity: 1, radius: 1.9, power: 1.5 },
   bloom: { threshold: 1.1, knee: 0.65, strength: 0.45 },
   shadows: { maxLights: 4, size: 768, pcfRadius: 1.6 },
-  controls: { distance: 40, autoRotate: 0.05 },   // fly: { speed: 10 } too
+  cameraPosition: [0, 4, 12], cameraTarget: [0, 0, 0],
 });
 
 const cube = app.mesh(AX.roundedBox(1, 1, 1, 0.06, 6));   // beveled edges catch light
@@ -162,11 +162,20 @@ app.addMany(100000, cube, brass, (i, out) => {    // bulk, no garbage
   out.color[0] = i / 100000;
 }, { dynamic: true });
 
-app.onFrame((dt) => { /* your logic */ }).start();
-app.setCameraMode('fly');   // WASD + mouse-look; 'orbit' to go back
+app.onFrame((dt) => {        // your logic — including the camera
+  app.camera.position.set([Math.cos(app.time) * 12, 4, Math.sin(app.time) * 12]);
+  app.camera.target.set([0, 0, 0]);
+  app.camera.update();
+}).start();
 console.log(app.stats);     // drawCalls, instances, culled, triangles,
                             // shadowCasters, shadowDraws, shadowLights, cpuMs
 ```
+
+**Axion reads no input.** No keyboard, mouse or touch handling is built in,
+and the camera only moves when your code moves it. Controls belong to the page:
+`demo/controls.js` has orbit and fly controllers used by the demos, and
+`examples/khan-academy-sponza.html` has a self-contained ES5 fly camera —
+copy either, or write your own.
 
 More lights than `shadows.maxLights` is fine: each frame the renderer ranks
 lights by intensity and distance to the camera and gives the maps to the ones
@@ -222,7 +231,7 @@ src/
                         resolve → bloom → final
   render/shaders.js     WGSL: shadow, GGX + fBm geometry, AO, SSR resolve,
                         bloom, ACES + FXAA — nine programs
-  render/camera.js      reverse-Z camera, orbit controls, free-fly controls
+  render/camera.js      reverse-Z camera (no input handling)
   geometry/primitives.js box, roundedBox, sphere, icosphere, plane, torus
   systems/transform.js  motion integration, matrix composition
 demo/index.html         live viewport with frame telemetry
@@ -291,8 +300,8 @@ base64'd into one script (~16 MB, under jsDelivr's 20 MB per-file cap). Load it
 with a script tag and hand it to the loader:
 
 ```html
-<script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.4.3/dist/axion.min.js"></script>
-<script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.4.3/assets/sponza.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.5.0/dist/axion.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.5.0/assets/sponza.js"></script>
 <script>
   const app = await Axion.App.create(canvas);
   await Axion.loadGLTF(app, AxionAssets.sponza);
@@ -334,7 +343,7 @@ The IIFE builds expose a global `Axion`, for pages that cannot use modules.
 Push a tag to GitHub and jsDelivr serves it with no publishing step:
 
 ```html
-<script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.4.3/dist/axion.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.5.0/dist/axion.min.js"></script>
 <script>
   const app = await Axion.App.create(document.querySelector('canvas'));
 </script>

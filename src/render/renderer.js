@@ -125,8 +125,13 @@ export class Renderer {
      * adapting at `speed`. `exposure` (or the physical camera) still applies on
      * top as compensation. min/max are limits in stops.
      */
+    /** Stops added after everything else: manual, physical or auto exposure. */
+    this.exposureCompensation = options.exposureCompensation ?? 0;
+
     this.autoExposure = {
       enabled: options.autoExposure?.enabled ?? false,
+      /** Target average (log-mean) luminance. 0.18 is photographic middle grey. */
+      key: options.autoExposure?.key ?? 0.12,
       speed: options.autoExposure?.speed ?? 1.5,
       min: options.autoExposure?.min ?? -6,
       max: options.autoExposure?.max ?? 6,
@@ -1001,7 +1006,7 @@ export class Renderer {
     const tm = this.tonemap;
     cd[108] = TONEMAP_MODES[tm.mode] ?? 3; cd[109] = tm.white; cd[110] = tm.contrast; cd[111] = tm.saturation;
     const ae = this.autoExposure;
-    cd[112] = tm.brightness; cd[113] = ae.enabled ? 1 : 0; cd[114] = 0; cd[115] = 0;
+    cd[112] = tm.brightness; cd[113] = ae.enabled ? 1 : 0; cd[114] = this.exposureCompensation; cd[115] = ae.key;
     cd[116] = ae.min; cd[117] = ae.max; cd[118] = ae.speed; cd[119] = dtFrame;
     this.device.queue.writeBuffer(this.cameraBuffer, 0, cd);
 

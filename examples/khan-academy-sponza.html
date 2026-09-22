@@ -219,6 +219,18 @@
             .reset {
                 margin-top: 14px;
             }
+
+            /* Controls that don't apply in the current mode */
+            .off {
+                opacity: 0.38;
+                pointer-events: none;
+            }
+
+            .info {
+                margin: 4px 0 8px;
+                color: rgb(127, 143, 164);
+                font-size: 11px;
+            }
         </style>
     </head>
     <body>
@@ -230,8 +242,8 @@
             <div id="bar"><div id="thumb"></div></div>
         </div>
 
-        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.6.2/dist/axion.min.js"></script><!-- My 3D engine Axion -->
-        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.6.2/assets/sponza.js"></script><!-- The Sponza test in JS form -->
+        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.6.3/dist/axion.min.js"></script><!-- My 3D engine Axion -->
+        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.6.3/assets/sponza.js"></script><!-- The Sponza test in JS form -->
 
         <!-- Shared state -->
         <script>
@@ -991,6 +1003,7 @@
                             set(start);
                             show();
                         });
+                        return row;
                     }
 
                     function toggle(label, get, set) {
@@ -1013,6 +1026,7 @@
                             box.checked = start;
                             set(start);
                         });
+                        return lab;
                     }
 
                     // Drop-down. options is a list of [value, label] pairs
@@ -1044,6 +1058,7 @@
                             sel.value = start;
                             set(start);
                         });
+                        return row;
                     }
 
                     function button(label, onClick, parent) {
@@ -1110,39 +1125,76 @@
                         function (v) { cam.sens = v; });
 
                     section("Camera and exposure");
+                    var ui = {};
+
                     toggle("Physical light units",
                         function () { return r.physical.enabled; },
-                        function (v) { lights.setPhysical(v); });
-                    slider("Exposure (manual)", 0.2, 3, 0.05,
+                        function (v) { lights.setPhysical(v); sync(); });
+                    ui.info = document.createElement("div");
+                    ui.info.className = "info";
+                    body.appendChild(ui.info);
+
+                    ui.manual = slider("Exposure (manual)", 0.2, 3, 0.05,
                         function () { return r.exposure; },
-                        function (v) { r.exposure = v; });
-                    slider("Aperture (f-stop)", 1.4, 22, 0.1,
+                        function (v) { r.exposure = v; sync(); });
+                    ui.aperture = slider("Aperture (f-stop)", 1.4, 22, 0.1,
                         function () { return r.physical.aperture; },
-                        function (v) { r.physical.aperture = v; });
-                    choice("Shutter speed", [
+                        function (v) { r.physical.aperture = v; sync(); });
+                    ui.shutter = choice("Shutter speed", [
                         [1 / 8, "1/8 s"], [1 / 15, "1/15 s"], [1 / 30, "1/30 s"], [1 / 60, "1/60 s"],
                         [1 / 125, "1/125 s"], [1 / 250, "1/250 s"], [1 / 500, "1/500 s"]
                     ],
                         function () { return r.physical.shutter; },
-                        function (v) { r.physical.shutter = Number(v); });
-                    slider("ISO", 50, 3200, 50,
+                        function (v) { r.physical.shutter = Number(v); sync(); });
+                    ui.iso = slider("ISO", 50, 3200, 50,
                         function () { return r.physical.iso; },
-                        function (v) { r.physical.iso = v; });
+                        function (v) { r.physical.iso = v; sync(); });
                     slider("Exposure compensation", -4, 4, 0.1,
-                        function () { return r.physical.compensation; },
-                        function (v) { r.physical.compensation = v; });
+                        function () { return r.exposureCompensation; },
+                        function (v) { r.exposureCompensation = v; });
+
                     toggle("Auto exposure",
                         function () { return r.autoExposure.enabled; },
-                        function (v) { r.autoExposure.enabled = v; });
-                    slider("Adapt speed", 0.2, 6, 0.1,
+                        function (v) { r.autoExposure.enabled = v; sync(); });
+                    ui.speed = slider("Adapt speed", 0.2, 6, 0.1,
                         function () { return r.autoExposure.speed; },
                         function (v) { r.autoExposure.speed = v; });
-                    slider("Auto min (stops)", -8, 0, 0.5,
+                    ui.min = slider("Auto min (stops)", -8, 0, 0.5,
                         function () { return r.autoExposure.min; },
                         function (v) { r.autoExposure.min = v; });
-                    slider("Auto max (stops)", 0, 8, 0.5,
+                    ui.max = slider("Auto max (stops)", 0, 8, 0.5,
                         function () { return r.autoExposure.max; },
                         function (v) { r.autoExposure.max = v; });
+
+                    // Grey out what the current mode ignores, and say what is metering
+                    function sync() {
+                        var phys = r.physical.enabled;
+                        var auto = r.autoExposure.enabled;
+
+                        ui.manual.classList.toggle("off", phys || auto);
+                        ui.aperture.classList.toggle("off", !phys || auto);
+                        ui.shutter.classList.toggle("off", !phys || auto);
+                        ui.iso.classList.toggle("off", !phys || auto);
+                        ui.speed.classList.toggle("off", !auto);
+                        ui.min.classList.toggle("off", !auto);
+                        ui.max.classList.toggle("off", !auto);
+
+                        var text;
+                        if (auto) {
+                            text = "Auto exposure is metering the scene";
+                        } else if (phys) {
+                            var p = r.physical;
+                            var ev = Math.log(p.aperture * p.aperture / p.shutter * 100 / p.iso) / Math.LN2;
+                            text = "Lights in lumens · EV100 " + ev.toFixed(1);
+                        } else {
+                            text = "Manual exposure";
+                        }
+                        if (phys && auto) {
+                            text += " · lights in lumens";
+                        }
+                        ui.info.textContent = text;
+                    }
+                    sync();
 
                     section("Lighting and shadows");
                     slider("Sky light", 0, 3000, 50,
@@ -1272,15 +1324,15 @@
                         clearColor: [0.05, 0.06, 0.08, 1],
                         ambient: [0.10, 0.105, 0.12],
                         groundAmbient: 0.45,
-                        exposure: 1.1,
+                        exposure: 0.95,
                         ssr: { steps: 24, maxDistance: 40, fadeDistance: 60, thickness: 0.35 },
                         ao: { radius: 0.9, fadeDistance: 35 },
                         bloom: { threshold: 1.2, strength: 0.35 },
                         shadows: { maxLights: 3, size: 1024, pcfRadius: 1.4, near: 0.1 },
                         ssil: { intensity: 1, radius: 3 },
-                        volumetric: { enabled: true, density: 0.01, heightFalloff: 0.1, anisotropy: 0.3 },
+                        volumetric: { enabled: true, density: 0.01, heightFalloff: 0.1, anisotropy: 0.3, ambient: 0.6 },
                         tonemap: { mode: "aces" },
-                        autoExposure: { enabled: false },
+                        autoExposure: { enabled: false, key: 0.15 },
                         physical: { enabled: false, aperture: 2.8, shutter: 1 / 30, iso: 400 }
                     }).then(function (app) {
                         sz.app = app;

@@ -1,4 +1,4 @@
-/*! Axion 0.6.2 — WebGPU, data-oriented 3D engine. MIT. */
+/*! Axion 0.6.3 — WebGPU, data-oriented 3D engine. MIT. */
 var __defProp = Object.defineProperty;
 var __export = (target, all) => {
   for (var name in all)
@@ -292,7 +292,7 @@ struct Camera {
   vol2     : vec4<f32>,   // x = height base, y = height falloff, z = ambient scatter, w = light scatter
   volColor : vec4<f32>,   // rgb = scattering albedo, a = enabled
   tone     : vec4<f32>,   // x = mode (0 linear, 1 reinhard, 2 filmic, 3 aces, 4 agx), y = white, z = contrast, w = saturation
-  grade    : vec4<f32>,   // x = brightness, y = auto exposure on, zw = unused
+  grade    : vec4<f32>,   // x = brightness, y = auto exposure on, z = compensation (stops), w = auto key
   expo     : vec4<f32>,   // x = min log2 exposure, y = max log2 exposure, z = adapt speed, w = frame dt
   pad      : vec4<f32>,
 };
@@ -1611,11 +1611,13 @@ fn tonemap(x : vec3<f32>) -> vec3<f32> {
 fn exposure() -> f32 {
   var e = camera.params.y;
   if (camera.grade.y > 0.5) {
-    // Put the average exposed luminance at middle grey (0.18), within limits.
-    let ev = clamp(log2(0.18) - exposureState[0], camera.expo.x, camera.expo.y);
+    // Bring the average exposed luminance to the key value, within limits.
+    // The camera's own exposure cancels out here, as it does on a real
+    // camera in auto mode; compensation below is how to push it either way.
+    let ev = clamp(log2(camera.grade.w) - exposureState[0], camera.expo.x, camera.expo.y);
     e = e * exp2(ev);
   }
-  return e;
+  return e * exp2(camera.grade.z);
 }
 
 /** Graded pixel: HDR + bloom, exposed, tonemapped, adjusted, gamma-encoded. FXAA runs on this. */
@@ -2643,8 +2645,11 @@ var Renderer = class {
       contrast: options.tonemap?.contrast ?? 1,
       saturation: options.tonemap?.saturation ?? 1
     };
+    this.exposureCompensation = options.exposureCompensation ?? 0;
     this.autoExposure = {
       enabled: options.autoExposure?.enabled ?? false,
+      /** Target average (log-mean) luminance. 0.18 is photographic middle grey. */
+      key: options.autoExposure?.key ?? 0.12,
       speed: options.autoExposure?.speed ?? 1.5,
       min: options.autoExposure?.min ?? -6,
       max: options.autoExposure?.max ?? 6
@@ -3531,8 +3536,8 @@ var Renderer = class {
     const ae = this.autoExposure;
     cd[112] = tm.brightness;
     cd[113] = ae.enabled ? 1 : 0;
-    cd[114] = 0;
-    cd[115] = 0;
+    cd[114] = this.exposureCompensation;
+    cd[115] = ae.key;
     cd[116] = ae.min;
     cd[117] = ae.max;
     cd[118] = ae.speed;
@@ -4813,7 +4818,7 @@ async function loadGLTF(app, source, { onProgress = () => {
 }
 
 // src/index.js
-var VERSION = "0.6.2";
+var VERSION = "0.6.3";
 export {
   AO_BLUR_WGSL,
   AO_WGSL,

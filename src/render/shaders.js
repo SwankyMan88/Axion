@@ -42,7 +42,7 @@ struct Camera {
   vol2     : vec4<f32>,   // x = height base, y = height falloff, z = ambient scatter, w = light scatter
   volColor : vec4<f32>,   // rgb = scattering albedo, a = enabled
   tone     : vec4<f32>,   // x = mode (0 linear, 1 reinhard, 2 filmic, 3 aces, 4 agx), y = white, z = contrast, w = saturation
-  grade    : vec4<f32>,   // x = brightness, y = auto exposure on, zw = unused
+  grade    : vec4<f32>,   // x = brightness, y = auto exposure on, z = compensation (stops), w = auto key
   expo     : vec4<f32>,   // x = min log2 exposure, y = max log2 exposure, z = adapt speed, w = frame dt
   pad      : vec4<f32>,
 };
@@ -1363,11 +1363,13 @@ fn tonemap(x : vec3<f32>) -> vec3<f32> {
 fn exposure() -> f32 {
   var e = camera.params.y;
   if (camera.grade.y > 0.5) {
-    // Put the average exposed luminance at middle grey (0.18), within limits.
-    let ev = clamp(log2(0.18) - exposureState[0], camera.expo.x, camera.expo.y);
+    // Bring the average exposed luminance to the key value, within limits.
+    // The camera's own exposure cancels out here, as it does on a real
+    // camera in auto mode; compensation below is how to push it either way.
+    let ev = clamp(log2(camera.grade.w) - exposureState[0], camera.expo.x, camera.expo.y);
     e = e * exp2(ev);
   }
-  return e;
+  return e * exp2(camera.grade.z);
 }
 
 /** Graded pixel: HDR + bloom, exposed, tonemapped, adjusted, gamma-encoded. FXAA runs on this. */

@@ -1,4 +1,4 @@
-/*! Axion 0.7.0 — WebGPU, data-oriented 3D engine. MIT. */
+/*! Axion 0.8.0 — WebGPU, data-oriented 3D engine. MIT. */
 var Axion = (() => {
   var __defProp = Object.defineProperty;
   var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -569,13 +569,20 @@ struct Face {
   viewProj : mat4x4<f32>,
 };
 
+// Same layout as the geometry pass's instances; only the matrix is read here.
+struct Caster {
+  model : mat4x4<f32>,
+  rest  : array<vec4<f32>, 3>,
+};
+
 @group(0) @binding(0) var<uniform> face : Face;
-@group(0) @binding(1) var<storage, read> models : array<mat4x4<f32>>;
+@group(0) @binding(1) var<storage, read> instances : array<Caster>;
+@group(0) @binding(2) var<storage, read> casters : array<u32>;
 
 @vertex
 fn vs(@builtin(instance_index) ii : u32,
       @location(0) position : vec3<f32>) -> @builtin(position) vec4<f32> {
-  return face.viewProj * (models[ii] * vec4<f32>(position, 1.0));
+  return face.viewProj * (instances[casters[ii]].model * vec4<f32>(position, 1.0));
 }
 
 /* Alpha-tested casters: leaves, chains, grilles. Without this they cast solid
@@ -592,7 +599,7 @@ fn vsMask(@builtin(instance_index) ii : u32,
           @location(0) position : vec3<f32>,
           @location(2) uv : vec2<f32>) -> MaskOut {
   var o : MaskOut;
-  o.pos = face.viewProj * (models[ii] * vec4<f32>(position, 1.0));
+  o.pos = face.viewProj * (instances[casters[ii]].model * vec4<f32>(position, 1.0));
   o.uv = uv;
   return o;
 }
@@ -627,15 +634,18 @@ struct Light {
 @group(0) @binding(2) var<storage, read> lights : array<Light>;
 @group(0) @binding(3) var shadowMaps : texture_depth_2d_array;
 @group(0) @binding(4) var shadowSampler : sampler_comparison;
+// Slots that survived culling this frame; instance_index walks this list.
+@group(0) @binding(5) var<storage, read> visible : array<u32>;
 ${MATERIAL_WGSL}
 struct VSOut {
-  @builtin(position) clip : vec4<f32>,
+  @invariant @builtin(position) clip : vec4<f32>,
   @location(0) worldPos   : vec3<f32>,
   @location(1) normal     : vec3<f32>,
   @location(2) uv         : vec2<f32>,
-  @location(3) color      : vec4<f32>,
-  @location(4) pbr        : vec4<f32>,
-  @location(5) surf       : vec4<f32>,
+  // Per-object values: flat, so the rasterizer copies them instead of interpolating.
+  @location(3) @interpolate(flat) color : vec4<f32>,
+  @location(4) @interpolate(flat) pbr   : vec4<f32>,
+  @location(5) @interpolate(flat) surf  : vec4<f32>,
 };
 
 struct GBuffer {
@@ -651,7 +661,7 @@ fn vs(
   @location(1) normal   : vec3<f32>,
   @location(2) uv       : vec2<f32>,
 ) -> VSOut {
-  let inst = instances[ii];
+  let inst = instances[visible[ii]];
   let world = inst.model * vec4<f32>(position, 1.0);
   let n = normalize((inst.model * vec4<f32>(normal, 0.0)).xyz);
 
@@ -664,6 +674,18 @@ fn vs(
   out.pbr = inst.pbr;
   out.surf = inst.surf;
   return out;
+}
+
+/*
+ * Depth prepass. Same math as vs above, and both outputs are @invariant, so
+ * the main pass can test depth for equality and shade every pixel once.
+ */
+@vertex
+fn vsDepth(@builtin(instance_index) ii : u32,
+           @location(0) position : vec3<f32>) -> @invariant @builtin(position) vec4<f32> {
+  let inst = instances[visible[ii]];
+  let world = inst.model * vec4<f32>(position, 1.0);
+  return camera.viewProj * world;
 }
 
 /* ----------------------------------------------------------- noise ----- */
@@ -2754,6 +2776,8 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   var MAX_LIGHTS = 256;
   var FACE_SLOT_BYTES = 256;
   var HDR_FORMAT = "rgba16float";
+  var ALBEDO_FORMAT = "rgba8unorm";
+  var MAT_SNAP = 12;
   var TONEMAP_MODES = { linear: 0, reinhard: 1, filmic: 2, aces: 3, agx: 4 };
   var AO_FORMAT = "rgba16float";
   var Renderer = class {
@@ -2770,6 +2794,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       this.ambient = options.ambient ?? [0.09, 0.11, 0.15];
       this.groundAmbient = options.groundAmbient ?? 0.35;
       this.frustumCulling = options.frustumCulling !== false;
+      this.depthPrepass = options.depthPrepass !== false;
       this.fxaa = options.fxaa !== false;
       this.ssr = {
         intensity: options.ssr?.intensity ?? 1,
@@ -2854,7 +2879,8 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       this.vertexArena = new Arena(device, GPUBufferUsage.VERTEX, 4 << 20, "axion-vertices");
       this.indexArena = new Arena(device, GPUBufferUsage.INDEX, 2 << 20, "axion-indices");
       this.instances = new DynamicBuffer(device, GPUBufferUsage.STORAGE, 4096 * INSTANCE_FLOATS, "axion-instances");
-      this.shadowModels = new DynamicBuffer(device, GPUBufferUsage.STORAGE, 4096 * 16, "axion-shadow-models");
+      this.visibleList = new DynamicBuffer(device, GPUBufferUsage.STORAGE, 4096, "axion-visible");
+      this.shadowModels = new DynamicBuffer(device, GPUBufferUsage.STORAGE, 4096, "axion-shadow-casters");
       this.cameraBuffer = device.createBuffer({
         size: CAMERA_FLOATS * 4,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -2888,12 +2914,13 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       this._buildStaticPipelines();
       this._buildShadowTarget();
       this._rebuildFrameBindGroup();
-      this._visArch = new Uint16Array(4096);
-      this._visRow = new Uint32Array(4096);
-      this._visKey = new Uint32Array(4096);
-      this._sVisArch = new Uint16Array(4096);
-      this._sVisRow = new Uint32Array(4096);
-      this._sVisMesh = new Uint32Array(4096);
+      this._sig = null;
+      this._groups = [];
+      this._dyn = [];
+      this._moved = [];
+      this._instTotal = 0;
+      this._draws = [];
+      this._shadowState = [];
       this._frustum = new Float32Array(24);
       this._shadowBatches = [];
       this._shadowSlots = /* @__PURE__ */ new Map();
@@ -2924,7 +2951,8 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
           { binding: 1, visibility: VERT, buffer: { type: "read-only-storage" } },
           { binding: 2, visibility: FRAG, buffer: { type: "read-only-storage" } },
           { binding: 3, visibility: FRAG, texture: { sampleType: "depth", viewDimension: "2d-array" } },
-          { binding: 4, visibility: FRAG, sampler: { type: "comparison" } }
+          { binding: 4, visibility: FRAG, sampler: { type: "comparison" } },
+          { binding: 5, visibility: VERT, buffer: { type: "read-only-storage" } }
         ]
       });
       this._materialLayout = d.createBindGroupLayout({
@@ -2959,7 +2987,8 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
         label: "axion-shadow",
         entries: [
           { binding: 0, visibility: VERT, buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 64 } },
-          { binding: 1, visibility: VERT, buffer: { type: "read-only-storage" } }
+          { binding: 1, visibility: VERT, buffer: { type: "read-only-storage" } },
+          { binding: 2, visibility: VERT, buffer: { type: "read-only-storage" } }
         ]
       });
       const tex = (n) => ({ binding: n, visibility: FRAG, texture: { sampleType: "float" } });
@@ -3138,6 +3167,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
         }));
       }
       this._boundInstanceBuffer = null;
+      this._shadowState = [];
     }
     _ensureShadowCapacity() {
       const built = this._shadowBuiltFor;
@@ -3255,8 +3285,9 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
     }
     /** Recreated only when the instance buffer was reallocated by a grow. */
     _rebuildFrameBindGroup() {
-      if (this._boundInstanceBuffer === this.instances.buffer) return;
+      if (this._boundInstanceBuffer === this.instances.buffer && this._boundVisibleBuffer === this.visibleList.buffer) return;
       this._boundInstanceBuffer = this.instances.buffer;
+      this._boundVisibleBuffer = this.visibleList.buffer;
       this.frameBindGroup = this.device.createBindGroup({
         layout: this._frameLayout,
         label: "axion-frame",
@@ -3265,24 +3296,61 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
           { binding: 1, resource: { buffer: this.instances.buffer } },
           { binding: 2, resource: { buffer: this.lightBuffer } },
           { binding: 3, resource: this._shadowArrayView },
-          { binding: 4, resource: this._shadowSampler }
+          { binding: 4, resource: this._shadowSampler },
+          { binding: 5, resource: { buffer: this.visibleList.buffer } }
         ]
       });
     }
     _rebuildShadowBindGroup() {
-      if (this._boundShadowBuffer === this.shadowModels.buffer) return;
+      if (this._boundShadowBuffer === this.shadowModels.buffer && this._boundShadowInstances === this.instances.buffer) return;
       this._boundShadowBuffer = this.shadowModels.buffer;
+      this._boundShadowInstances = this.instances.buffer;
       this.shadowBindGroup = this.device.createBindGroup({
         layout: this._shadowLayout,
         label: "axion-shadow",
         entries: [
           { binding: 0, resource: { buffer: this.faceBuffer, size: 64 } },
-          { binding: 1, resource: { buffer: this.shadowModels.buffer } }
+          { binding: 1, resource: { buffer: this.instances.buffer } },
+          { binding: 2, resource: { buffer: this.shadowModels.buffer } }
         ]
       });
     }
+    /** Opaque, not alpha-tested: the materials the depth prepass can draw. */
+    _inPrepass(material) {
+      return this.depthPrepass && !material.transparent && !material.masked;
+    }
+    _depthPipelineFor(material) {
+      const key = `depth|${material.doubleSided ? 1 : 0}`;
+      let p = this._pipelines.get(key);
+      if (p) return p;
+      this._depthLayout ??= this.device.createPipelineLayout({
+        bindGroupLayouts: [this._frameLayout],
+        label: "axion-depth-layout"
+      });
+      p = this.device.createRenderPipeline({
+        label: `axion-pipeline-${key}`,
+        layout: this._depthLayout,
+        vertex: {
+          module: this._modules.standard,
+          entryPoint: "vsDepth",
+          buffers: [{
+            arrayStride: VERTEX_STRIDE_BYTES,
+            attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }]
+          }]
+        },
+        primitive: {
+          topology: "triangle-list",
+          cullMode: material.doubleSided ? "none" : "back",
+          frontFace: "ccw"
+        },
+        depthStencil: { format: "depth32float", depthWriteEnabled: true, depthCompare: "greater" }
+      });
+      this._pipelines.set(key, p);
+      return p;
+    }
     _pipelineFor(material) {
-      const key = `${material.transparent ? 1 : 0}|${material.doubleSided ? 1 : 0}`;
+      const pre = this._inPrepass(material);
+      const key = `${material.transparent ? 1 : 0}|${material.doubleSided ? 1 : 0}|${pre ? 1 : 0}`;
       let p = this._pipelines.get(key);
       if (p) return p;
       p = this.device.createRenderPipeline({
@@ -3314,7 +3382,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
             // Transparent surfaces must not overwrite the surface or albedo
             // buffers, or the resolve would shade a reflection for a ghost.
             { format: HDR_FORMAT, writeMask: material.transparent ? 0 : GPUColorWrite.ALL },
-            { format: HDR_FORMAT, writeMask: material.transparent ? 0 : GPUColorWrite.ALL }
+            { format: ALBEDO_FORMAT, writeMask: material.transparent ? 0 : GPUColorWrite.ALL }
           ]
         },
         primitive: {
@@ -3326,8 +3394,8 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
         // precision where it matters instead of wasting it near the near plane.
         depthStencil: {
           format: "depth32float",
-          depthWriteEnabled: !material.transparent,
-          depthCompare: "greater"
+          depthWriteEnabled: !material.transparent && !pre,
+          depthCompare: pre ? "equal" : "greater"
         }
       });
       this._pipelines.set(key, p);
@@ -3346,7 +3414,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       });
       const color = make(HDR_FORMAT, width, height, "axion-scene-color");
       const surface = make(HDR_FORMAT, width, height, "axion-surface");
-      const albedo = make(HDR_FORMAT, width, height, "axion-albedo");
+      const albedo = make(ALBEDO_FORMAT, width, height, "axion-albedo");
       const depth = make("depth32float", width, height, "axion-depth");
       const hdr = make(HDR_FORMAT, width, height, "axion-hdr");
       const aoW = Math.max(1, width >> 1), aoH = Math.max(1, height >> 1);
@@ -3411,17 +3479,6 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       this.bloomBindGroups = t.bloomViews.map((v, i) => bg(this._bloomLayout, [camRes, this._sampler, v], `axion-bloom-${i}`));
       this._targetSize = [width, height];
     }
-    _growVisibility(n) {
-      if (n <= this._visArch.length) return;
-      let cap = this._visArch.length;
-      while (cap < n) cap *= 2;
-      this._visArch = new Uint16Array(cap);
-      this._visRow = new Uint32Array(cap);
-      this._visKey = new Uint32Array(cap);
-      this._sVisArch = new Uint16Array(cap);
-      this._sVisRow = new Uint32Array(cap);
-      this._sVisMesh = new Uint32Array(cap);
-    }
     /* --------------------------------------------------------- shadow prep */
     /**
      * Build the cube-face view-projection matrices for one light.
@@ -3464,89 +3521,254 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
         m[base + 15] = -tz;
       }
     }
+    /* ------------------------------------------------------ instance cache */
     /**
-     * Gather shadow casters per light and scatter their matrices into one
-     * buffer, grouped by mesh. Materials do not matter for a depth-only pass, so
-     * the sort key is just the mesh — fewer, bigger batches than the main pass.
+     * Instance data lives on the GPU between frames.
+     *
+     * Every renderable is written once, sorted by (mesh, material), into one
+     * storage buffer, along with a world-space bounding sphere kept on the CPU.
+     * After that a frame only rewrites the entities tagged Dynamic, culls the
+     * spheres, and uploads a list of visible slot numbers — four bytes per
+     * object instead of a hundred and twelve. The cache is rebuilt when the set
+     * of entities or a material changes; `invalidate()` forces it after writing
+     * component data of static entities by hand.
      */
-    _buildShadowBatches(world, lights) {
+    invalidate() {
+      this._sig = null;
+    }
+    _cacheIsCurrent(world, archetypes) {
+      const sig = this._sig;
+      const len = 4 + archetypes.length * 3;
+      if (!sig || sig.length !== len) return false;
+      if (sig[0] !== world._structureVersion || sig[1] !== this.materials.length || sig[2] !== this.meshes.length || sig[3] !== archetypes.length) return false;
+      for (let i = 0; i < archetypes.length; i++) {
+        const a = archetypes[i], o = 4 + i * 3;
+        if (sig[o] !== a.index || sig[o + 1] !== a.count || sig[o + 2] !== a.version) return false;
+      }
+      return !this._materialsChanged();
+    }
+    _storeSignature(world, archetypes) {
+      const sig = new Float64Array(4 + archetypes.length * 3);
+      sig[0] = world._structureVersion;
+      sig[1] = this.materials.length;
+      sig[2] = this.meshes.length;
+      sig[3] = archetypes.length;
+      for (let i = 0; i < archetypes.length; i++) {
+        const a = archetypes[i], o = 4 + i * 3;
+        sig[o] = a.index;
+        sig[o + 1] = a.count;
+        sig[o + 2] = a.version;
+      }
+      this._sig = sig;
+    }
+    /** Material fields are plain properties, so compare them with last frame's copy. */
+    _materialsChanged() {
+      const mats = this.materials;
+      let snap = this._matSnap;
+      const need = mats.length * MAT_SNAP;
+      let changed = false;
+      if (!snap || snap.length !== need) {
+        snap = this._matSnap = new Float64Array(need);
+        changed = true;
+      }
+      for (let i = 0; i < mats.length; i++) {
+        const m = mats[i], o = i * MAT_SNAP;
+        const v0 = m.color[0], v1 = m.color[1], v2 = m.color[2];
+        if (snap[o] !== v0 || snap[o + 1] !== v1 || snap[o + 2] !== v2 || snap[o + 3] !== m.alpha || snap[o + 4] !== m.emissive || snap[o + 5] !== m.metallic || snap[o + 6] !== m.roughness || snap[o + 7] !== m.noiseScale || snap[o + 8] !== m.noiseStrength || snap[o + 9] !== m.bump || snap[o + 10] !== m.oxide || snap[o + 11] !== (m.castShadow === false ? 0 : 1)) {
+          snap[o] = v0;
+          snap[o + 1] = v1;
+          snap[o + 2] = v2;
+          snap[o + 3] = m.alpha;
+          snap[o + 4] = m.emissive;
+          snap[o + 5] = m.metallic;
+          snap[o + 6] = m.roughness;
+          snap[o + 7] = m.noiseScale;
+          snap[o + 8] = m.noiseStrength;
+          snap[o + 9] = m.bump;
+          snap[o + 10] = m.oxide;
+          snap[o + 11] = m.castShadow === false ? 0 : 1;
+          changed = true;
+        }
+      }
+      return changed;
+    }
+    /** Write one entity into its slot: instance data on the CPU mirror, sphere into `_spheres`. */
+    _writeInstance(slot, a, r) {
+      const inst = this.instances.cpu;
+      const o = slot * INSTANCE_FLOATS;
+      const W = a.columns.get(LocalToWorld.id);
+      const R = a.columns.get(MeshRef.id);
+      const B = a.columns.get(Bounds.id);
+      const w = r * 16, b = r * 4;
+      for (let m = 0; m < 16; m++) inst[o + m] = W[w + m];
+      const mat = this.materials[R[r * 2 + M_MATERIAL]] ?? this.materials[0];
+      const C = a.columns.get(InstanceColor.id);
+      if (C) {
+        inst[o + 16] = C[b];
+        inst[o + 17] = C[b + 1];
+        inst[o + 18] = C[b + 2];
+        inst[o + 22] = C[b + 3];
+      } else {
+        inst[o + 16] = mat.color[0];
+        inst[o + 17] = mat.color[1];
+        inst[o + 18] = mat.color[2];
+        inst[o + 22] = mat.emissive;
+      }
+      inst[o + 19] = mat.alpha;
+      inst[o + 20] = mat.metallic;
+      inst[o + 21] = mat.roughness;
+      inst[o + 23] = 0;
+      inst[o + 24] = mat.noiseScale;
+      inst[o + 25] = mat.noiseStrength;
+      inst[o + 26] = mat.bump;
+      inst[o + 27] = mat.oxide;
+      const sp = this._spheres, so = slot * 4;
+      sp[so] = W[w] * B[b] + W[w + 4] * B[b + 1] + W[w + 8] * B[b + 2] + W[w + 12];
+      sp[so + 1] = W[w + 1] * B[b] + W[w + 5] * B[b + 1] + W[w + 9] * B[b + 2] + W[w + 13];
+      sp[so + 2] = W[w + 2] * B[b] + W[w + 6] * B[b + 1] + W[w + 10] * B[b + 2] + W[w + 14];
+      sp[so + 3] = B[b + 3] * Math.max(
+        Math.hypot(W[w], W[w + 1], W[w + 2]),
+        Math.hypot(W[w + 4], W[w + 5], W[w + 6]),
+        Math.hypot(W[w + 8], W[w + 9], W[w + 10])
+      );
+    }
+    _rebuildInstances(world, archetypes) {
+      const matCount = Math.max(1, this.materials.length);
+      const keyCount = Math.max(1, this.meshes.length) * matCount;
+      const counts = new Uint32Array(keyCount);
+      let total = 0;
+      for (const a of archetypes) {
+        const R = a.columns.get(MeshRef.id);
+        for (let r = 0; r < a.count; r++) {
+          counts[R[r * 2 + M_MESH] * matCount + R[r * 2 + M_MATERIAL]]++;
+        }
+        total += a.count;
+      }
+      const groups = [];
+      const cursor = new Uint32Array(keyCount);
+      let running = 0;
+      for (let k = 0; k < keyCount; k++) {
+        cursor[k] = running;
+        if (counts[k] > 0) {
+          const material = this.materials[k % matCount] ?? this.materials[0];
+          groups.push({
+            mesh: k / matCount | 0,
+            material: k % matCount,
+            matRef: material,
+            start: running,
+            count: counts[k],
+            castShadow: material.castShadow !== false
+          });
+        }
+        running += counts[k];
+      }
+      this.instances.ensure(Math.max(1, total) * INSTANCE_FLOATS);
+      if (!this._spheres || this._spheres.length < total * 4) {
+        this._spheres = new Float32Array(Math.max(1024, total * 4));
+      }
+      const dyn = [];
+      for (const a of archetypes) {
+        const R = a.columns.get(MeshRef.id);
+        const isDyn = a.has[Dynamic.id] === 1;
+        const rowSlot = isDyn ? new Uint32Array(a.count) : null;
+        for (let r = 0; r < a.count; r++) {
+          const slot = cursor[R[r * 2 + M_MESH] * matCount + R[r * 2 + M_MATERIAL]]++;
+          this._writeInstance(slot, a, r);
+          if (rowSlot) rowSlot[r] = slot;
+        }
+        if (rowSlot && a.count > 0) dyn.push({ a, rowSlot });
+      }
+      this.instances.flush(total * INSTANCE_FLOATS);
+      this._groups = groups;
+      this._dyn = dyn;
+      this._instTotal = total;
+      this._instBuild = (this._instBuild ?? 0) + 1;
+      this._storeSignature(world, archetypes);
+    }
+    /**
+     * Rewrite the Dynamic entities. Spheres that moved are remembered (old and
+     * new position) so only shadow maps they can touch are redrawn.
+     */
+    _updateDynamic() {
+      const moved = this._moved;
+      moved.length = 0;
+      if (this._dyn.length === 0) return;
+      const sp = this._spheres;
+      let lo = Infinity, hi = -1;
+      for (const d of this._dyn) {
+        const rowSlot = d.rowSlot, a = d.a;
+        for (let r = 0; r < rowSlot.length; r++) {
+          const slot = rowSlot[r], so = slot * 4;
+          const ox = sp[so], oy = sp[so + 1], oz = sp[so + 2], or = sp[so + 3];
+          this._writeInstance(slot, a, r);
+          if (sp[so] !== ox || sp[so + 1] !== oy || sp[so + 2] !== oz || sp[so + 3] !== or) {
+            moved.push(ox, oy, oz, or, sp[so], sp[so + 1], sp[so + 2], sp[so + 3]);
+          }
+          if (slot < lo) lo = slot;
+          if (slot > hi) hi = slot;
+        }
+      }
+      if (hi >= lo) {
+        const cpu = this.instances.cpu;
+        this.device.queue.writeBuffer(
+          this.instances.buffer,
+          lo * INSTANCE_FLOATS * 4,
+          cpu.buffer,
+          cpu.byteOffset + lo * INSTANCE_FLOATS * 4,
+          (hi - lo + 1) * INSTANCE_FLOATS * 4
+        );
+      }
+    }
+    /** Did anything that moved this frame pass through this light's range? */
+    _movedNear(L) {
+      const m = this._moved;
+      for (let i = 0; i < m.length; i += 4) {
+        const dx = m[i] - L.x, dy = m[i + 1] - L.y, dz = m[i + 2] - L.z;
+        const reach = L.range + m[i + 3];
+        if (dx * dx + dy * dy + dz * dz <= reach * reach) return true;
+      }
+      return false;
+    }
+    /** Slot numbers as u32, in a buffer that grows by doubling. */
+    _u32List(name, n) {
+      const buf = this[name];
+      buf.ensure(Math.max(1, n));
+      if (!buf.u32 || buf.u32.buffer !== buf.cpu.buffer) buf.u32 = new Uint32Array(buf.cpu.buffer);
+      return buf.u32;
+    }
+    /**
+     * Gather shadow casters for the lights whose maps need redrawing, as slot
+     * numbers into the instance buffer, grouped by (mesh, material).
+     */
+    _buildShadowBatches(lights) {
       const batches = this._shadowBatches;
       batches.length = 0;
       if (lights.length === 0) return 0;
-      const archetypes = world.query([LocalToWorld, MeshRef, Bounds], [Hidden]);
-      const matCount = Math.max(1, this.materials.length);
-      const meshCount = Math.max(1, this.meshes.length) * matCount;
-      if (!this._sCounts || this._sCounts.length < meshCount + 1) {
-        this._sCounts = new Uint32Array(meshCount + 1);
-        this._sCursor = new Uint32Array(meshCount + 1);
-      }
-      let total = 0;
-      for (const a of archetypes) total += a.count;
-      this._growVisibility(total);
-      let written = 0;
+      const sp = this._spheres;
       const cap = this.shadows.maxCasters;
+      const list = this._u32List("shadowModels", Math.min(cap, this._instTotal * lights.length));
+      let written = 0;
       for (let li = 0; li < lights.length; li++) {
         const L = lights[li];
-        this._sCounts.fill(0, 0, meshCount + 1);
-        let visible = 0;
-        for (let ai = 0; ai < archetypes.length && written + visible < cap; ai++) {
-          const a = archetypes[ai];
-          const W = a.columns.get(LocalToWorld.id);
-          const R = a.columns.get(MeshRef.id);
-          const B = a.columns.get(Bounds.id);
-          for (let r = 0; r < a.count; r++) {
-            const mat = this.materials[R[r * 2 + M_MATERIAL]];
-            if (mat && mat.castShadow === false) continue;
-            const w = r * 16, b = r * 4;
-            const cx = W[w] * B[b] + W[w + 4] * B[b + 1] + W[w + 8] * B[b + 2] + W[w + 12];
-            const cy = W[w + 1] * B[b] + W[w + 5] * B[b + 1] + W[w + 9] * B[b + 2] + W[w + 13];
-            const cz = W[w + 2] * B[b] + W[w + 6] * B[b + 1] + W[w + 10] * B[b + 2] + W[w + 14];
-            const s = Math.max(
-              Math.hypot(W[w], W[w + 1], W[w + 2]),
-              Math.hypot(W[w + 4], W[w + 5], W[w + 6]),
-              Math.hypot(W[w + 8], W[w + 9], W[w + 10])
-            );
-            const radius = B[b + 3] * s;
-            const dx = cx - L.x, dy = cy - L.y, dz = cz - L.z;
+        L.casters = 0;
+        for (const g of this._groups) {
+          if (!g.castShadow || written >= cap) continue;
+          const first = written;
+          const end = g.start + g.count;
+          for (let s = g.start; s < end && written < cap; s++) {
+            const so = s * 4;
+            const radius = sp[so + 3];
+            const dx = sp[so] - L.x, dy = sp[so + 1] - L.y, dz = sp[so + 2] - L.z;
             const distSq = dx * dx + dy * dy + dz * dz;
             if (distSq > (L.range + radius) * (L.range + radius)) continue;
             if (distSq < radius * radius && radius < Math.min(1, 0.1 * L.range)) continue;
-            const mesh2 = R[r * 2 + M_MESH] * matCount + R[r * 2 + M_MATERIAL];
-            this._sVisArch[visible] = ai;
-            this._sVisRow[visible] = r;
-            this._sVisMesh[visible] = mesh2;
-            this._sCounts[mesh2]++;
-            visible++;
+            list[written++] = s;
+          }
+          if (written > first) {
+            batches.push({ light: L, mesh: g.mesh, material: g.material, first, count: written - first });
+            L.casters += written - first;
           }
         }
-        if (visible === 0) {
-          L.slot = -1;
-          continue;
-        }
-        let running = written;
-        for (let k = 0; k < meshCount; k++) {
-          this._sCursor[k] = running;
-          if (this._sCounts[k] > 0) {
-            batches.push({
-              light: li,
-              mesh: k / matCount | 0,
-              material: k % matCount,
-              first: running,
-              count: this._sCounts[k]
-            });
-          }
-          running += this._sCounts[k];
-        }
-        this.shadowModels.ensure((written + visible) * 16);
-        const dst = this.shadowModels.cpu;
-        for (let i = 0; i < visible; i++) {
-          const a = archetypes[this._sVisArch[i]];
-          const r = this._sVisRow[i];
-          const slot = this._sCursor[this._sVisMesh[i]]++;
-          const W = a.columns.get(LocalToWorld.id);
-          for (let m = 0; m < 16; m++) dst[slot * 16 + m] = W[r * 16 + m];
-        }
-        written += visible;
       }
       return written;
     }
@@ -3617,12 +3839,41 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       } else {
         this._shadowSlots.clear();
       }
-      const shadowCasters = this.shadows.enabled ? this._buildShadowBatches(world, shadowLights) : 0;
+      const archetypes = world.query([LocalToWorld, MeshRef, Bounds], [Hidden]);
+      if (this._cacheIsCurrent(world, archetypes)) {
+        this._updateDynamic();
+      } else {
+        this._rebuildInstances(world, archetypes);
+        this._moved.length = 0;
+      }
+      const near = this.shadows.near;
+      const redraw = [];
+      for (const l of shadowLights) {
+        const st = this._shadowState[l.slot];
+        const same = st && st.entity === l.entity && st.x === l.x && st.y === l.y && st.z === l.z && st.range === l.range && st.near === near && st.build === this._instBuild;
+        if (same && !this._movedNear(l)) {
+          l.casters = st.casters;
+        } else {
+          redraw.push(l);
+        }
+      }
+      const shadowCasters = this._buildShadowBatches(redraw);
+      for (const l of redraw) {
+        this._shadowState[l.slot] = {
+          entity: l.entity,
+          x: l.x,
+          y: l.y,
+          z: l.z,
+          range: l.range,
+          near,
+          build: this._instBuild,
+          casters: l.casters
+        };
+      }
       if (shadowCasters > 0) {
-        this.shadowModels.flush(shadowCasters * 16);
-        for (const l of shadowLights) {
-          if (l.slot < 0) continue;
-          this._writeFaceMatrices(l.slot, l.x, l.y, l.z, this.shadows.near, l.range);
+        this.shadowModels.flush(shadowCasters);
+        for (const l of redraw) {
+          if (l.casters > 0) this._writeFaceMatrices(l.slot, l.x, l.y, l.z, near, l.range);
         }
         this.device.queue.writeBuffer(this.faceBuffer, 0, this.faceData);
       }
@@ -3637,7 +3888,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
         this.lightData[o + 5] = l.g;
         this.lightData[o + 6] = l.b;
         this.lightData[o + 7] = this.physical.enabled ? l.intensity / (4 * Math.PI) : l.intensity;
-        this.lightData[o + 8] = shadowCasters > 0 ? l.slot : -1;
+        this.lightData[o + 8] = l.slot >= 0 && l.casters > 0 ? l.slot : -1;
         this.lightData[o + 9] = this.shadows.near;
         this.lightData[o + 10] = this.shadows.bias;
         this.lightData[o + 11] = l.range;
@@ -3739,95 +3990,40 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       cd[127] = df.enabled ? 1 : 0;
       this.device.queue.writeBuffer(this.cameraBuffer, 0, cd);
       if (this.frustumCulling) frustumFromMatrix(this._frustum, 0, camera.viewProj, 0);
-      const archetypes = world.query([LocalToWorld, MeshRef, Bounds], [Hidden]);
-      let total = 0;
-      for (const a of archetypes) total += a.count;
-      this._growVisibility(total);
-      const matCount = Math.max(1, this.materials.length);
-      const keyCount = Math.max(1, this.meshes.length) * matCount;
-      if (!this._counts || this._counts.length < keyCount + 1) {
-        this._counts = new Uint32Array(keyCount + 1);
-        this._cursor = new Uint32Array(keyCount + 1);
-      } else {
-        this._counts.fill(0, 0, keyCount + 1);
-      }
-      let visible = 0, culled = 0;
-      for (let ai = 0; ai < archetypes.length; ai++) {
-        const a = archetypes[ai];
-        const W = a.columns.get(LocalToWorld.id);
-        const R = a.columns.get(MeshRef.id);
-        const B = a.columns.get(Bounds.id);
-        const n = a.count;
-        for (let r = 0; r < n; r++) {
-          if (this.frustumCulling) {
-            const w = r * 16, b = r * 4;
-            const cx = W[w] * B[b] + W[w + 4] * B[b + 1] + W[w + 8] * B[b + 2] + W[w + 12];
-            const cy = W[w + 1] * B[b] + W[w + 5] * B[b + 1] + W[w + 9] * B[b + 2] + W[w + 13];
-            const cz = W[w + 2] * B[b] + W[w + 6] * B[b + 1] + W[w + 10] * B[b + 2] + W[w + 14];
-            const s = Math.max(
-              Math.hypot(W[w], W[w + 1], W[w + 2]),
-              Math.hypot(W[w + 4], W[w + 5], W[w + 6]),
-              Math.hypot(W[w + 8], W[w + 9], W[w + 10])
-            );
-            if (!sphereInFrustum(this._frustum, 0, cx, cy, cz, B[b + 3] * s)) {
-              culled++;
-              continue;
-            }
-          }
-          const key = R[r * 2 + M_MESH] * matCount + R[r * 2 + M_MATERIAL];
-          this._visArch[visible] = ai;
-          this._visRow[visible] = r;
-          this._visKey[visible] = key;
-          this._counts[key]++;
-          visible++;
-        }
-      }
-      let running = 0;
-      for (let k = 0; k < keyCount; k++) {
-        this._cursor[k] = running;
-        running += this._counts[k];
-      }
-      this.instances.ensure(visible * INSTANCE_FLOATS);
-      const inst = this.instances.cpu;
-      for (let i = 0; i < visible; i++) {
-        const a = archetypes[this._visArch[i]];
-        const r = this._visRow[i];
-        const slot = this._cursor[this._visKey[i]]++;
-        const o = slot * INSTANCE_FLOATS;
-        const W = a.columns.get(LocalToWorld.id);
-        for (let m = 0; m < 16; m++) inst[o + m] = W[r * 16 + m];
-        const mat = this.materials[a.columns.get(MeshRef.id)[r * 2 + M_MATERIAL]] ?? this.materials[0];
-        const C = a.columns.get(InstanceColor.id);
-        if (C) {
-          inst[o + 16] = C[r * 4];
-          inst[o + 17] = C[r * 4 + 1];
-          inst[o + 18] = C[r * 4 + 2];
-          inst[o + 19] = mat.alpha;
-          inst[o + 22] = C[r * 4 + 3];
+      const sp = this._spheres, fr = this._frustum, cull = this.frustumCulling;
+      const vis = this._u32List("visibleList", this._instTotal);
+      const drawList = this._draws;
+      drawList.length = 0;
+      let visible = 0;
+      for (const g of this._groups) {
+        const first = visible, end = g.start + g.count;
+        if (!cull) {
+          for (let s = g.start; s < end; s++) vis[visible++] = s;
         } else {
-          inst[o + 16] = mat.color[0];
-          inst[o + 17] = mat.color[1];
-          inst[o + 18] = mat.color[2];
-          inst[o + 19] = mat.alpha;
-          inst[o + 22] = mat.emissive;
+          for (let s = g.start; s < end; s++) {
+            const so = s * 4;
+            const x = sp[so], y = sp[so + 1], z = sp[so + 2], r = -sp[so + 3];
+            if (fr[0] * x + fr[1] * y + fr[2] * z + fr[3] < r) continue;
+            if (fr[4] * x + fr[5] * y + fr[6] * z + fr[7] < r) continue;
+            if (fr[8] * x + fr[9] * y + fr[10] * z + fr[11] < r) continue;
+            if (fr[12] * x + fr[13] * y + fr[14] * z + fr[15] < r) continue;
+            if (fr[16] * x + fr[17] * y + fr[18] * z + fr[19] < r) continue;
+            if (fr[20] * x + fr[21] * y + fr[22] * z + fr[23] < r) continue;
+            vis[visible++] = s;
+          }
         }
-        inst[o + 20] = mat.metallic;
-        inst[o + 21] = mat.roughness;
-        inst[o + 23] = 0;
-        inst[o + 24] = mat.noiseScale;
-        inst[o + 25] = mat.noiseStrength;
-        inst[o + 26] = mat.bump;
-        inst[o + 27] = mat.oxide;
+        if (visible > first) drawList.push(g, first, visible - first);
       }
-      this.instances.flush(visible * INSTANCE_FLOATS);
+      const culled = this._instTotal - visible;
+      this.visibleList.flush(visible);
       this._rebuildFrameBindGroup();
       const enc = this.device.createCommandEncoder({ label: "axion-frame" });
       let shadowDraws = 0;
       if (shadowCasters > 0) {
         const maxSlot = this._shadowFaceViews.length / 6 | 0;
-        for (const light of shadowLights) {
-          if (light.slot < 0 || light.slot >= maxSlot) continue;
-          const batches2 = this._shadowBatches.filter((b) => shadowLights[b.light] === light);
+        for (const light of redraw) {
+          if (light.slot < 0 || light.slot >= maxSlot || !(light.casters > 0)) continue;
+          const batches2 = this._shadowBatches.filter((b) => b.light === light);
           for (let face = 0; face < 6; face++) {
             const layer = light.slot * 6 + face;
             const pass = enc.beginRenderPass({
@@ -3861,6 +4057,37 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
           }
         }
       }
+      let prepassDraws = 0;
+      if (this.depthPrepass) {
+        const dp = enc.beginRenderPass({
+          label: "axion-depth-prepass",
+          colorAttachments: [],
+          depthStencilAttachment: {
+            view: t.depthView,
+            depthClearValue: 0,
+            depthLoadOp: "clear",
+            depthStoreOp: "store"
+          }
+        });
+        dp.setBindGroup(0, this.frameBindGroup);
+        dp.setVertexBuffer(0, this.vertexArena.buffer);
+        dp.setIndexBuffer(this.indexArena.buffer, "uint32");
+        let bound = null;
+        for (let i = 0; i < drawList.length; i += 3) {
+          const g = drawList[i];
+          if (!this._inPrepass(g.matRef)) continue;
+          const m = this.meshes[g.mesh];
+          if (!m) continue;
+          const p = this._depthPipelineFor(g.matRef);
+          if (p !== bound) {
+            dp.setPipeline(p);
+            bound = p;
+          }
+          dp.drawIndexed(m.indexCount, drawList[i + 2], m.firstIndex, m.baseVertex, drawList[i + 1]);
+          prepassDraws++;
+        }
+        dp.end();
+      }
       const geo = enc.beginRenderPass({
         label: "axion-geometry",
         colorAttachments: [
@@ -3877,7 +4104,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
           view: t.depthView,
           depthClearValue: 0,
           // reverse-Z
-          depthLoadOp: "clear",
+          depthLoadOp: this.depthPrepass ? "load" : "clear",
           depthStoreOp: "store"
         }
       });
@@ -3886,13 +4113,11 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       geo.setIndexBuffer(this.indexArena.buffer, "uint32");
       let draws = 0, tris = 0, batches = 0, currentPipeline = null, currentMaterial = null;
       for (let phase = 0; phase < 2; phase++) {
-        for (let k = 0; k < keyCount; k++) {
-          const count = this._counts[k];
-          const start = this._cursor[k] - count;
-          if (count === 0) continue;
-          const material = this.materials[k % matCount] ?? this.materials[0];
+        for (let i = 0; i < drawList.length; i += 3) {
+          const g = drawList[i], start = drawList[i + 1], count = drawList[i + 2];
+          const material = g.matRef;
           if ((material.transparent ? 1 : 0) !== phase) continue;
-          const m = this.meshes[k / matCount | 0];
+          const m = this.meshes[g.mesh];
           if (!m) continue;
           const pipeline = this._pipelineFor(material);
           if (pipeline !== currentPipeline) {
@@ -3925,8 +4150,19 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
         pass.draw(3);
         pass.end();
       };
-      fullscreen("axion-ao", t.aoView, this._aoPipeline, this.aoBindGroup);
-      fullscreen("axion-ao-blur", t.aoBlurView, this._aoBlurPipeline, this.aoBlurBindGroup);
+      let aoPasses = 0;
+      if (this.ao.intensity > 0 || this.ssil.intensity > 0) {
+        fullscreen("axion-ao", t.aoView, this._aoPipeline, this.aoBindGroup);
+        fullscreen("axion-ao-blur", t.aoBlurView, this._aoBlurPipeline, this.aoBlurBindGroup);
+        t.aoIdle = false;
+        aoPasses = 2;
+      } else if (!t.aoIdle) {
+        enc.beginRenderPass({
+          label: "axion-ao-off",
+          colorAttachments: [{ view: t.aoBlurView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }]
+        }).end();
+        t.aoIdle = true;
+      }
       let volumePasses = 0;
       if (this.volumetric.enabled && this.volumetric.density > 0) {
         if (!this._volumeBindGroup || this._volumeShadowView !== this._shadowArrayView) {
@@ -3993,14 +4229,15 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       final.end();
       this.device.queue.submit([enc.finish()]);
       const bloomPasses = t.bloom.length > 0 && this.bloom.strength > 0 ? t.bloom.length * 2 - 1 : 0;
-      this.stats.drawCalls = draws + shadowDraws + 3 + volumePasses + dofPasses + bloomPasses + 1;
+      this.stats.drawCalls = draws + prepassDraws + shadowDraws + 1 + aoPasses + volumePasses + dofPasses + bloomPasses + 1;
       this.stats.batches = batches;
       this.stats.instances = visible;
       this.stats.culled = culled;
       this.stats.triangles = tris;
       this.stats.shadowDraws = shadowDraws;
       this.stats.shadowCasters = shadowCasters;
-      this.stats.shadowLights = shadowCasters > 0 ? shadowLights.filter((l) => l.slot >= 0).length : 0;
+      this.stats.shadowLights = shadowLights.filter((l) => l.casters > 0).length;
+      this.stats.shadowRedraws = redraw.length;
       this.stats.cpuMs = performance.now() - t0;
     }
     destroy() {
@@ -4008,6 +4245,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       this.indexArena.destroy();
       this.instances.destroy();
       this.shadowModels.destroy();
+      this.visibleList.destroy();
       this.cameraBuffer.destroy();
       this.lightBuffer.destroy();
       this.faceBuffer.destroy();
@@ -4404,6 +4642,15 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
     }
     get stats() {
       return this.renderer.stats;
+    }
+    /**
+     * Static objects are uploaded to the GPU once. Adding or removing objects and
+     * changing materials is noticed on its own; call this after writing the
+     * components of a static (non-Dynamic) object by hand.
+     */
+    refresh() {
+      this.renderer.invalidate();
+      return this;
     }
     dispose() {
       if (this.disposed) return;
@@ -5020,6 +5267,6 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   }
 
   // src/index.js
-  var VERSION = "0.7.0";
+  var VERSION = "0.8.0";
   return __toCommonJS(index_exports);
 })();

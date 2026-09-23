@@ -28,6 +28,16 @@
                 pointer-events: none;
             }
 
+            #status {
+                position: fixed;
+                left: 10px;
+                bottom: 8px;
+                color: rgb(151, 166, 187);
+                font-size: 11px;
+                text-shadow: 0 1px 2px rgb(0, 0, 0);
+                pointer-events: none;
+            }
+
             #tab {
                 position: fixed;
                 left: 10px;
@@ -236,6 +246,7 @@
     <body>
         <canvas id="c"></canvas>
         <div id="msg">loading…</div>
+        <div id="status">collision: waiting</div>
         <button id="tab" title="Visual settings">&#9776;</button>
         <div id="panel">
             <div id="list"></div>
@@ -257,6 +268,21 @@
 
                 sz.app = null;
                 sz.ready = false;
+
+                // Small line in the corner saying what collision is doing
+                sz.statusEl = document.getElementById("status");
+                sz.status = function (text) {
+                    sz.statusEl.textContent = "collision: " + text;
+                };
+
+                // Any uncaught error shows up on screen instead of vanishing
+                window.addEventListener("error", function (e) {
+                    sz.statusEl.textContent = "error: " + e.message + " (line " + e.lineno + ")";
+                });
+                window.addEventListener("unhandledrejection", function (e) {
+                    var r = e.reason;
+                    sz.statusEl.textContent = "error: " + (r && r.message ? r.message : r);
+                });
 
                 // A clean copy of the page (menu not built yet) for the fullscreen window
                 sz.pageHtml = "";
@@ -361,6 +387,84 @@
             })();
         </script>
 
+        <!-- Collision builder, run in a background worker.
+             Not a regular script, so the page never runs it or rewrites it. -->
+        <script type="text/js-worker" id="physWorker">
+            // Receives [{ v: vertices (8 floats each), idx: indices }], sends back the triangle grid
+            onmessage = function (e) {
+                var prims = e.data.prims;
+                var cell = e.data.cell;
+
+                var total = 0;
+                for (var i = 0; i < prims.length; i++) {
+                    total += prims[i].idx.length / 3;
+                }
+                var tris = new Float32Array(total * 9);
+                var box = new Float32Array(total * 6);
+                var up = new Float32Array(total);
+                var grid = {};
+                var n = 0;
+
+                for (var p = 0; p < prims.length; p++) {
+                    var v = prims[p].v;
+                    var idx = prims[p].idx;
+
+                    for (var t = 0; t < idx.length; t += 3) {
+                        var o = n * 9;
+                        for (var c = 0; c < 3; c++) {
+                            var src = idx[t + c] * 8;
+                            tris[o + c * 3] = v[src];
+                            tris[o + c * 3 + 1] = v[src + 1];
+                            tris[o + c * 3 + 2] = v[src + 2];
+                        }
+
+                        var ax = tris[o], ay = tris[o + 1], az = tris[o + 2];
+                        var bx = tris[o + 3], by = tris[o + 4], bz = tris[o + 5];
+                        var cx = tris[o + 6], cy = tris[o + 7], cz = tris[o + 8];
+
+                        var ux = bx - ax, uy = by - ay, uz = bz - az;
+                        var wx = cx - ax, wy = cy - ay, wz = cz - az;
+                        var nx = uy * wz - uz * wy;
+                        var ny = uz * wx - ux * wz;
+                        var nz = ux * wy - uy * wx;
+                        var len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+                        if (len < 1e-9) {
+                            continue;
+                        }
+                        up[n] = Math.abs(ny) / len;
+
+                        var b = n * 6;
+                        box[b] = Math.min(ax, bx, cx);
+                        box[b + 1] = Math.min(ay, by, cy);
+                        box[b + 2] = Math.min(az, bz, cz);
+                        box[b + 3] = Math.max(ax, bx, cx);
+                        box[b + 4] = Math.max(ay, by, cy);
+                        box[b + 5] = Math.max(az, bz, cz);
+
+                        var x0 = Math.floor(box[b] / cell);
+                        var x1 = Math.floor(box[b + 3] / cell);
+                        var z0 = Math.floor(box[b + 2] / cell);
+                        var z1 = Math.floor(box[b + 5] / cell);
+                        for (var ix = x0; ix <= x1; ix++) {
+                            for (var iz = z0; iz <= z1; iz++) {
+                                var k = (ix + 2048) * 4096 + (iz + 2048);
+                                var list = grid[k];
+                                if (!list) {
+                                    list = [];
+                                    grid[k] = list;
+                                }
+                                list.push(n);
+                            }
+                        }
+                        n++;
+                    }
+                }
+
+                postMessage({ tris: tris, box: box, up: up, grid: grid, count: n },
+                    [tris.buffer, box.buffer, up.buffer]);
+            };
+        </script>
+
         <!-- Collision and physics -->
         <script>
             (function () {
@@ -443,10 +547,17 @@
                     phys.count = n + 1;
                 }
 
-                // Build from Axion's parsed glTF primitives (world-space vertices).
-                // Runs in small slices between frames, so the page never stalls
-                // (and Khan Academy never mistakes a long loop for a frozen one).
-                phys.build = function (prims, done) {
+                function finish(done) {
+                    phys.stamp = new Uint32Array(phys.count);
+                    phys.ready = true;
+                    sz.status("ready, " + phys.count + " triangles");
+                    if (done) {
+                        done();
+                    }
+                }
+
+                // Fallback: build on the page in small slices between frames
+                function buildHere(prims, done, fail) {
                     var total = 0;
                     for (var i = 0; i < prims.length; i++) {
                         total += prims[i].geometry.indices.length / 3;
@@ -454,37 +565,107 @@
                     phys.tris = new Float32Array(total * 9);
                     phys.box = new Float32Array(total * 6);
                     phys.up = new Float32Array(total);
+                    phys.grid = {};
                     phys.count = 0;
 
                     var p = 0;
                     var t = 0;
 
-                    function slice() {
-                        var until = Date.now() + 6;
+                    function step() {
+                        var until = Date.now() + 4;
                         while (p < prims.length && Date.now() < until) {
                             var g = prims[p].geometry;
                             var idx = g.indices;
-                            var stop = Math.min(t + 1500, idx.length);
-                            for (; t < stop; t += 3) {
+                            var stop = Math.min(t + 600, idx.length);
+                            while (t < stop) {
                                 addTri(g.vertices, idx[t], idx[t + 1], idx[t + 2]);
+                                t += 3;
                             }
                             if (t >= idx.length) {
                                 p++;
                                 t = 0;
                             }
                         }
-
                         if (p < prims.length) {
                             setTimeout(slice, 0);
                             return;
                         }
-                        phys.stamp = new Uint32Array(phys.count);
-                        phys.ready = true;
-                        if (done) {
-                            done();
+                        finish(done);
+                    }
+
+                    function slice() {
+                        try {
+                            step();
+                        } catch (e) {
+                            if (fail) {
+                                fail(e);
+                            }
                         }
                     }
                     slice();
+                }
+
+                // Build from Axion's parsed glTF primitives (world-space vertices).
+                // Uses a background worker so the page never stalls; falls back to
+                // building here in small slices if workers aren't allowed.
+                phys.build = function (prims, done, fail) {
+                    var worker = null;
+                    try {
+                        var code = document.getElementById("physWorker").textContent;
+                        var url = URL.createObjectURL(new Blob([code], { type: "text/javascript" }));
+                        worker = new Worker(url);
+                    } catch (e) {
+                        worker = null;
+                    }
+                    if (!worker) {
+                        sz.status("building on the page");
+                        buildHere(prims, done, fail);
+                        return;
+                    }
+                    sz.status("building in a worker");
+
+                    var gave = false;
+                    function fallBack() {
+                        if (gave) {
+                            return;
+                        }
+                        gave = true;
+                        worker.terminate();
+                        sz.status("worker failed, building on the page");
+                        buildHere(prims, done, fail);
+                    }
+
+                    worker.onmessage = function (e) {
+                        gave = true;
+                        worker.terminate();
+                        phys.tris = e.data.tris;
+                        phys.box = e.data.box;
+                        phys.up = e.data.up;
+                        phys.grid = e.data.grid;
+                        phys.count = e.data.count;
+                        finish(done);
+                    };
+                    worker.onerror = function (e) {
+                        e.preventDefault();
+                        fallBack();
+                    };
+
+                    var list = [];
+                    for (var i = 0; i < prims.length; i++) {
+                        list.push({ v: prims[i].geometry.vertices, idx: prims[i].geometry.indices });
+                    }
+                    try {
+                        worker.postMessage({ prims: list, cell: phys.cell });
+                    } catch (e) {
+                        fallBack();
+                        return;
+                    }
+                    // A worker that never answers (blocked quietly) gets 8 seconds
+                    setTimeout(function () {
+                        if (!phys.ready) {
+                            fallBack();
+                        }
+                    }, 8000);
                 };
 
                 // Triangles whose cells touch the square around x, z
@@ -858,9 +1039,15 @@
                     var rz = -sy;
 
                     if (cam.mode === "walk") {
-                        // Hold still until the collision data is built
                         if (sz.phys.ready) {
                             walk(dt, rx, rz);
+                        } else {
+                            // Collision still building (or failed): glide at eye height
+                            var saveY = cam.y;
+                            fly(dt, -sy, 0, -cy, rx, rz);
+                            cam.y = saveY;
+                            cam.vy = 0;
+                            cam.eyeY = cam.y + cam.eye;
                         }
                     } else {
                         fly(dt, fx, fy, fz, rx, rz);
@@ -935,7 +1122,9 @@
                     }
 
                     var html = sz.pageHtml || "<!DOCTYPE html>" + document.documentElement.outerHTML;
-                    html = html.replace("<head>", "<head><script>window.szPopped = true;<\/script>");
+                    // The tag is split in two so no page tool can mistake it for the end of this script
+                    var tag = "scr" + "ipt";
+                    html = html.replace("<head>", "<head><" + tag + ">window.szPopped = true;</" + tag + ">");
                     try {
                         w.document.open();
                         w.document.write(html);
@@ -1079,9 +1268,13 @@
                     scroll.update();
                 };
 
-                // Keys typed in the menu shouldn't move the camera
-                panel.addEventListener("keydown", function (e) {
-                    e.stopPropagation();
+                // Don't let menu buttons and checkboxes keep keyboard focus: a focused
+                // button swallows Space and its keys never reach the camera
+                panel.addEventListener("click", function (e) {
+                    var t = e.target;
+                    if (t.tagName === "BUTTON" || (t.tagName === "INPUT" && t.type === "checkbox")) {
+                        t.blur();
+                    }
                 });
 
                 sz.buildMenu = function (app, lights) {
@@ -1573,17 +1766,27 @@
                             sz.ready = true;
                             sz.hint();
                             app.start();
-                            if (sz.full.popped) {
+                            if (sz.full && sz.full.popped) {
                                 sz.full.prompt();
                             }
 
                             // Collision reads the same model's triangles on the CPU.
                             // Wait a moment so the first frames get the machine to themselves.
+                            sz.status("starting soon");
                             setTimeout(function () {
+                                sz.status("decoding model");
                                 Axion.unpackAsset(AxionAssets.sponza).then(function (bytes) {
+                                    sz.status("reading triangles");
                                     var glb = Axion.parseGLB(bytes);
                                     var model = Axion.parseGLTF(glb.json, [glb.bin]);
-                                    sz.phys.build(model.primitives);
+                                    sz.status("building (" + model.primitives.length + " parts)");
+                                    sz.phys.build(model.primitives, function () {
+                                        sz.hint();
+                                    }, function (e) {
+                                        sz.status("failed: " + (e.message || e));
+                                    });
+                                }).catch(function (e) {
+                                    sz.status("failed: " + (e.message || e));
                                 });
                             }, 1500);
                         });

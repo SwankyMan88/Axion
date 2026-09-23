@@ -243,13 +243,20 @@ struct Face {
   viewProj : mat4x4<f32>,
 };
 
+// Same layout as the geometry pass's instances; only the matrix is read here.
+struct Caster {
+  model : mat4x4<f32>,
+  rest  : array<vec4<f32>, 3>,
+};
+
 @group(0) @binding(0) var<uniform> face : Face;
-@group(0) @binding(1) var<storage, read> models : array<mat4x4<f32>>;
+@group(0) @binding(1) var<storage, read> instances : array<Caster>;
+@group(0) @binding(2) var<storage, read> casters : array<u32>;
 
 @vertex
 fn vs(@builtin(instance_index) ii : u32,
       @location(0) position : vec3<f32>) -> @builtin(position) vec4<f32> {
-  return face.viewProj * (models[ii] * vec4<f32>(position, 1.0));
+  return face.viewProj * (instances[casters[ii]].model * vec4<f32>(position, 1.0));
 }
 
 /* Alpha-tested casters: leaves, chains, grilles. Without this they cast solid
@@ -266,7 +273,7 @@ fn vsMask(@builtin(instance_index) ii : u32,
           @location(0) position : vec3<f32>,
           @location(2) uv : vec2<f32>) -> MaskOut {
   var o : MaskOut;
-  o.pos = face.viewProj * (models[ii] * vec4<f32>(position, 1.0));
+  o.pos = face.viewProj * (instances[casters[ii]].model * vec4<f32>(position, 1.0));
   o.uv = uv;
   return o;
 }
@@ -301,15 +308,18 @@ struct Light {
 @group(0) @binding(2) var<storage, read> lights : array<Light>;
 @group(0) @binding(3) var shadowMaps : texture_depth_2d_array;
 @group(0) @binding(4) var shadowSampler : sampler_comparison;
+// Slots that survived culling this frame; instance_index walks this list.
+@group(0) @binding(5) var<storage, read> visible : array<u32>;
 ${MATERIAL_WGSL}
 struct VSOut {
-  @builtin(position) clip : vec4<f32>,
+  @invariant @builtin(position) clip : vec4<f32>,
   @location(0) worldPos   : vec3<f32>,
   @location(1) normal     : vec3<f32>,
   @location(2) uv         : vec2<f32>,
-  @location(3) color      : vec4<f32>,
-  @location(4) pbr        : vec4<f32>,
-  @location(5) surf       : vec4<f32>,
+  // Per-object values: flat, so the rasterizer copies them instead of interpolating.
+  @location(3) @interpolate(flat) color : vec4<f32>,
+  @location(4) @interpolate(flat) pbr   : vec4<f32>,
+  @location(5) @interpolate(flat) surf  : vec4<f32>,
 };
 
 struct GBuffer {
@@ -325,7 +335,7 @@ fn vs(
   @location(1) normal   : vec3<f32>,
   @location(2) uv       : vec2<f32>,
 ) -> VSOut {
-  let inst = instances[ii];
+  let inst = instances[visible[ii]];
   let world = inst.model * vec4<f32>(position, 1.0);
   let n = normalize((inst.model * vec4<f32>(normal, 0.0)).xyz);
 
@@ -338,6 +348,18 @@ fn vs(
   out.pbr = inst.pbr;
   out.surf = inst.surf;
   return out;
+}
+
+/*
+ * Depth prepass. Same math as vs above, and both outputs are @invariant, so
+ * the main pass can test depth for equality and shade every pixel once.
+ */
+@vertex
+fn vsDepth(@builtin(instance_index) ii : u32,
+           @location(0) position : vec3<f32>) -> @invariant @builtin(position) vec4<f32> {
+  let inst = instances[visible[ii]];
+  let world = inst.model * vec4<f32>(position, 1.0);
+  return camera.viewProj * world;
 }
 
 /* ----------------------------------------------------------- noise ----- */

@@ -1,0 +1,1164 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8">
+        <title>Axion vs three.js</title>
+        <style>
+            body {
+                margin: 0;
+                background: rgb(14, 17, 22);
+                color: rgb(212, 219, 227);
+                font: 13px/1.5 system-ui, sans-serif;
+            }
+            header {
+                padding: 14px 18px 6px;
+            }
+            h1 {
+                margin: 0;
+                font-size: 18px;
+            }
+            h2 {
+                margin: 18px 0 8px;
+                font-size: 14px;
+                color: rgb(151, 163, 178);
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }
+            .note {
+                color: rgb(134, 146, 161);
+                max-width: 900px;
+            }
+            #bar {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 14px;
+                align-items: center;
+                padding: 8px 18px;
+                background: rgb(21, 26, 33);
+                border-top: 1px solid rgb(38, 45, 56);
+                border-bottom: 1px solid rgb(38, 45, 56);
+            }
+            #bar label {
+                display: flex;
+                gap: 5px;
+                align-items: center;
+            }
+            select, input, button {
+                font: inherit;
+                color: rgb(222, 228, 235);
+                background: rgb(31, 37, 47);
+                border: 1px solid rgb(58, 67, 81);
+                border-radius: 4px;
+                padding: 3px 7px;
+            }
+            input[type="checkbox"] {
+                padding: 0;
+            }
+            button {
+                cursor: pointer;
+                padding: 5px 14px;
+                background: rgb(46, 97, 171);
+                border-color: rgb(69, 121, 197);
+            }
+            button:disabled {
+                opacity: 0.5;
+                cursor: default;
+            }
+            main {
+                padding: 6px 18px 40px;
+            }
+            #fit {
+                width: 100%;
+                max-width: 960px;
+                overflow: hidden;
+                border: 1px solid rgb(38, 45, 56);
+                background: rgb(6, 7, 9);
+            }
+            #stage {
+                position: relative;
+                width: 960px;
+                height: 540px;
+                transform-origin: 0 0;
+            }
+            #stage canvas {
+                position: absolute;
+                left: 0;
+                top: 0;
+                width: 960px;
+                height: 540px;
+            }
+            #tag {
+                position: absolute;
+                left: 10px;
+                top: 8px;
+                padding: 2px 8px;
+                border-radius: 3px;
+                background: rgba(0, 0, 1, 0.6);
+                font-weight: 600;
+            }
+            #status {
+                margin: 8px 0;
+                color: rgb(233, 191, 101);
+                font-family: ui-monospace, monospace;
+            }
+            table {
+                border-collapse: collapse;
+                font-variant-numeric: tabular-nums;
+            }
+            th, td {
+                padding: 4px 10px;
+                border-bottom: 1px solid rgb(38, 45, 56);
+                text-align: right;
+            }
+            th:first-child, td:first-child, td:nth-child(2) {
+                text-align: left;
+            }
+            th {
+                color: rgb(151, 163, 178);
+                font-weight: 600;
+            }
+            .ax {
+                color: rgb(242, 164, 61);
+            }
+            .th {
+                color: rgb(89, 181, 199);
+            }
+            .win {
+                font-weight: 700;
+            }
+            .row {
+                display: grid;
+                grid-template-columns: 170px 1fr 70px;
+                gap: 8px;
+                align-items: center;
+                margin: 2px 0;
+                max-width: 760px;
+            }
+            .track {
+                height: 9px;
+                background: rgb(27, 32, 41);
+                border-radius: 2px;
+            }
+            .fill {
+                height: 9px;
+                border-radius: 2px;
+            }
+            #compare {
+                position: relative;
+                width: 100%;
+                max-width: 960px;
+                user-select: none;
+            }
+            #compare img {
+                display: block;
+                width: 100%;
+            }
+            #compare .top {
+                position: absolute;
+                left: 0;
+                top: 0;
+                height: 100%;
+                overflow: hidden;
+                border-right: 2px solid rgb(250, 250, 248);
+            }
+            #compare .top img {
+                width: auto;
+                height: 100%;
+            }
+            #compare span {
+                position: absolute;
+                top: 6px;
+                padding: 1px 7px;
+                background: rgba(0, 0, 1, 0.6);
+                border-radius: 3px;
+            }
+            #shots {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                margin-top: 8px;
+            }
+            #shots img {
+                width: 300px;
+                border: 1px solid rgb(38, 45, 56);
+                cursor: pointer;
+            }
+        </style>
+    </head>
+    <body>
+        <header>
+            <h1>Axion vs three.js</h1>
+            <p class="note">
+                Both engines draw the same scene at 960 × 540, one at a time, on a fresh canvas, following the same camera path.
+                <b>Uncapped</b> renders frame after frame and waits for the GPU to finish each one, so the numbers aren't capped by your monitor's refresh rate.
+                <b>Refresh-locked</b> is what you'd actually see in a normal render loop.
+                The light brightness is matched by formula, so the two images should look close but not identical.
+            </p>
+        </header>
+
+        <div id="bar">
+            <label>Scene
+                <select id="scene">
+                    <option value="all">All scenes</option>
+                    <option value="instances">20,000 instanced cubes</option>
+                    <option value="draws">2,500 separate objects</option>
+                    <option value="lights">48 lights + 4 shadows</option>
+                    <option value="sponza">Sponza (glTF)</option>
+                </select>
+            </label>
+            <label>Settings
+                <select id="preset">
+                    <option value="lean">Matched (effects off)</option>
+                    <option value="full">Each engine's quality defaults</option>
+                </select>
+            </label>
+            <label>Frames <input id="frames" type="number" value="300" min="30" max="3000" style="width: 70px;"></label>
+            <label><input id="locked" type="checkbox" checked> Refresh-locked pass</label>
+            <button id="run">Run</button>
+        </div>
+
+        <main>
+            <div id="status">loading…</div>
+            <div id="fit">
+                <div id="stage"><div id="tag"></div></div>
+            </div>
+
+            <h2>Results</h2>
+            <div id="results" class="note">Nothing yet.</div>
+
+            <h2>Speed</h2>
+            <div id="bars" class="note">Nothing yet.</div>
+
+            <h2>Quality</h2>
+            <p class="note">Same camera, same frame. Drag across the image to compare. Click a thumbnail to switch scenes.</p>
+            <div id="compare"></div>
+            <div id="shots"></div>
+        </main>
+
+        <!-- Shared state and where the engines load from -->
+        <script>
+            (function () {
+                var local = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+                var q = location.search;
+
+                window.bn = {
+                    w: 960,
+                    h: 540,
+                    local: local,
+                    auto: /[?&]auto=1/.test(q),
+                    axionUrl: local ? "../dist/axion.min.js" : "https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.7.0/dist/axion.min.js",
+                    sponzaUrl: local ? "../assets/sponza.js" : "https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.7.0/assets/sponza.js",
+                    threeUrl: local ? "../node_modules/three/" : "https://cdn.jsdelivr.net/npm/three@0.186.0/",
+                    results: [],
+                    shots: {}
+                };
+
+                var st = document.getElementById("status");
+                bn.status = function (t) {
+                    st.textContent = t;
+                };
+
+                window.addEventListener("error", function (e) {
+                    bn.status("error: " + e.message);
+                });
+                window.addEventListener("unhandledrejection", function (e) {
+                    bn.status("error: " + (e.reason && e.reason.message ? e.reason.message : e.reason));
+                });
+
+                bn.loadScript = function (src) {
+                    return new Promise(function (ok, fail) {
+                        var s = document.createElement("script");
+                        s.src = src;
+                        s.onload = ok;
+                        s.onerror = function () {
+                            fail(new Error("couldn't load " + src));
+                        };
+                        document.head.appendChild(s);
+                    });
+                };
+
+                bn.wait = function (ms) {
+                    return new Promise(function (ok) {
+                        setTimeout(ok, ms);
+                    });
+                };
+
+                bn.nextFrame = function () {
+                    return new Promise(function (ok) {
+                        requestAnimationFrame(ok);
+                    });
+                };
+
+                // three.js only ships as modules, so it is loaded through an import map
+                var map = document.createElement("script");
+                map.type = "importmap";
+                map.textContent = JSON.stringify({
+                    imports: {
+                        "three": bn.threeUrl + "build/three.webgpu.js",
+                        "three/webgpu": bn.threeUrl + "build/three.webgpu.js",
+                        "three/addons/": bn.threeUrl + "examples/jsm/"
+                    }
+                });
+                document.head.appendChild(map);
+
+                bn.threeReady = new Promise(function (ok) {
+                    bn.gotThree = ok;
+                });
+
+                var mod = document.createElement("script");
+                mod.type = "module";
+                mod.textContent = "import * as T from 'three'; import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'; window.THREE = T; window.GLTFLoader = GLTFLoader; bn.gotThree();";
+                document.head.appendChild(mod);
+
+                bn.axionReady = bn.loadScript(bn.axionUrl);
+
+                // Keep the 960 x 540 stage whole on small windows
+                var fit = document.getElementById("fit");
+                var stage = document.getElementById("stage");
+                function scale() {
+                    var k = Math.min(1, fit.clientWidth / 960);
+                    stage.style.transform = "scale(" + k + ")";
+                    fit.style.height = (540 * k) + "px";
+                }
+                window.addEventListener("resize", scale);
+                scale();
+            })();
+        </script>
+
+        <!-- Scenes: plain data both engines build from -->
+        <script>
+            (function () {
+                function rng(seed) {
+                    return function () {
+                        seed = (seed + 0x6d2b79f5) | 0;
+                        var t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+                        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+                        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+                    };
+                }
+
+                function hue(h) {
+                    var r = Math.abs(h * 6 - 3) - 1;
+                    var g = 2 - Math.abs(h * 6 - 2);
+                    var b = 2 - Math.abs(h * 6 - 4);
+                    return [
+                        0.25 + 0.7 * Math.max(0, Math.min(1, r)),
+                        0.25 + 0.7 * Math.max(0, Math.min(1, g)),
+                        0.25 + 0.7 * Math.max(0, Math.min(1, b))
+                    ];
+                }
+
+                function orbit(r, h, look, speed) {
+                    return function (i) {
+                        var a = i * speed + 0.6;
+                        return {
+                            pos: [Math.cos(a) * r, h, Math.sin(a) * r],
+                            at: [0, look, 0]
+                        };
+                    };
+                }
+
+                var list = {};
+
+                list.instances = function () {
+                    var rand = rng(11);
+                    var n = 142;
+                    var inst = [];
+                    for (var z = 0; z < n; z++) {
+                        for (var x = 0; x < n; x++) {
+                            if (inst.length >= 20000) {
+                                break;
+                            }
+                            var h = 0.3 + rand() * rand() * 3;
+                            inst.push({
+                                pos: [(x - n / 2) * 1.4, h / 2, (z - n / 2) * 1.4],
+                                rot: [0, rand() * 3.14, 0],
+                                scale: [1, h, 1],
+                                color: hue(rand())
+                            });
+                        }
+                    }
+                    var lights = [];
+                    for (var i = 0; i < 4; i++) {
+                        var a = i / 4 * 6.283;
+                        lights.push({ pos: [Math.cos(a) * 45, 14, Math.sin(a) * 45], color: hue(i / 4 + 0.1), intensity: 900, range: 90, shadow: false });
+                    }
+                    return {
+                        name: "20,000 instanced cubes",
+                        instanced: { shape: "box", list: inst, rough: 0.55, metal: 0 },
+                        objects: [],
+                        lights: lights,
+                        floor: 220,
+                        shadows: 0,
+                        camera: orbit(70, 34, 0, 0.004)
+                    };
+                };
+
+                list.draws = function () {
+                    var rand = rng(23);
+                    var mats = [];
+                    for (var m = 0; m < 24; m++) {
+                        mats.push({ color: hue(m / 24), rough: 0.2 + rand() * 0.7, metal: rand() < 0.3 ? 1 : 0 });
+                    }
+                    var shapes = ["box", "sphere", "torus"];
+                    var obj = [];
+                    for (var i = 0; i < 2500; i++) {
+                        obj.push({
+                            shape: shapes[i % 3],
+                            mat: Math.floor(rand() * 24),
+                            pos: [(rand() - 0.5) * 60, 0.6 + rand() * 6, (rand() - 0.5) * 60],
+                            rot: [rand() * 6.28, rand() * 6.28, 0],
+                            scale: [1, 1, 1]
+                        });
+                    }
+                    var lights = [];
+                    for (var j = 0; j < 8; j++) {
+                        lights.push({ pos: [(rand() - 0.5) * 50, 9, (rand() - 0.5) * 50], color: hue(rand()), intensity: 160, range: 35, shadow: false });
+                    }
+                    return {
+                        name: "2,500 separate objects",
+                        mats: mats,
+                        objects: obj,
+                        lights: lights,
+                        floor: 80,
+                        shadows: 0,
+                        camera: orbit(42, 16, 2, 0.005)
+                    };
+                };
+
+                list.lights = function () {
+                    var rand = rng(37);
+                    var mats = [
+                        { color: [0.8, 0.8, 0.82], rough: 0.5, metal: 0 },
+                        { color: [0.85, 0.62, 0.35], rough: 0.3, metal: 1 },
+                        { color: [0.4, 0.55, 0.8], rough: 0.7, metal: 0 }
+                    ];
+                    var obj = [];
+                    for (var i = 0; i < 400; i++) {
+                        obj.push({
+                            shape: i % 2 ? "sphere" : "box",
+                            mat: i % 3,
+                            pos: [(rand() - 0.5) * 36, 0.5 + rand() * 1.5, (rand() - 0.5) * 36],
+                            rot: [0, rand() * 6.28, 0],
+                            scale: [0.6 + rand(), 0.6 + rand() * 2, 0.6 + rand()]
+                        });
+                    }
+                    var lights = [];
+                    for (var j = 0; j < 48; j++) {
+                        lights.push({
+                            pos: [(rand() - 0.5) * 34, 1.5 + rand() * 3, (rand() - 0.5) * 34],
+                            color: hue(rand()),
+                            intensity: j < 4 ? 120 : 25,
+                            range: j < 4 ? 30 : 9,
+                            shadow: j < 4
+                        });
+                    }
+                    return {
+                        name: "48 lights + 4 shadows",
+                        mats: mats,
+                        objects: obj,
+                        lights: lights,
+                        floor: 50,
+                        shadows: 4,
+                        camera: orbit(24, 11, 0, 0.006)
+                    };
+                };
+
+                list.sponza = function () {
+                    return {
+                        name: "Sponza (glTF)",
+                        gltf: true,
+                        objects: [],
+                        lights: [
+                            { pos: [1.5, 26, 0.6], color: [1, 0.94, 0.86], intensity: 1400, range: 70, shadow: true },
+                            { pos: [6, 1.8, -0.2], color: [1, 0.62, 0.32], intensity: 55, range: 16, shadow: true },
+                            { pos: [-4, 2.6, 2.4], color: [0.45, 0.62, 1], intensity: 55, range: 16, shadow: true }
+                        ],
+                        floor: 0,
+                        shadows: 3,
+                        camera: function (i) {
+                            var a = i * 0.006;
+                            var x = Math.sin(a) * 8;
+                            return { pos: [x, 2.2, 1.8], at: [x * 0.4 - 3 * Math.cos(a), 3, -0.8] };
+                        }
+                    };
+                };
+
+                bn.scenes = list;
+                bn.sceneNames = ["instances", "draws", "lights", "sponza"];
+            })();
+        </script>
+
+        <!-- Axion runner -->
+        <script>
+            (function () {
+                var geo = {
+                    box: function () { return Axion.box(1, 1, 1); },
+                    sphere: function () { return Axion.sphere(0.5, 32, 16); },
+                    torus: function () { return Axion.torus(0.5, 0.2, 32, 16); }
+                };
+
+                function options(sc, full) {
+                    var o = {
+                        maxDpr: 1,
+                        thumbnail: false,
+                        fov: 60,
+                        clearColor: [0.02, 0.025, 0.035, 1],
+                        tonemap: { mode: "aces" },
+                        shadows: { enabled: sc.shadows > 0, maxLights: Math.max(1, sc.shadows), size: 1024 }
+                    };
+                    if (!full) {
+                        o.fxaa = false;
+                        o.ao = { intensity: 0 };
+                        o.ssr = { intensity: 0 };
+                        o.ssil = { intensity: 0 };
+                        o.bloom = { strength: 0 };
+                        o.volumetric = { enabled: false };
+                    }
+                    return o;
+                }
+
+                bn.axion = {
+                    name: "Axion",
+                    setup: function (canvas, sc, full) {
+                        var me = this;
+                        return Axion.App.create(canvas, options(sc, full)).then(function (app) {
+                            me.app = app;
+                            me.device = app.device;
+                            var meshes = {};
+                            function mesh(s) {
+                                if (meshes[s] === undefined) {
+                                    meshes[s] = app.mesh(geo[s]());
+                                }
+                                return meshes[s];
+                            }
+
+                            if (sc.floor) {
+                                var fm = app.material({ color: [0.55, 0.56, 0.58], roughness: 0.8, castShadow: false });
+                                app.add({ mesh: app.mesh(Axion.plane(sc.floor, sc.floor)), material: fm });
+                            }
+
+                            if (sc.instanced) {
+                                var d = sc.instanced;
+                                var im = app.material({ color: [1, 1, 1], roughness: d.rough, metallic: d.metal });
+                                app.addMany(d.list.length, mesh(d.shape), im, function (i, out) {
+                                    var e = d.list[i];
+                                    out.position[0] = e.pos[0]; out.position[1] = e.pos[1]; out.position[2] = e.pos[2];
+                                    out.rotation[0] = e.rot[0]; out.rotation[1] = e.rot[1]; out.rotation[2] = e.rot[2];
+                                    out.scale = e.scale;
+                                    out.color[0] = e.color[0]; out.color[1] = e.color[1]; out.color[2] = e.color[2];
+                                });
+                            }
+
+                            var mats = [];
+                            var i;
+                            for (i = 0; sc.mats && i < sc.mats.length; i++) {
+                                var m = sc.mats[i];
+                                mats.push(app.material({ color: m.color, roughness: m.rough, metallic: m.metal }));
+                            }
+                            for (i = 0; i < sc.objects.length; i++) {
+                                var o = sc.objects[i];
+                                app.add({ mesh: mesh(o.shape), material: mats[o.mat], position: o.pos, rotation: o.rot, scale: o.scale });
+                            }
+                            for (i = 0; i < sc.lights.length; i++) {
+                                var l = sc.lights[i];
+                                app.light(l.pos, { color: l.color, intensity: l.intensity, range: l.range });
+                            }
+
+                            if (sc.gltf) {
+                                return Axion.loadGLTF(app, AxionAssets.sponza);
+                            }
+                        });
+                    },
+                    frame: function (i, cam) {
+                        var app = this.app;
+                        app.camera.position.set(cam.pos);
+                        app.camera.target.set(cam.at);
+                        app.camera.update();
+                        app.world.step(1 / 60);
+                        app.renderer.render(app.world, app.camera, i / 60);
+                    },
+                    snap: function () {
+                        return this.app.snapshot(bn.w, bn.h);
+                    },
+                    info: function () {
+                        var s = this.app.stats;
+                        return { draws: s.drawCalls, tris: s.triangles };
+                    },
+                    dispose: function () {
+                        if (this.app) {
+                            this.app.dispose();
+                        }
+                        this.app = null;
+                    }
+                };
+            })();
+        </script>
+
+        <!-- three.js runner -->
+        <script>
+            (function () {
+                function geo(s) {
+                    if (s === "box") {
+                        return new THREE.BoxGeometry(1, 1, 1);
+                    }
+                    if (s === "sphere") {
+                        return new THREE.SphereGeometry(0.5, 32, 16);
+                    }
+                    return new THREE.TorusGeometry(0.5, 0.2, 16, 32);
+                }
+
+                function color(c) {
+                    return new THREE.Color().setRGB(c[0], c[1], c[2], THREE.LinearSRGBColorSpace);
+                }
+
+                function place(obj, e) {
+                    obj.position.set(e.pos[0], e.pos[1], e.pos[2]);
+                    obj.rotation.set(e.rot[0], e.rot[1], e.rot[2], "YXZ");
+                    obj.scale.set(e.scale[0], e.scale[1], e.scale[2]);
+                }
+
+                function loadSponza(scene) {
+                    return Axion.unpackAsset(AxionAssets.sponza).then(function (bytes) {
+                        var buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+                        return new Promise(function (ok, fail) {
+                            new GLTFLoader().parse(buf, "", function (g) {
+                                g.scene.traverse(function (o) {
+                                    if (o.isMesh) {
+                                        o.castShadow = true;
+                                        o.receiveShadow = true;
+                                    }
+                                });
+                                scene.add(g.scene);
+                                ok();
+                            }, fail);
+                        });
+                    });
+                }
+
+                bn.three = {
+                    name: "three.js",
+                    setup: function (canvas, sc, full) {
+                        var me = this;
+                        // The device is made here, like Axion makes its own, so three.js
+                        // can't quietly drop to WebGL on browsers it isn't sure about
+                        return navigator.gpu.requestAdapter({ powerPreference: "high-performance" }).then(function (a) {
+                            if (!a) {
+                                throw new Error("no WebGPU adapter for three.js");
+                            }
+                            var feats = [];
+                            a.features.forEach(function (f) {
+                                feats.push(f);
+                            });
+                            return a.requestDevice({ requiredFeatures: feats });
+                        }).then(function (dev) {
+                            me.dev = dev;
+                            var r = new THREE.WebGPURenderer({ canvas: canvas, antialias: full, device: dev });
+                            me.r = r;
+                            return r.init();
+                        }).then(function () {
+                            var r = me.r;
+                            if (!r.backend.isWebGPUBackend) {
+                                throw new Error("three.js fell back to WebGL, so the test wouldn't be fair");
+                            }
+                            me.device = r.backend.device;
+                            r.setPixelRatio(1);
+                            r.setSize(bn.w, bn.h, false);
+                            r.toneMapping = THREE.ACESFilmicToneMapping;
+                            r.shadowMap.enabled = sc.shadows > 0;
+                            r.shadowMap.type = THREE.PCFSoftShadowMap;
+                            r.setClearColor(color([0.02, 0.025, 0.035]), 1);
+
+                            var scene = new THREE.Scene();
+                            var cam = new THREE.PerspectiveCamera(60, bn.w / bn.h, 0.1, 2000);
+                            me.scene = scene;
+                            me.cam = cam;
+
+                            // Axion's default sky and ground ambient
+                            scene.add(new THREE.HemisphereLight(color([0.15, 0.19, 0.26]), color([0.036, 0.044, 0.06]), 3.14));
+
+                            if (sc.floor) {
+                                var f = new THREE.Mesh(
+                                    new THREE.PlaneGeometry(sc.floor, sc.floor),
+                                    new THREE.MeshStandardMaterial({ color: color([0.55, 0.56, 0.58]), roughness: 0.8 })
+                                );
+                                f.rotation.x = -Math.PI / 2;
+                                f.receiveShadow = true;
+                                scene.add(f);
+                            }
+
+                            var i;
+                            if (sc.instanced) {
+                                var d = sc.instanced;
+                                var im = new THREE.InstancedMesh(
+                                    geo(d.shape),
+                                    new THREE.MeshStandardMaterial({ roughness: d.rough, metalness: d.metal }),
+                                    d.list.length
+                                );
+                                var tmp = new THREE.Object3D();
+                                for (i = 0; i < d.list.length; i++) {
+                                    place(tmp, d.list[i]);
+                                    tmp.updateMatrix();
+                                    im.setMatrixAt(i, tmp.matrix);
+                                    im.setColorAt(i, color(d.list[i].color));
+                                }
+                                im.computeBoundingSphere();
+                                scene.add(im);
+                            }
+
+                            var geos = {};
+                            var mats = [];
+                            for (i = 0; sc.mats && i < sc.mats.length; i++) {
+                                var m = sc.mats[i];
+                                mats.push(new THREE.MeshStandardMaterial({ color: color(m.color), roughness: m.rough, metalness: m.metal }));
+                            }
+                            for (i = 0; i < sc.objects.length; i++) {
+                                var o = sc.objects[i];
+                                if (!geos[o.shape]) {
+                                    geos[o.shape] = geo(o.shape);
+                                }
+                                var mesh = new THREE.Mesh(geos[o.shape], mats[o.mat]);
+                                place(mesh, o);
+                                mesh.castShadow = true;
+                                mesh.receiveShadow = true;
+                                scene.add(mesh);
+                            }
+
+                            for (i = 0; i < sc.lights.length; i++) {
+                                var l = sc.lights[i];
+                                var pl = new THREE.PointLight(color(l.color), l.intensity, l.range, 2);
+                                pl.position.set(l.pos[0], l.pos[1], l.pos[2]);
+                                if (l.shadow) {
+                                    pl.castShadow = true;
+                                    pl.shadow.mapSize.set(1024, 1024);
+                                    pl.shadow.camera.near = 0.1;
+                                    pl.shadow.bias = -0.002;
+                                }
+                                scene.add(pl);
+                            }
+
+                            if (sc.gltf) {
+                                return loadSponza(scene);
+                            }
+                        });
+                    },
+                    frame: function (i, c) {
+                        this.cam.position.set(c.pos[0], c.pos[1], c.pos[2]);
+                        this.cam.lookAt(c.at[0], c.at[1], c.at[2]);
+                        this.r.render(this.scene, this.cam);
+                    },
+                    snap: function () {
+                        var out = document.createElement("canvas");
+                        out.width = bn.w;
+                        out.height = bn.h;
+                        out.getContext("2d").drawImage(this.r.domElement, 0, 0);
+                        return out;
+                    },
+                    info: function () {
+                        // three.js clears its counters every frame, so count one frame by hand
+                        var inf = this.r.info;
+                        inf.autoReset = false;
+                        inf.reset();
+                        this.r.render(this.scene, this.cam);
+                        var out = { draws: inf.render.drawCalls, tris: inf.render.triangles };
+                        inf.autoReset = true;
+                        return out;
+                    },
+                    dispose: function () {
+                        if (this.scene) {
+                            this.scene.traverse(function (o) {
+                                if (o.geometry) {
+                                    o.geometry.dispose();
+                                }
+                                if (o.material) {
+                                    var list = [].concat(o.material);
+                                    for (var i = 0; i < list.length; i++) {
+                                        for (var k in list[i]) {
+                                            if (list[i][k] && list[i][k].isTexture) {
+                                                list[i][k].dispose();
+                                            }
+                                        }
+                                        list[i].dispose();
+                                    }
+                                }
+                            });
+                        }
+                        if (this.r) {
+                            this.r.dispose();
+                        }
+                        if (this.dev) {
+                            this.dev.destroy();
+                        }
+                        this.r = null;
+                        this.dev = null;
+                        this.scene = null;
+                    }
+                };
+            })();
+        </script>
+
+        <!-- The test itself -->
+        <script>
+            (function () {
+                var stage = document.getElementById("stage");
+                var tag = document.getElementById("tag");
+
+                function heap() {
+                    return performance.memory ? performance.memory.usedJSHeapSize / 1048576 : NaN;
+                }
+
+                function freshCanvas() {
+                    var old = stage.querySelector("canvas");
+                    if (old) {
+                        old.remove();
+                    }
+                    var c = document.createElement("canvas");
+                    c.width = bn.w;
+                    c.height = bn.h;
+                    stage.insertBefore(c, tag);
+                    return c;
+                }
+
+                function sorted(list) {
+                    return list.slice().sort(function (a, b) {
+                        return a - b;
+                    });
+                }
+
+                function avg(list) {
+                    var s = 0;
+                    for (var i = 0; i < list.length; i++) {
+                        s += list[i];
+                    }
+                    return s / list.length;
+                }
+
+                // Renders frame after frame, waiting for the GPU each time
+                function uncapped(eng, sc, count) {
+                    var cpu = [];
+                    var total = [];
+                    var i = 0;
+                    function step() {
+                        if (i >= count) {
+                            return Promise.resolve();
+                        }
+                        var t0 = performance.now();
+                        eng.frame(1000 + i, sc.camera(1000 + i));
+                        var t1 = performance.now();
+                        return eng.device.queue.onSubmittedWorkDone().then(function () {
+                            cpu.push(t1 - t0);
+                            total.push(performance.now() - t0);
+                            i++;
+                            // Give the page a breath every so often so it stays responsive
+                            if (i % 30 === 0) {
+                                return bn.wait(0).then(step);
+                            }
+                            return step();
+                        });
+                    }
+                    return step().then(function () {
+                        var s = sorted(total);
+                        return {
+                            cpu: avg(cpu),
+                            ms: avg(total),
+                            p95: s[Math.floor(s.length * 0.95)]
+                        };
+                    });
+                }
+
+                // A normal render loop, capped by the display
+                function locked(eng, sc, count) {
+                    var gaps = [];
+                    var last = 0;
+                    var i = 0;
+                    return new Promise(function (ok) {
+                        function tick(now) {
+                            if (last) {
+                                gaps.push(now - last);
+                            }
+                            last = now;
+                            eng.frame(3000 + i, sc.camera(3000 + i));
+                            i++;
+                            if (i <= count) {
+                                requestAnimationFrame(tick);
+                            } else {
+                                var s = sorted(gaps);
+                                var worst = s.slice(Math.floor(s.length * 0.99));
+                                ok({ fps: 1000 / avg(gaps), low: 1000 / avg(worst) });
+                            }
+                        }
+                        requestAnimationFrame(tick);
+                    });
+                }
+
+                function runOne(eng, key, full, frames, doLocked) {
+                    var sc = bn.scenes[key]();
+                    var res = { engine: eng.name, scene: sc.name, key: key };
+                    var canvas = freshCanvas();
+                    tag.textContent = eng.name + " · " + sc.name;
+                    tag.className = eng === bn.axion ? "ax" : "th";
+                    var h0 = heap();
+                    var t0 = performance.now();
+
+                    bn.status(eng.name + ": building " + sc.name + "…");
+                    return eng.setup(canvas, sc, full).then(function () {
+                        eng.frame(0, sc.camera(0));
+                        return eng.device.queue.onSubmittedWorkDone();
+                    }).then(function () {
+                        res.setup = performance.now() - t0;
+
+                        // Warm up so shader compiles and first-use costs don't count
+                        bn.status(eng.name + ": warming up…");
+                        return uncapped(eng, sc, 20);
+                    }).then(function () {
+                        bn.status(eng.name + ": uncapped, " + frames + " frames…");
+                        return uncapped(eng, sc, frames);
+                    }).then(function (u) {
+                        res.ms = u.ms;
+                        res.cpu = u.cpu;
+                        res.p95 = u.p95;
+                        var inf = eng.info();
+                        res.draws = inf.draws;
+                        res.tris = inf.tris;
+                        res.heap = heap() - h0;
+                        if (!doLocked) {
+                            return null;
+                        }
+                        bn.status(eng.name + ": refresh-locked…");
+                        return locked(eng, sc, Math.min(frames, 240));
+                    }).then(function (l) {
+                        res.fps = l ? l.fps : NaN;
+                        res.low = l ? l.low : NaN;
+
+                        // Quality shot at a fixed point on the path
+                        eng.frame(0, sc.camera(200));
+                        var shot = eng.snap();
+                        if (!bn.shots[key]) {
+                            bn.shots[key] = { name: sc.name };
+                        }
+                        bn.shots[key][eng === bn.axion ? "ax" : "th"] = shot.toDataURL("image/jpeg", 0.9);
+                    }).catch(function (e) {
+                        res.error = e && e.message ? e.message : String(e);
+                    }).then(function () {
+                        eng.dispose();
+                        bn.results.push(res);
+                        bn.show();
+                        return bn.wait(400);
+                    });
+                }
+
+                bn.run = function () {
+                    var key = document.getElementById("scene").value;
+                    var full = document.getElementById("preset").value === "full";
+                    var frames = Math.max(30, parseInt(document.getElementById("frames").value, 10) || 300);
+                    var doLocked = document.getElementById("locked").checked;
+                    var keys = key === "all" ? bn.sceneNames.slice() : [key];
+                    var btn = document.getElementById("run");
+
+                    bn.results = [];
+                    bn.shots = {};
+                    bn.show();
+                    btn.disabled = true;
+
+                    var chain = Promise.all([bn.axionReady, bn.threeReady]);
+                    if (keys.indexOf("sponza") >= 0 && !window.AxionAssets) {
+                        chain = chain.then(function () {
+                            bn.status("loading Sponza (16 MB)…");
+                            return bn.loadScript(bn.sponzaUrl);
+                        });
+                    }
+
+                    // Axion then three.js for each scene
+                    keys.forEach(function (k) {
+                        chain = chain.then(function () {
+                            return runOne(bn.axion, k, full, frames, doLocked);
+                        }).then(function () {
+                            return runOne(bn.three, k, full, frames, doLocked);
+                        });
+                    });
+
+                    return chain.then(function () {
+                        bn.status("done.");
+                        tag.textContent = "";
+                        btn.disabled = false;
+                        window.__result = { done: true, ok: bn.results.every(function (r) { return !r.error; }), results: bn.results };
+                    }, function (e) {
+                        bn.status("error: " + e.message);
+                        btn.disabled = false;
+                        window.__result = { done: true, ok: false, error: e.message };
+                    });
+                };
+
+                document.getElementById("run").onclick = bn.run;
+
+                Promise.all([bn.axionReady, bn.threeReady]).then(function () {
+                    if (!navigator.gpu) {
+                        bn.status("This browser doesn't support WebGPU.");
+                        return;
+                    }
+                    bn.status("ready. Axion " + Axion.VERSION + ", three.js r" + THREE.REVISION + ". Press Run.");
+                    if (bn.auto) {
+                        var m = /[?&]scene=(\w+)/.exec(location.search);
+                        var f = /[?&]frames=(\d+)/.exec(location.search);
+                        if (m) {
+                            document.getElementById("scene").value = m[1];
+                        }
+                        if (f) {
+                            document.getElementById("frames").value = f[1];
+                        }
+                        document.getElementById("locked").checked = false;
+                        bn.run();
+                    }
+                });
+            })();
+        </script>
+
+        <!-- Results table, bars and the image compare -->
+        <script>
+            (function () {
+                var out = document.getElementById("results");
+                var bars = document.getElementById("bars");
+                var compare = document.getElementById("compare");
+                var shots = document.getElementById("shots");
+
+                function num(v, d) {
+                    return isNaN(v) || v === undefined ? "–" : v.toFixed(d);
+                }
+
+                function pair(key) {
+                    var a = null;
+                    var t = null;
+                    for (var i = 0; i < bn.results.length; i++) {
+                        var r = bn.results[i];
+                        if (r.key === key && !r.error) {
+                            if (r.engine === "Axion") {
+                                a = r;
+                            } else {
+                                t = r;
+                            }
+                        }
+                    }
+                    return { a: a, t: t };
+                }
+
+                var cols = [
+                    ["Setup ms", "setup", 0, true],
+                    ["Frame ms (CPU+GPU)", "ms", 2, true],
+                    ["Uncapped fps", "ufps", 0, false],
+                    ["95% ms", "p95", 2, true],
+                    ["CPU ms", "cpu", 2, true],
+                    ["Locked fps", "fps", 0, false],
+                    ["1% low fps", "low", 0, false],
+                    ["Draw calls", "draws", 0, true],
+                    ["Triangles", "tris", 0, null],
+                    ["JS heap MB", "heap", 1, true]
+                ];
+
+                function tableHtml() {
+                    var h = "<table><tr><th>Scene</th><th>Engine</th>";
+                    var i, j;
+                    for (i = 0; i < cols.length; i++) {
+                        h += "<th>" + cols[i][0] + "</th>";
+                    }
+                    h += "</tr>";
+                    for (i = 0; i < bn.results.length; i++) {
+                        var r = bn.results[i];
+                        r.ufps = 1000 / r.ms;
+                        var cls = r.engine === "Axion" ? "ax" : "th";
+                        h += "<tr><td>" + r.scene + "</td><td class='" + cls + "'>" + r.engine + "</td>";
+                        if (r.error) {
+                            h += "<td colspan='" + cols.length + "' style='text-align: left; color: rgb(236, 112, 99);'>" + r.error + "</td></tr>";
+                            continue;
+                        }
+                        var p = pair(r.key);
+                        var other = r.engine === "Axion" ? p.t : p.a;
+                        for (j = 0; j < cols.length; j++) {
+                            var c = cols[j];
+                            var v = r[c[1]];
+                            var win = "";
+                            if (other && c[3] !== null && !isNaN(v) && !isNaN(other[c[1]])) {
+                                var better = c[3] ? v < other[c[1]] : v > other[c[1]];
+                                win = better ? " class='win'" : "";
+                            }
+                            h += "<td" + win + ">" + num(v, c[2]) + "</td>";
+                        }
+                        h += "</tr>";
+                    }
+                    return h + "</table>";
+                }
+
+                function barsHtml() {
+                    var h = "";
+                    for (var k = 0; k < bn.sceneNames.length; k++) {
+                        var p = pair(bn.sceneNames[k]);
+                        if (!p.a || !p.t) {
+                            continue;
+                        }
+                        var top = Math.max(p.a.ms, p.t.ms);
+                        var k2 = p.t.ms / p.a.ms;
+                        var verdict = k2 >= 1 ? "Axion " + k2.toFixed(2) + "× faster" : "three.js " + (1 / k2).toFixed(2) + "× faster";
+                        h += "<div style='margin: 10px 0 4px; color: rgb(212, 219, 227);'>" + p.a.scene + " — <b>" + verdict + "</b></div>";
+                        h += "<div class='row'><span class='ax'>Axion</span><div class='track'><div class='fill' style='width: " + (p.a.ms / top * 100) + "%; background: rgb(242, 164, 61);'></div></div><span>" + p.a.ms.toFixed(2) + " ms</span></div>";
+                        h += "<div class='row'><span class='th'>three.js</span><div class='track'><div class='fill' style='width: " + (p.t.ms / top * 100) + "%; background: rgb(89, 181, 199);'></div></div><span>" + p.t.ms.toFixed(2) + " ms</span></div>";
+                    }
+                    return h || "Nothing yet.";
+                }
+
+                function showCompare(key) {
+                    var s = bn.shots[key];
+                    if (!s || !s.ax || !s.th) {
+                        return;
+                    }
+                    compare.innerHTML =
+                        "<img src='" + s.th + "'>" +
+                        "<div class='top' style='width: 50%;'><img src='" + s.ax + "'></div>" +
+                        "<span class='ax' style='left: 8px;'>Axion</span>" +
+                        "<span class='th' style='right: 8px;'>three.js</span>";
+                    var top = compare.querySelector(".top");
+                    var inner = top.querySelector("img");
+                    function size() {
+                        inner.style.width = compare.clientWidth + "px";
+                    }
+                    size();
+                    function move(e) {
+                        var b = compare.getBoundingClientRect();
+                        var x = Math.max(0, Math.min(1, (e.clientX - b.left) / b.width));
+                        top.style.width = (x * 100) + "%";
+                    }
+                    compare.onpointermove = move;
+                    compare.onpointerdown = move;
+                    window.addEventListener("resize", size);
+                }
+
+                bn.show = function () {
+                    out.innerHTML = bn.results.length ? tableHtml() : "Nothing yet.";
+                    bars.innerHTML = barsHtml();
+
+                    shots.innerHTML = "";
+                    var first = null;
+                    for (var i = 0; i < bn.sceneNames.length; i++) {
+                        var key = bn.sceneNames[i];
+                        var s = bn.shots[key];
+                        if (!s || !s.ax) {
+                            continue;
+                        }
+                        if (!first && s.th) {
+                            first = key;
+                        }
+                        var img = document.createElement("img");
+                        img.src = s.ax;
+                        img.title = s.name;
+                        img.onclick = showCompare.bind(null, key);
+                        shots.appendChild(img);
+                    }
+                    if (first && !compare.firstChild) {
+                        showCompare(first);
+                    }
+                    if (!bn.results.length) {
+                        compare.innerHTML = "";
+                    }
+                };
+            })();
+        </script>
+    </body>
+</html>

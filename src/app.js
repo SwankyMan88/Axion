@@ -302,6 +302,13 @@ export class App {
 
   get stats() { return this.renderer.stats; }
 
+  /**
+   * Static objects are uploaded to the GPU once. Adding or removing objects and
+   * changing materials is noticed on its own; call this after writing the
+   * components of a static (non-Dynamic) object by hand.
+   */
+  refresh() { this.renderer.invalidate(); return this; }
+
   dispose() {
     if (this.disposed) return;
     this.disposed = true;

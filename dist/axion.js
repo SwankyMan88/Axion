@@ -1,4 +1,4 @@
-/*! Axion 0.9.4 — WebGPU, data-oriented 3D engine. MIT. */
+/*! Axion 0.9.6 — WebGPU, data-oriented 3D engine. MIT. */
 var Axion = (() => {
   var __defProp = Object.defineProperty;
   var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -2196,14 +2196,24 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
     return vec4<f32>(sanitize(applyVolume(sky, in.uv)), 1.0);
   }
 
-  let surf = textureSampleLevel(surfaceTex, texSampler, in.uv, 0.0);
-  let albedo = textureSampleLevel(albedoTex, texSampler, in.uv, 0.0).rgb;
+  // Loaded, not filtered: the water flag and its packed reflection must not
+  // blend with a neighbouring pixel
+  let surf = textureLoad(surfaceTex, pixelOf(in.uv), 0);
+  let alb4 = textureLoad(albedoTex, pixelOf(in.uv), 0);
   let aoGi = textureSampleLevel(aoTex, texSampler, in.uv, 0.0);
   let ao = aoGi.a;
 
+  // Water (metallic 2) keeps a reflection of the land in its albedo slot
+  let water = surf.w > 1.5;
+  var albedo = alb4.rgb;
+  var metallic = surf.w;
+  if (water) {
+    albedo = vec3<f32>(0.0);
+    metallic = 0.0;
+  }
+
   let N = octDecode(surf.xy);
   let roughness = surf.z;
-  let metallic = surf.w;
 
   let P = viewPosFromUV(in.uv, d, camera.proj);
   let V = normalize(-P);
@@ -2234,6 +2244,18 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   // colour premultiplied by how sure the hit is, and that certainty in alpha.
   let Rworld = normalize((camera.invView * vec4<f32>(R, 0.0)).xyz);
   var reflected = environment(Rworld, roughness);
+  if (water && alb4.a > 0.01) {
+    // The land the water saw by marching the heightmap, hazed by the air
+    // along the reflected ray like everything else at that distance
+    let dist = -800.0 * log(max(1.0 - (alb4.a - 0.02) / 0.98, 1e-4));
+    var land = alb4.rgb * alb4.rgb * 8.0;
+    var haze = camera.fog.rgb;
+    if (camera.sky.x > 0.5) {
+      haze = skyRadiance(normalize(vec3<f32>(Rworld.x, max(Rworld.y, 0.0) * 0.5 + 0.03, Rworld.z)));
+    }
+    land = mix(land, haze, fogAmount(Rworld, dist));
+    reflected = land;
+  }
   let ssr = textureLoad(ssrTex, pixelOf(in.uv), 0);
   reflected = reflected * (1.0 - clamp(ssr.a, 0.0, 1.0)) + ssr.rgb;
 
@@ -6273,6 +6295,81 @@ fn waveSlope(xz : vec2<f32>, t : f32) -> vec2<f32> {
   return g;
 }
 
+/**
+ * What the lake mirrors where the screen has no picture of it (off the edge of
+ * the screen, or hidden behind something near): the reflected ray is marched
+ * over the heightmap itself, with forest canopy standing on the ground where
+ * the map says there is forest. Returns the lit colour and the distance, or a
+ * negative distance when the ray only finds sky.
+ */
+fn mirrorMarch(start : vec3<f32>, R : vec3<f32>) -> vec4<f32> {
+  if (R.y > 0.6) { return vec4<f32>(0.0, 0.0, 0.0, -1.0); }
+  var t = 1.5;
+  var prev = 0.0;
+  var hit = false;
+  for (var i = 0; i < 64; i = i + 1) {
+    let p = start + R * t;
+    if (p.y > 700.0 || t > 1800.0) { break; }
+    if (p.y < canopyTop(p.xz)) { hit = true; break; }
+    prev = t;
+    t = t + 1.0 + t * 0.1;
+  }
+  if (!hit) { return vec4<f32>(0.0, 0.0, 0.0, -1.0); }
+  // Close in on the crossing
+  var lo = prev;
+  var hi = t;
+  for (var k = 0; k < 5; k = k + 1) {
+    let mid = (lo + hi) * 0.5;
+    let q = start + R * mid;
+    if (q.y < canopyTop(q.xz)) { hi = mid; } else { lo = mid; }
+  }
+  let p = start + R * hi;
+  let uvT = terrainUV(p.xz);
+  let h = heightAt(p.xz);
+  var N = normalize(textureSampleLevel(normalTex, clampSampler, uvT, 0.0).xyz * 2.0 - 1.0);
+  let splat = textureSampleLevel(splatTex, clampSampler, uvT, 0.0);
+
+  // The ground's colour: each layer's average, mixed as the ground mixes them
+  var w = array<f32, 5>(max(1.0 - (splat.r + splat.g + splat.b + splat.a), 0.0), splat.r, splat.g, splat.b, splat.a);
+  if (tp.rock.x >= 0.0) {
+    let rw = smoothstep(tp.rock.y, tp.rock.z, 1.0 - N.y) * tp.rock.w;
+    for (var j = 0; j < 5; j = j + 1) { w[j] = w[j] * (1.0 - rw); }
+    w[i32(tp.rock.x)] = w[i32(tp.rock.x)] + rw;
+  }
+  var col = vec3<f32>(0.0);
+  var total = 0.0;
+  let count = min(i32(tp.info3.z), 5);
+  for (var j = 0; j < count; j = j + 1) {
+    let avg = textureSampleLevel(albedoArr, repeatSampler, vec2<f32>(0.5), j, 16.0).rgb * tp.tint[j].rgb;
+    col = col + avg * w[j];
+    total = total + w[j];
+  }
+  col = col / max(total, 1e-4);
+  if (tp.snow.w > 0.0) {
+    let sw = smoothstep(tp.snow.x, tp.snow.y, p.y) * (1.0 - smoothstep(tp.snow.z * 0.6, tp.snow.z, 1.0 - N.y));
+    col = mix(col, vec3<f32>(0.8, 0.83, 0.88), sw * tp.snow.w);
+  }
+  // Treetops: dark needles, lit mostly from above
+  if (p.y > h + 1.0) {
+    col = vec3<f32>(0.035, 0.06, 0.03);
+    N = normalize(N + vec3<f32>(0.0, 1.5, 0.0));
+  }
+  let L = camera.sunDir.xyz;
+  var sun = vec3<f32>(0.0);
+  if (camera.sunDir.w > 0.5) {
+    sun = camera.sunColor.rgb * max(dot(N, L), 0.0) * horizonShadow(p + N * 2.0);
+  }
+  let lit = col * (sun + camera.ambient.rgb * (0.6 + 0.4 * N.y));
+  return vec4<f32>(lit, hi);
+}
+
+/** Top of the ground at xz, with the forest canopy on it where there is forest. */
+fn canopyTop(xz : vec2<f32>) -> f32 {
+  let h = heightAt(xz);
+  let forest = textureSampleLevel(splatTex, clampSampler, terrainUV(xz), 0.0).r;
+  return h + smoothstep(0.25, 0.6, forest) * 14.0;
+}
+
 @fragment
 fn fsWater(in : WOut) -> GBuffer {
   let world = in.world;
@@ -6310,8 +6407,22 @@ fn fsWater(in : WOut) -> GBuffer {
   s.roughness = mix(0.035, 0.6, foam);
   s.metallic = 0.0;
   s.translucency = 0.0;
-  let Lo = shadeDirect(s, in.clip.xy);
-  return gbuffer(Lo, 1.0, N, albedo, s.roughness, 0.0);
+  // The water's own sky light: the resolve leaves water out of its ambient,
+  // because water's albedo slot carries the reflection below instead
+  let Lo = shadeDirect(s, in.clip.xy) + albedo * camera.ambient.rgb;
+
+  // The fallback reflection, packed into the albedo target: colour (square
+  // root, over 8) and the distance it was found at (0 = only sky)
+  let R2 = reflect(-V, N);
+  let m = mirrorMarch(world + vec3<f32>(0.0, 0.05, 0.0), R2);
+  var out = gbuffer(Lo, 1.0, N, albedo, s.roughness, 0.0);
+  if (m.w > 0.0) {
+    out.albedo = vec4<f32>(sqrt(clamp(m.rgb / 8.0, vec3<f32>(0.0), vec3<f32>(1.0))), 0.02 + 0.98 * (1.0 - exp(-m.w / 800.0)));
+  } else {
+    out.albedo = vec4<f32>(0.0);
+  }
+  out.surface.w = 2.0;          // marks water for the resolve
+  return out;
 }
 
 /* ---------------------------------------------------------------- grass */
@@ -8260,6 +8371,6 @@ fn vs(@builtin(instance_index) ii : u32, @location(0) grid : vec3<f32>) -> @buil
   }
 
   // src/index.js
-  var VERSION = "0.9.4";
+  var VERSION = "0.9.6";
   return __toCommonJS(index_exports);
 })();

@@ -1857,14 +1857,24 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
     return vec4<f32>(sanitize(applyVolume(sky, in.uv)), 1.0);
   }
 
-  let surf = textureSampleLevel(surfaceTex, texSampler, in.uv, 0.0);
-  let albedo = textureSampleLevel(albedoTex, texSampler, in.uv, 0.0).rgb;
+  // Loaded, not filtered: the water flag and its packed reflection must not
+  // blend with a neighbouring pixel
+  let surf = textureLoad(surfaceTex, pixelOf(in.uv), 0);
+  let alb4 = textureLoad(albedoTex, pixelOf(in.uv), 0);
   let aoGi = textureSampleLevel(aoTex, texSampler, in.uv, 0.0);
   let ao = aoGi.a;
 
+  // Water (metallic 2) keeps a reflection of the land in its albedo slot
+  let water = surf.w > 1.5;
+  var albedo = alb4.rgb;
+  var metallic = surf.w;
+  if (water) {
+    albedo = vec3<f32>(0.0);
+    metallic = 0.0;
+  }
+
   let N = octDecode(surf.xy);
   let roughness = surf.z;
-  let metallic = surf.w;
 
   let P = viewPosFromUV(in.uv, d, camera.proj);
   let V = normalize(-P);
@@ -1895,6 +1905,18 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   // colour premultiplied by how sure the hit is, and that certainty in alpha.
   let Rworld = normalize((camera.invView * vec4<f32>(R, 0.0)).xyz);
   var reflected = environment(Rworld, roughness);
+  if (water && alb4.a > 0.01) {
+    // The land the water saw by marching the heightmap, hazed by the air
+    // along the reflected ray like everything else at that distance
+    let dist = -800.0 * log(max(1.0 - (alb4.a - 0.02) / 0.98, 1e-4));
+    var land = alb4.rgb * alb4.rgb * 8.0;
+    var haze = camera.fog.rgb;
+    if (camera.sky.x > 0.5) {
+      haze = skyRadiance(normalize(vec3<f32>(Rworld.x, max(Rworld.y, 0.0) * 0.5 + 0.03, Rworld.z)));
+    }
+    land = mix(land, haze, fogAmount(Rworld, dist));
+    reflected = land;
+  }
   let ssr = textureLoad(ssrTex, pixelOf(in.uv), 0);
   reflected = reflected * (1.0 - clamp(ssr.a, 0.0, 1.0)) + ssr.rgb;
 

@@ -9,7 +9,7 @@
  *   app.start();
  */
 
-export const VERSION = '0.9.3';
+export const VERSION = '0.9.4';
 
 export { App } from './app.js';
 export { World, defineComponent, entityIndex, entityGen, NULL_ENTITY } from './core/ecs.js';

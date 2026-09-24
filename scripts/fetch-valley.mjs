@@ -22,7 +22,7 @@ const MODELS = [
   'fir_sapling', 'island_tree_01', 'island_tree_02',
   'rock_moss_set_01', 'rock_moss_set_02', 'boulder_01', 'stone_01', 'rock_07', 'rock_face_01',
   'rock_face_02', 'mountainside', 'dead_tree_trunk', 'dead_tree_trunk_02', 'tree_stump_01',
-  'tree_stump_02', 'root_cluster_01', 'dry_branches_medium_01', 'fern_02', 'shrub_04', 'dandelion_01',
+  'tree_stump_02', 'root_cluster_01', 'dry_branches_medium_01', 'fern_02', 'shrub_04', 'shrub_02', 'dandelion_01',
   'stone_fire_pit', 'wooden_lantern_01', 'wooden_picnic_table', 'painted_wooden_bench',
   'wooden_barrels_01', 'wooden_crate_01', 'wooden_crate_02', 'wooden_bucket_01',
   'modular_wooden_pier', 'modular_fort_01',

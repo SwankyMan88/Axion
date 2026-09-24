@@ -28,9 +28,11 @@ Credit is not required by CC0, but thanks to the Poly Haven artists and supporte
 The recordings in `pine-valley-2.js` are from [Freesound](https://freesound.org), all released
 under CC0 (public domain), trimmed, looped and re-encoded:
 
-- Lake: [Gentle waves on a lake](https://freesound.org/s/614299/)
+- Lake: [Waves lapping on rocks](https://freesound.org/s/457956/)
+- Leaves: [Forest, close up of trees rustling in the wind](https://freesound.org/s/523389/)
+- Bushes: [Bushes Rustling](https://freesound.org/s/117884/)
 - Birds: [sfx_amb_forest_spring_afternoon-01](https://freesound.org/s/385280/)
 - Wind: [wind in the trees](https://freesound.org/s/150174/)
 - Campfire: [Crackling Fire](https://freesound.org/s/204348/)
 - Crickets: [Night Crickets Back Porch](https://freesound.org/s/333221/)
-- Footsteps: [Footsteps_Grass_1](https://freesound.org/s/389625/), [footsteps on wood](https://freesound.org/s/198962/), [Splashing Footsteps Shallow Water](https://freesound.org/s/861369/)
+- Footsteps: [Footsteps_Grass_1](https://freesound.org/s/389625/), [footsteps on wood](https://freesound.org/s/198962/), [Splashing Footsteps Shallow Water](https://freesound.org/s/861369/), [Gravel road walk](https://freesound.org/s/274832/), [Footsteps Dirt 01](https://freesound.org/s/264469/), [Footsteps stone + sneaker](https://freesound.org/s/677069/), [Forest dry leaves walk](https://freesound.org/s/274833/)

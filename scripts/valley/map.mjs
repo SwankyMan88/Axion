@@ -505,6 +505,21 @@ export function buildPlacements(h) {
     }
   }
 
+  // --- Bushes: in clumps through the forest and along its edges ---
+  const bushes = ['bush_a', 'bush_b', 'bush_c', 'bush_d'];
+  for (let i = 0; i < 7000; i++) {
+    const px = (rng() - 0.5) * SIZE * 0.9, pz = (rng() - 0.5) * SIZE * 0.9;
+    if (!free(px, pz, 1)) continue;
+    const f = forestAmount(px, pz);
+    if (f < 0.3 || slopeAt(h, px, pz) > 0.4 || sampleHeight(h, px, pz) > 200) continue;
+    const n = 2 + Math.floor(rng() * 5);
+    for (let k = 0; k < n; k++) {
+      const bx = px + (rng() - 0.5) * 6, bz = pz + (rng() - 0.5) * 6;
+      if (!free(bx, bz, 0) || !clear(bx, bz, 1.6)) continue;
+      put(pick(bushes), bx, bz, rng() * 6.28, 1.3 + rng() * 0.9, -0.1);
+    }
+  }
+
   // --- Camp ---
   const cx = CAMP.x, cz = CAMP.z;
   put('firepit', cx, cz, 0.3, 1, -0.05);

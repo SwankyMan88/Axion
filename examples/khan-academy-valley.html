@@ -314,7 +314,7 @@
             <div id="bar"><div id="thumb"></div></div>
         </div>
 
-        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.9.3/dist/axion.min.js"></script><!-- My 3D engine Axion -->
+        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.9.4/dist/axion.min.js"></script><!-- My 3D engine Axion -->
 
         <!-- Shared state -->
         <script>
@@ -322,7 +322,7 @@
                 var vl = window.vl = {};
 
                 // Where the world's asset packs live
-                vl.base = "https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.9.3/assets/";
+                vl.base = "https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.9.4/assets/";
                 // The world comes in two files; each holds some of the packs
                 vl.files = ["pine-valley-1", "pine-valley-2"];
                 vl.packs = [
@@ -582,7 +582,10 @@
                     radius: 0.32,
                     maxSlope: 0.62,      // steepest walkable ground, as the up component of its normal
                     spheres: [0.6, 1.05, 1.45],
-                    found: []
+                    found: [],
+                    plants: [],          // bushes and ferns: no collision, only a rustle
+                    plantGrid: {},
+                    floorId: -1          // the object stood on, or -1 for the ground
                 };
 
                 function key(ix, iz) {
@@ -593,8 +596,13 @@
                 // collider triangles (local space) or, for trees, the trunk radius.
                 phys.add = function (x, y, z, yaw, s, model) {
                     var ex = model.extras || {};
+                    if (ex.kind === "bush" || /^fern|^shrub/.test(model.name || "")) {
+                        var sz = ex.size || [1, 1, 1];
+                        phys.plants.push({ x: x, z: z, r: 0.45 * Math.max(sz[0], sz[2]) * s, top: y + sz[1] * s, big: ex.kind === "bush" });
+                        return;
+                    }
                     var o = {
-                        x: x, y: y, z: z, yaw: yaw, s: s,
+                        x: x, y: y, z: z, yaw: yaw, s: s, name: model.name || "",
                         trunk: 0, height: 0, col: null, r: 1
                     };
                     if (ex.kind === "tree") {
@@ -623,6 +631,17 @@
                         grid[k].push(i);
                     }
                     phys.grid = grid;
+
+                    var pg = {};
+                    for (i = 0; i < phys.plants.length; i++) {
+                        var pl = phys.plants[i];
+                        var pk = key(Math.floor(pl.x / 8), Math.floor(pl.z / 8));
+                        if (!pg[pk]) {
+                            pg[pk] = [];
+                        }
+                        pg[pk].push(pl);
+                    }
+                    phys.plantGrid = pg;
                     phys.ready = true;
                 };
 
@@ -737,8 +756,35 @@
                     vl.status("ready · " + near.length + " objects near, " + tris + " triangles");
                 };
 
+                // How deep into a bush or fern the point x, z is (0 = not in one)
+                phys.inPlant = function (x, y, z) {
+                    var cx = Math.floor(x / 8), cz = Math.floor(z / 8);
+                    var most = 0;
+                    for (var ix = cx - 1; ix <= cx + 1; ix++) {
+                        for (var iz = cz - 1; iz <= cz + 1; iz++) {
+                            var list = phys.plantGrid[key(ix, iz)];
+                            if (!list) {
+                                continue;
+                            }
+                            for (var i = 0; i < list.length; i++) {
+                                var pl = list[i];
+                                if (y > pl.top + 0.2) {
+                                    continue;
+                                }
+                                var dx = x - pl.x, dz = z - pl.z;
+                                var d = Math.sqrt(dx * dx + dz * dz);
+                                if (d < pl.r) {
+                                    most = Math.max(most, (1 - d / pl.r) * (pl.big ? 1 : 0.6));
+                                }
+                            }
+                        }
+                    }
+                    return most;
+                };
+
                 // Highest walkable surface under x, z at or below `top`
                 phys.floor = function (x, top, z) {
+                    phys.floorId = -1;
                     var best = phys.terrain.heightAt(x, z);
                     var swim = phys.water - phys.swimDepth;
                     if (best < swim) {
@@ -776,6 +822,7 @@
                             var y = w1 * ay + w2 * by + w3 * cy;
                             if (y <= top && y > best) {
                                 best = y;
+                                phys.floorId = +id;
                             }
                         }
                     }
@@ -2049,7 +2096,8 @@
                                         continue;
                                     }
                                     var ddx = o.x - cam.x, ddz = o.z - cam.z;
-                                    var dd = ddx * ddx + ddz * ddz;
+                                    var ddy = o.y + o.height * 0.7 - cam.eyeY;
+                                    var dd = ddx * ddx + ddy * ddy + ddz * ddz;
                                     if (dd < 45 * 45) {
                                         found.push([dd, o]);
                                     }
@@ -2074,11 +2122,25 @@
                     }
 
                     var ground = t.heightAt(cam.x, cam.z);
-                    var surface = "grass";
+                    var surface = surfaceAt(cam.x, cam.z);
                     if (cam.swim) {
                         surface = "water";
-                    } else if (cam.y > ground + 0.25) {
-                        surface = "wood";
+                    } else if (vl.phys.floorId >= 0 && cam.y > ground + 0.1) {
+                        // Standing on something: the pier, a log, a rock or the fort
+                        var on = vl.phys.objs[vl.phys.floorId].name;
+                        surface = /pier|log|stump|dead|table|bench|crate|barrel/.test(on) ? "wood" : "stone";
+                    }
+
+                    // Pushing through a bush: a rustle, more often the faster you go
+                    var speed = Math.sqrt(cam.vx * cam.vx + cam.vz * cam.vz);
+                    var brush = 0;
+                    ear.brushTimer = (ear.brushTimer || 0) - dt;
+                    if (cam.mode === "walk" && speed > 0.6 && ear.brushTimer <= 0) {
+                        var depth = vl.phys.inPlant(cam.x, cam.y, cam.z);
+                        if (depth > 0.05) {
+                            brush = Math.min(1, depth * 0.6 + speed / 7);
+                            ear.brushTimer = 0.9 / Math.min(2, speed / 2 + 0.4);
+                        }
                     }
 
                     snd.update({
@@ -2095,6 +2157,8 @@
                         waterX: ear.waterX,
                         waterZ: ear.waterZ,
                         fires: ear.fires,
+                        above: cam.eyeY - Math.max(ground, vl.phys.water),
+                        brush: brush,
                         step: cam.mode === "walk" && cam.stepped,
                         surface: surface,
                         land: cam.mode === "walk" ? (cam.landed || 0) : 0,
@@ -2102,6 +2166,36 @@
                     });
                     cam.stepped = false;
                     cam.landed = 0;
+                }
+
+                // What the ground is made of here, from the map's layer weights:
+                // needles and leaves, trail, gravel, rock, or the meadow's grass
+                function surfaceAt(x, z) {
+                    var m = world.map;
+                    if (!m.splatData) {
+                        m.splatData = m.bytes(m.splat);
+                    }
+                    var n = m.splatSize;
+                    var i = Math.floor((x + m.size / 2) / m.size * n);
+                    var j = Math.floor((z + m.size / 2) / m.size * n);
+                    i = Math.max(0, Math.min(n - 1, i));
+                    j = Math.max(0, Math.min(n - 1, j));
+                    var o = (j * n + i) * 4, d = m.splatData;
+                    var w = [d[o], d[o + 1], d[o + 2], d[o + 3]];
+                    var grass = 255 - w[0] - w[1] - w[2] - w[3];
+                    // The shore is sand and pebbles whatever the layers say
+                    if (vl.phys.terrain.heightAt(x, z) < world.map.water + 1.2) {
+                        return "gravel";
+                    }
+                    var names = ["leaves", "dirt", "gravel", "stone"];
+                    var best = "grass", most = grass;
+                    for (var k = 0; k < 4; k++) {
+                        if (w[k] > most) {
+                            most = w[k];
+                            best = names[k];
+                        }
+                    }
+                    return best;
                 }
 
                 // Browsers only allow sound after a click or a key

@@ -77,6 +77,7 @@ if (which === 'nature' || which === 'all') {
       ...await buildProps(reg, { asset: 'root_cluster_01', name: 'roots', split: 'all', lods: [2500, 700, 150], distances: [0, 30, 80], drawDistance: 200, texSize: 512, collider: 100, kind: 'rock' }),
       ...await buildProps(reg, { asset: 'dry_branches_medium_01', name: 'branches', split: 'each', lods: [600, 150], distances: [0, 20], drawDistance: 60, texSize: 256, kind: 'debris' }),
       ...await buildProps(reg, { asset: 'fern_02', name: 'fern', split: 'each', lods: [1600, 500], distances: [0, 22], drawDistance: 75, texSize: 512, masked: true, kind: 'plant', materialExtras: { wind: 0.9, flutter: 0.6, translucency: 0.6 } }),
+      ...await buildProps(reg, { asset: 'shrub_02', name: 'bush', split: 'each', lods: [3000, 900, 250], distances: [0, 30, 80], drawDistance: 160, texSize: 1024, masked: true, kind: 'bush', materialExtras: { wind: 0.7, flutter: 0.7, translucency: 0.6 } }),
       ...await buildProps(reg, { asset: 'shrub_04', name: 'shrub', split: 'all', lods: [3500, 900], distances: [0, 25], drawDistance: 90, texSize: 512, masked: true, kind: 'plant', materialExtras: { wind: 0.8, flutter: 0.8, translucency: 0.6 } }),
       ...await buildProps(reg, { asset: 'dandelion_01', name: 'dandelion', split: ['a', 'b'].map((k) => ({ name: `dandelion_${k}`, nodes: [`dandelion_01_${k}_LOD0`] })), lods: [2200, 500], distances: [0, 14], drawDistance: 40, texSize: 512, masked: true, kind: 'plant', materialExtras: { wind: 1, flutter: 0.6, translucency: 0.5 } }),
     ];

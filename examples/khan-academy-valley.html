@@ -400,7 +400,7 @@
                     }
                     var how = vl.cam.mode === "walk"
                         ? "WASD walk · Shift run · Space jump · F fly"
-                        : "WASD fly · Space / Shift up and down · Ctrl fast · F walk";
+                        : "WASD fly · Space / Shift up and down · Q fast · F walk";
                     if (vl.cam.locked) {
                         vl.msg.textContent = how + " · Esc to release the mouse";
                     } else {
@@ -418,7 +418,10 @@
 
                 window.addEventListener("keydown", function (e) {
                     cam.keys[e.code] = true;
-                    if (e.code === "Space") {
+                    // While playing, keys belong to the game, not the browser:
+                    // Ctrl+D (bookmark), Ctrl+S, Space scrolling and the rest.
+                    // Esc still releases the mouse.
+                    if (e.code === "Space" || ((cam.locked || cam.drag) && e.code !== "Escape")) {
                         e.preventDefault();
                     }
                     if (e.code === "KeyF" && !e.repeat && vl.setMode) {
@@ -459,6 +462,16 @@
 
                 document.addEventListener("pointerlockchange", function () {
                     cam.locked = document.pointerLockElement === vl.canvas;
+                    // A few shortcuts (Ctrl+W, Ctrl+T, Ctrl+N) can only be held
+                    // back in fullscreen, where browsers offer a keyboard lock
+                    var kb = navigator.keyboard;
+                    if (kb && kb.lock) {
+                        if (cam.locked && (document.fullscreenElement || document.webkitFullscreenElement)) {
+                            kb.lock().catch(function () {});
+                        } else if (!cam.locked && kb.unlock) {
+                            kb.unlock();
+                        }
+                    }
                     vl.hint();
                 });
 
@@ -1002,7 +1015,7 @@
 
                     var len = Math.sqrt(mx * mx + my * my + mz * mz);
                     var speed = cam.flySpeed;
-                    if (k.ControlLeft) {
+                    if (k.KeyQ) {
                         speed *= 4;
                     }
                     if (len > 0) {
@@ -1051,7 +1064,7 @@
 
                     var len = Math.sqrt(mx * mx + mz * mz);
                     var speed = cam.walkSpeed;
-                    if (k.ShiftLeft || k.ShiftRight || k.ControlLeft) {
+                    if (k.ShiftLeft || k.ShiftRight) {
                         speed *= 2;
                     }
                     if (cam.swim) {
@@ -1697,7 +1710,7 @@
                     placed: 0,
                     // Time of day in hours; it always runs. Sunrise is at 6, sunset at 18.
                     day: {
-                        hour: 16.9,
+                        hour: 10,
                         minutes: 24,      // real minutes for one whole day
                         elevation: 0,
                         azimuth: 0

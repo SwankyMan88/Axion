@@ -428,6 +428,8 @@ struct Camera {
   extra    : vec4<f32>,   // x = fog height base, y = fog height falloff, z = cloud shadows, w = unused
   csmWorld : vec4<f32>,   // world-space width of each cascade
   prevViewProj : mat4x4<f32>,
+  night    : vec4<f32>,   // xyz = direction toward the real sun (the sky's), w = how much night (0..1)
+  moon     : vec4<f32>,   // xyz = direction toward the moon, w = moon size (0 = no moon or stars)
 };
 
 const PI : f32 = 3.14159265359;
@@ -1757,7 +1759,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   let el = sign(x) * x * x * PI * 0.5;
   let az = (in.uv.x - 0.5) * 2.0 * PI;
   let dir = vec3<f32>(cos(el) * cos(az), sin(el), cos(el) * sin(az));
-  let L = camera.sunDir.xyz;
+  let L = camera.night.xyz;
   let haze = max(camera.sky2.w, 0.0);
 
   let oy = RG + clamp(camera.position.y, 0.0, 4000.0) + 50.0;
@@ -2032,6 +2034,49 @@ fn environment(dir : vec3<f32>, roughness : f32) -> vec3<f32> {
   return mix(sharp, camera.ambient.rgb * 1.15, roughness * roughness);
 }
 
+/** Stars and the moon, over whatever the atmosphere gives. */
+fn nightSky(dir : vec3<f32>, base : vec3<f32>) -> vec3<f32> {
+  if (camera.moon.w <= 0.0 || dir.y < -0.02) { return base; }
+  var c = base;
+  let n = camera.night.w;
+  let above = smoothstep(-0.02, 0.08, dir.y);
+  // Stars: one hashed point per cell of a fine grid on the sky, twinkling a little
+  if (n > 0.0) {
+    let g = dir * 420.0;
+    let cell = floor(g);
+    let h = fract(sin(dot(cell, vec3<f32>(12.9898, 78.233, 37.719))) * 43758.5453);
+    if (h > 0.9965) {
+      let centre = cell + 0.5 + (vec3<f32>(fract(h * 17.0), fract(h * 29.0), fract(h * 43.0)) - 0.5) * 0.6;
+      let d = length(g - centre);
+      let tw = 0.75 + 0.25 * sin(camera.wind.w * 3.0 + h * 900.0);
+      let b = (h - 0.9965) / 0.0035;
+      let tint = mix(vec3<f32>(0.75, 0.85, 1.0), vec3<f32>(1.0, 0.9, 0.75), fract(h * 7.0));
+      c = c + tint * smoothstep(0.55, 0.0, d) * (0.04 + b * b * 0.5) * tw * n * n * above;
+    }
+    // A faint band of the galaxy across the sky
+    let band = exp(-pow(dot(dir, normalize(vec3<f32>(0.3, 0.2, 0.93))) * 3.2, 2.0));
+    c = c + vec3<f32>(0.006, 0.0065, 0.009) * band * n * n * above * (0.6 + 0.4 * valueNoise(dir * 9.0));
+  }
+  // The moon: a lit disc with darker seas; faint by day, bright at night
+  let M = camera.moon.xyz;
+  let cosR = cos(0.0045 * camera.moon.w);
+  let mu = dot(dir, M);
+  if (mu > cosR - 0.00002) {
+    let right = normalize(cross(M, vec3<f32>(0.0, 1.0, 0.0001)));
+    let up = cross(right, M);
+    let r = sqrt(max(1.0 - mu * mu, 0.0)) / sqrt(1.0 - cosR * cosR);
+    let p = vec2<f32>(dot(dir, right), dot(dir, up)) / sqrt(1.0 - cosR * cosR);
+    let edge = smoothstep(1.0, 0.94, r);
+    let seas = 0.72 + 0.28 * smoothstep(0.35, 0.65, valueNoise(vec3<f32>(p * 3.1, 1.7)));
+    let limb = 0.75 + 0.25 * sqrt(max(1.0 - r * r, 0.0));
+    let glow = mix(0.25, 0.9, n);
+    c = mix(c, vec3<f32>(0.9, 0.92, 0.96) * seas * limb * glow, edge * smoothstep(-0.01, 0.02, M.y));
+  }
+  // A soft halo around it at night
+  c = c + vec3<f32>(0.5, 0.6, 0.85) * pow(max(mu, 0.0), 900.0) * 0.08 * n;
+  return c;
+}
+
 /** Clouds in front of a sky pixel. */
 fn cloudLayer(dir : vec3<f32>, base : vec3<f32>) -> vec3<f32> {
   if (camera.sky.z <= 0.0 || dir.y < 0.01) { return base; }
@@ -2087,10 +2132,12 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
     var sky = sampleEnvironment(viewDirWorld, 0.0, camera.ambient.rgb) * 0.8;
     if (camera.sky.x > 0.5) {
       sky = environment(viewDirWorld, 0.0);
-      // The sun itself, darkened toward its rim like the real one.
-      let mu = dot(viewDirWorld, camera.sunDir.xyz);
-      let disc = smoothstep(0.99990, 0.99996, mu);
+      // The sun itself, darkened toward its rim like the real one. At night the
+      // light colour is the moon's, so the disc only shows while the sun lights.
+      let mu = dot(viewDirWorld, camera.night.xyz);
+      let disc = smoothstep(0.99990, 0.99996, mu) * (1.0 - camera.night.w);
       sky = sky + camera.sunColor.rgb * disc * camera.sky.y * 60.0 * (0.6 + 0.4 * smoothstep(0.99996, 0.99999, mu));
+      sky = nightSky(viewDirWorld, sky);
       sky = cloudLayer(viewDirWorld, sky);
     }
     return vec4<f32>(sanitize(applyVolume(sky, in.uv)), 1.0);
@@ -3428,7 +3475,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   // src/render/renderer.js
   var INSTANCE_FLOATS = 32;
   var LIGHT_FLOATS = 12;
-  var CAMERA_FLOATS = 256;
+  var CAMERA_FLOATS = 264;
   var MAX_LIGHTS = 256;
   var FACE_SLOT_BYTES = 256;
   var CASCADES = 4;
@@ -3577,6 +3624,15 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
         cloudShadows: ko.cloudShadows ?? 0.35,
         autoAmbient: ko.autoAmbient ?? true,
         ambientStrength: ko.ambientStrength ?? 1
+      };
+      const mo = options.moon ?? {};
+      this.moon = {
+        enabled: mo.enabled ?? true,
+        intensity: mo.intensity ?? 0.35,
+        color: mo.color ?? [0.56, 0.66, 0.9],
+        direction: mo.direction ?? null,
+        size: mo.size ?? 3,
+        stars: mo.stars ?? 1
       };
       this.wind = {
         direction: options.wind?.direction ?? [0.8, 0.6],
@@ -4923,18 +4979,35 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
      * the atmosphere model. Only recomputed when the sun or the air changes.
      */
     _updateSun(camera) {
-      const sun = this.sun, sky = this.sky;
+      const sun = this.sun, sky = this.sky, moon = this.moon;
       const L = sun.direction;
       const len = Math.hypot(L[0], L[1], L[2]) || 1;
-      const dir = [L[0] / len, L[1] / len, L[2] / len];
+      const sunDir = [L[0] / len, L[1] / len, L[2] / len];
+      const moonOn = moon.enabled && sky.enabled;
+      let moonDir = [0, -1, 0];
+      if (moonOn) {
+        const m = moon.direction ?? [-sunDir[0], -sunDir[1] * 0.85 + 0.15, -sunDir[2]];
+        const ml = Math.hypot(m[0], m[1], m[2]) || 1;
+        moonDir = [m[0] / ml, m[1] / ml, m[2] / ml];
+      }
+      const t = Math.min(Math.max((0.02 - sunDir[1]) / 0.14, 0), 1);
+      const night = moonOn ? t * t * (3 - 2 * t) : 0;
+      const byMoon = moonOn && sunDir[1] < -0.02;
+      const dir = byMoon ? moonDir : sunDir;
       this._sunDir = dir;
+      this._trueSun = sunDir;
+      this._moonDir = moonDir;
+      this._night = night;
       const alt = Math.round(Math.max(camera.position[1], 0) / 200) * 200;
-      const key = `${dir.map((v) => v.toFixed(4)).join()},${sky.haze},${alt},${sun.intensity},${sky.brightness},${sky.ambientStrength},${sun.color}`;
+      const key = `${sunDir.map((v) => v.toFixed(4)).join()},${moonDir.map((v) => v.toFixed(3)).join()},${sky.haze},${alt},${sun.intensity},${sky.brightness},${sky.ambientStrength},${sun.color},${moon.intensity},${moon.color},${moonOn}`;
       const st = this._sunState;
       if (st.key === key) return;
       st.key = key;
       const scatter = 3;
-      if (sun.color) {
+      const mk = moon.intensity * night * Math.min(Math.max(moonDir[1] / 0.15, 0), 1);
+      if (byMoon) {
+        st.color = moon.color.map((c) => c * mk);
+      } else if (sun.color) {
         st.color = sun.color.map((c) => c * sun.intensity);
       } else if (sky.enabled) {
         const T = sunTransmittance(dir, sky.haze, alt);
@@ -4944,8 +5017,8 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       }
       st.skyScale = sun.intensity * scatter * sky.brightness;
       if (sky.enabled) {
-        const A = skyAmbient(dir, sky.haze, alt);
-        st.ambient = A.map((c) => c * st.skyScale * sky.ambientStrength);
+        const A = skyAmbient(sunDir, sky.haze, alt);
+        st.ambient = A.map((c, i) => (c * st.skyScale + moon.color[i] * (mk * 0.3 + 0.012 * night * moon.intensity)) * sky.ambientStrength);
         const T = st.color;
         const skyLum = st.ambient[0] * 0.2126 + st.ambient[1] * 0.7152 + st.ambient[2] * 0.0722;
         const sunLum = (T[0] * 0.2126 + T[1] * 0.7152 + T[2] * 0.0722) * Math.max(dir[1], 0);
@@ -5411,6 +5484,15 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       cd[233] = this.fogHeight.falloff;
       cd[234] = skyOn ? sky.cloudShadows : 0;
       cd[235] = 0;
+      const ts = this._trueSun ?? sd, md = this._moonDir ?? [0, -1, 0];
+      cd[256] = ts[0];
+      cd[257] = ts[1];
+      cd[258] = ts[2];
+      cd[259] = this._night ?? 0;
+      cd[260] = md[0];
+      cd[261] = md[1];
+      cd[262] = md[2];
+      cd[263] = skyOn && this.moon.enabled ? this.moon.size : 0;
       if (this._prevViewProj) cd.set(this._prevViewProj, 240);
       else cd.set(camera.viewProj, 240);
       (this._prevViewProj ??= new Float32Array(16)).set(camera.viewProj);

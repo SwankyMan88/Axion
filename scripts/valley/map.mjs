@@ -74,7 +74,7 @@ const lerp = (a, b, t) => a + (b - a) * t;
 export const LAKE = { x: 30, z: 40, rx: 250, rz: 165, angle: 0.35 };
 export const CAMP = { x: -30, z: 262, r: 28 };
 export const FORT = { x: 360, z: -150, r: 60, height: 38 };
-export const PIER = { x: 8, z: 216, dir: -Math.PI / 2 - 0.12, sections: 7 };
+export const PIER = { x: 8, z: 216, dir: -Math.PI / 2 - 0.12, sections: 8 };
 export const SPAWN = { x: 9, z: 228 };
 export const ISLAND = { x: 75, z: 5, r: 44 };
 
@@ -508,9 +508,10 @@ export function buildPlacements(h) {
   // --- Camp ---
   const cx = CAMP.x, cz = CAMP.z;
   put('firepit', cx, cz, 0.3, 1, -0.05);
-  put('bench', cx - 3.4, cz + 0.4, Math.PI / 2 + 0.1, 1.35);
-  put('bench', cx + 3.3, cz - 0.8, -Math.PI / 2 - 0.2, 1.35);
-  put('log', cx + 0.5, cz + 3.6, 0.1, 0.9, -0.05);
+  // Logs to sit on around the fire, and a stump
+  put('log', cx - 3.2, cz + 0.2, Math.PI / 2 + 0.15, 1.35, -0.05);
+  put('log', cx + 3.1, cz - 0.6, Math.PI / 2 - 0.2, 1.35, -0.05);
+  put('log', cx + 0.3, cz + 3.4, 0.1, 1.2, -0.05);
   put('table', cx - 7.5, cz + 6.5, 0.4, 1);
   put('barrel_a', cx + 7.5, cz + 5, 0.3, 1);
   put('barrel_b', cx + 8.5, cz + 5.8, 1.3, 1);
@@ -528,11 +529,16 @@ export function buildPlacements(h) {
     if (sampleHeight(h, PIER.x + dxp * d, PIER.z + dzp * d) < WATER + 0.35) { startD = d; break; }
   }
   const pierYaw = -PIER.dir + Math.PI / 2;
+  // The sections repeat every 2.89 m in the original layout, overlapping a
+  // little. Each model's pivot sits at its own lowest point, so the height is
+  // set per model to put every deck at the same level.
+  const deckY = WATER + 0.9;
+  const sectionLow = { pier_section_02: -0.94, pier_section_03: -0.67 };
   for (let i = 0; i < PIER.sections; i++) {
-    const d = startD - 1.2 + i * 3.35;
+    const d = startD - 1.2 + i * 2.89;
     const x = PIER.x + dxp * d, z = PIER.z + dzp * d;
     const name = i === PIER.sections - 1 ? 'pier_section_03' : 'pier_section_02';
-    (out[name] ??= []).push(x, WATER - 2.95, z, pierYaw, 1);
+    (out[name] ??= []).push(x, deckY - 2.67 + sectionLow[name], z, pierYaw, 1);
     pier.push([x, z]);
   }
   PIER.start = [PIER.x + dxp * startD, PIER.z + dzp * startD];
@@ -544,24 +550,30 @@ export function buildPlacements(h) {
   (out.lantern ??= []).push(end[0] + dxp * 1.2 + dzp * 0.8, WATER + 0.9, end[1] + dzp * 1.2 - dxp * 0.8, 0, 1.1);
 
   // --- Fort: a ring of wall pieces on the hill ---
-  const R = 29;
+  // Six round towers on the corners of a hexagon, straight walls between
+  // them; the gate side faces the trail to the south.
+  const R = 27.6;
   const wallY = FORT.height - 0.4;
-  for (let i = 0; i < 12; i++) {
-    const a = (i / 12) * Math.PI * 2;
-    // Walls run along the ring: their long side (z) turned tangent to it.
-    const yaw = -a;
-    const x = FORT.x + Math.cos(a) * R, z = FORT.z + Math.sin(a) * R;
-    if (i === 3) {
-      // The gate, facing the trail, with a short end wall on each side
-      (out.fort_wall_thin_gate_01 ??= []).push(x, wallY, z, yaw, 1);
-      const tx = -Math.sin(a), tz = Math.cos(a);
+  const corner = (k) => {
+    const a = (k * 60 + 30) * Math.PI / 180;
+    return [FORT.x + Math.cos(a) * R, FORT.z + Math.sin(a) * R];
+  };
+  for (let k = 0; k < 6; k++) {
+    const [ax, az] = corner(k), [bx, bz] = corner(k + 1);
+    (out.fort_tower_round ??= []).push(ax, wallY, az, k * 1.1, 1);
+    const mx = (ax + bx) / 2, mz = (az + bz) / 2;
+    const len = Math.hypot(bx - ax, bz - az);
+    const dx = (bx - ax) / len, dz = (bz - az) / len;
+    const yaw = Math.atan2(dx, dz);
+    if (k === 1) {
+      (out.fort_wall_thin_gate_01 ??= []).push(mx, wallY, mz, yaw, 1);
       for (const s of [-1, 1]) {
-        (out.fort_wall_thick_end_02 ??= []).push(x + tx * s * 6.1, wallY, z + tz * s * 6.1, yaw + (s < 0 ? Math.PI : 0), 1);
+        (out.fort_wall_thick_end_02 ??= []).push(mx + dx * s * 6.1, wallY, mz + dz * s * 6.1, yaw + (s < 0 ? Math.PI : 0), 1);
       }
-      continue;
+    } else {
+      const piece = k % 2 === 0 ? 'fort_wall_thick_straight_01' : 'fort_wall_thin_straight_02';
+      (out[piece] ??= []).push(mx, wallY, mz, yaw, 1);
     }
-    const piece = i % 3 === 0 ? 'fort_tower_round' : (i % 3 === 1 ? 'fort_wall_thick_straight_01' : 'fort_wall_thin_straight_02');
-    (out[piece] ??= []).push(x, wallY, z, yaw, 1);
   }
   put('barrel_a', FORT.x + 6, FORT.z - 4, 0.3, 1);
   put('crate', FORT.x + 4, FORT.z - 6, 1.2, 1.3);

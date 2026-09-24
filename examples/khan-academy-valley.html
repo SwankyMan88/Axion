@@ -1601,18 +1601,28 @@
                         function (v) { cam.sens = v; });
 
                     section("Time of day and sky");
-                    slider("Sun height (degrees)", -4, 80, 0.5,
-                        function () { return world.sun.elevation; },
-                        function (v) { world.sun.elevation = v; world.setSun(); });
-                    slider("Sun direction (degrees)", 0, 360, 1,
-                        function () { return world.sun.azimuth; },
-                        function (v) { world.sun.azimuth = v; world.setSun(); });
-                    toggle("Time passes",
-                        function () { return world.sun.moving; },
-                        function (v) { world.sun.moving = v; });
-                    slider("Day speed (minutes per day)", 1, 60, 1,
-                        function () { return world.sun.dayMinutes; },
-                        function (v) { world.sun.dayMinutes = v; });
+                    var clock = document.createElement("div");
+                    clock.className = "info";
+                    body.appendChild(clock);
+                    function showClock() {
+                        var h = world.day.hour;
+                        var hh = Math.floor(h), mm = Math.floor((h - hh) * 60);
+                        clock.textContent = "Time " + (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm;
+                    }
+                    setInterval(showClock, 1000);
+                    showClock();
+                    slider("Time of day (hours)", 0, 24, 0.1,
+                        function () { return world.day.hour; },
+                        function (v) { world.day.hour = v; world.setSun(); showClock(); });
+                    slider("Minutes for a whole day", 2, 120, 1,
+                        function () { return world.day.minutes; },
+                        function (v) { world.day.minutes = v; });
+                    slider("Moonlight", 0, 1.5, 0.05,
+                        function () { return r.moon.intensity; },
+                        function (v) { r.moon.intensity = v; });
+                    slider("Stars and moon size", 0, 3, 0.05,
+                        function () { return r.moon.size; },
+                        function (v) { r.moon.size = v; });
                     slider("Sunlight", 0, 8, 0.1,
                         function () { return r.sun.intensity; },
                         function (v) { r.sun.intensity = v; });
@@ -1658,12 +1668,15 @@
                         function (v) { t.water.clarity = v; });
 
                     section("Fog and light shafts");
+                    slider("Morning mist", 0, 2, 0.05,
+                        function () { return world.fog.mist; },
+                        function (v) { world.fog.mist = v; world.setSun(); });
                     slider("Distance fog", 0, 0.01, 0.0001,
-                        function () { return r.fogDensity; },
-                        function (v) { r.fogDensity = v; });
+                        function () { return world.fog.density; },
+                        function (v) { world.fog.density = v; world.setSun(); });
                     slider("Fog thins with height", 0, 0.1, 0.001,
-                        function () { return r.fogHeight.falloff; },
-                        function (v) { r.fogHeight.falloff = v; });
+                        function () { return world.fog.falloff; },
+                        function (v) { world.fog.falloff = v; world.setSun(); });
                     slider("Sky colour in the fog", 0, 1, 0.05,
                         function () { return r.aerialPerspective; },
                         function (v) { r.aerialPerspective = v; });
@@ -1671,8 +1684,8 @@
                         function () { return r.volumetric.enabled; },
                         function (v) { r.volumetric.enabled = v; });
                     slider("Shaft density", 0, 0.03, 0.0005,
-                        function () { return r.volumetric.density; },
-                        function (v) { r.volumetric.density = v; });
+                        function () { return world.fog.shafts; },
+                        function (v) { world.fog.shafts = v; world.setSun(); });
                     slider("Shaft brightness", 0, 4, 0.05,
                         function () { return r.volumetric.lightScatter; },
                         function (v) { r.volumetric.lightScatter = v; });
@@ -1765,13 +1778,19 @@
                     fire: 1,
                     lights: [],
                     placed: 0,
-                    sun: {
-                        elevation: 20,
-                        azimuth: 150,
-                        moving: false,
-                        dayMinutes: 20,
-                        phase: 0,
-                        last: 0
+                    // Time of day in hours; it always runs. Sunrise is at 6, sunset at 18.
+                    day: {
+                        hour: 16.9,
+                        minutes: 24,      // real minutes for one whole day
+                        elevation: 0,
+                        azimuth: 0
+                    },
+                    // Fog the menu sets; the morning mist is added on top of it
+                    fog: {
+                        density: 0.0006,
+                        falloff: 0.009,
+                        shafts: 0.0016,
+                        mist: 1
                     }
                 };
 
@@ -1953,25 +1972,43 @@
                 }
 
                 // Time of day
-                world.setSun = function () {
-                    vl.app.renderer.setSunAngles(world.sun.elevation, world.sun.azimuth);
+                /*
+                 * The sun's path for an hour of the day: it rises in the east (+x)
+                 * at 6, is highest in the south (+z) at noon and sets in the west
+                 * at 18. At night the engine lights the world by the moon.
+                 */
+                world.sunAt = function (hour) {
+                    var a = (hour - 6) / 24 * Math.PI * 2;
+                    world.day.elevation = 6 + 52 * Math.sin(a);
+                    world.day.azimuth = ((hour - 6) / 24 * 360 + 360) % 360;
                 };
 
+                world.setSun = function () {
+                    var d = world.day;
+                    world.sunAt(d.hour);
+                    vl.app.renderer.setSunAngles(d.elevation, d.azimuth);
+                    setFog();
+                };
+
+                // Mist that gathers at dawn, sits low over the lake and burns off
+                // by mid-morning; a thinner haze comes back after dark.
+                function setFog() {
+                    var r = vl.app.renderer;
+                    var f = world.fog;
+                    var h = world.day.hour;
+                    var d = Math.abs(h - 6.6);
+                    var morning = Math.exp(-d * d / 2.2);
+                    var night = h < 5 || h > 20.5 ? 0.35 : 0;
+                    var mist = Math.max(morning, night) * f.mist;
+                    r.fogDensity = f.density + mist * 0.009;
+                    r.fogHeight.falloff = f.falloff + mist * 0.05;
+                    r.volumetric.density = f.shafts + mist * 0.012;
+                    r.volumetric.heightFalloff = 0.02 + mist * 0.06;
+                }
+
                 function moveSun(dt) {
-                    var s = world.sun;
-                    if (!s.moving) {
-                        return;
-                    }
-                    // Moved by hand since the last step: pick the day up from there, rising
-                    if (s.elevation !== s.last) {
-                        s.phase = Math.asin(Math.max(-1, Math.min(1, (s.elevation - 29) / 33)));
-                    }
-                    // Around the sky once per day; low at dawn and dusk, high at noon
-                    var turn = dt / (s.dayMinutes * 60);
-                    s.phase += turn * Math.PI * 2;
-                    s.elevation = 29 + 33 * Math.sin(s.phase);
-                    s.azimuth = (s.azimuth + turn * 360) % 360;
-                    s.last = s.elevation;
+                    var d = world.day;
+                    d.hour = (d.hour + dt * 24 / (d.minutes * 60)) % 24;
                     world.setSun();
                 }
 
@@ -2054,8 +2091,8 @@
                     clearColor: [0.5, 0.6, 0.75, 1],
                     exposure: 1,
                     sun: {
-                        elevation: world.sun.elevation,
-                        azimuth: world.sun.azimuth,
+                        elevation: 20,
+                        azimuth: 160,
                         intensity: 3.4,
                         shadows: { size: 2048, distance: 230, split: 0.8, reach: 300 }
                     },

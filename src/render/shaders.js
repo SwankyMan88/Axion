@@ -60,6 +60,8 @@ struct Camera {
   extra    : vec4<f32>,   // x = fog height base, y = fog height falloff, z = cloud shadows, w = unused
   csmWorld : vec4<f32>,   // world-space width of each cascade
   prevViewProj : mat4x4<f32>,
+  night    : vec4<f32>,   // xyz = direction toward the real sun (the sky's), w = how much night (0..1)
+  moon     : vec4<f32>,   // xyz = direction toward the moon, w = moon size (0 = no moon or stars)
 };
 
 const PI : f32 = 3.14159265359;
@@ -1410,7 +1412,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   let el = sign(x) * x * x * PI * 0.5;
   let az = (in.uv.x - 0.5) * 2.0 * PI;
   let dir = vec3<f32>(cos(el) * cos(az), sin(el), cos(el) * sin(az));
-  let L = camera.sunDir.xyz;
+  let L = camera.night.xyz;
   let haze = max(camera.sky2.w, 0.0);
 
   let oy = RG + clamp(camera.position.y, 0.0, 4000.0) + 50.0;
@@ -1693,6 +1695,49 @@ fn environment(dir : vec3<f32>, roughness : f32) -> vec3<f32> {
   return mix(sharp, camera.ambient.rgb * 1.15, roughness * roughness);
 }
 
+/** Stars and the moon, over whatever the atmosphere gives. */
+fn nightSky(dir : vec3<f32>, base : vec3<f32>) -> vec3<f32> {
+  if (camera.moon.w <= 0.0 || dir.y < -0.02) { return base; }
+  var c = base;
+  let n = camera.night.w;
+  let above = smoothstep(-0.02, 0.08, dir.y);
+  // Stars: one hashed point per cell of a fine grid on the sky, twinkling a little
+  if (n > 0.0) {
+    let g = dir * 420.0;
+    let cell = floor(g);
+    let h = fract(sin(dot(cell, vec3<f32>(12.9898, 78.233, 37.719))) * 43758.5453);
+    if (h > 0.9965) {
+      let centre = cell + 0.5 + (vec3<f32>(fract(h * 17.0), fract(h * 29.0), fract(h * 43.0)) - 0.5) * 0.6;
+      let d = length(g - centre);
+      let tw = 0.75 + 0.25 * sin(camera.wind.w * 3.0 + h * 900.0);
+      let b = (h - 0.9965) / 0.0035;
+      let tint = mix(vec3<f32>(0.75, 0.85, 1.0), vec3<f32>(1.0, 0.9, 0.75), fract(h * 7.0));
+      c = c + tint * smoothstep(0.55, 0.0, d) * (0.04 + b * b * 0.5) * tw * n * n * above;
+    }
+    // A faint band of the galaxy across the sky
+    let band = exp(-pow(dot(dir, normalize(vec3<f32>(0.3, 0.2, 0.93))) * 3.2, 2.0));
+    c = c + vec3<f32>(0.006, 0.0065, 0.009) * band * n * n * above * (0.6 + 0.4 * valueNoise(dir * 9.0));
+  }
+  // The moon: a lit disc with darker seas; faint by day, bright at night
+  let M = camera.moon.xyz;
+  let cosR = cos(0.0045 * camera.moon.w);
+  let mu = dot(dir, M);
+  if (mu > cosR - 0.00002) {
+    let right = normalize(cross(M, vec3<f32>(0.0, 1.0, 0.0001)));
+    let up = cross(right, M);
+    let r = sqrt(max(1.0 - mu * mu, 0.0)) / sqrt(1.0 - cosR * cosR);
+    let p = vec2<f32>(dot(dir, right), dot(dir, up)) / sqrt(1.0 - cosR * cosR);
+    let edge = smoothstep(1.0, 0.94, r);
+    let seas = 0.72 + 0.28 * smoothstep(0.35, 0.65, valueNoise(vec3<f32>(p * 3.1, 1.7)));
+    let limb = 0.75 + 0.25 * sqrt(max(1.0 - r * r, 0.0));
+    let glow = mix(0.25, 0.9, n);
+    c = mix(c, vec3<f32>(0.9, 0.92, 0.96) * seas * limb * glow, edge * smoothstep(-0.01, 0.02, M.y));
+  }
+  // A soft halo around it at night
+  c = c + vec3<f32>(0.5, 0.6, 0.85) * pow(max(mu, 0.0), 900.0) * 0.08 * n;
+  return c;
+}
+
 /** Clouds in front of a sky pixel. */
 fn cloudLayer(dir : vec3<f32>, base : vec3<f32>) -> vec3<f32> {
   if (camera.sky.z <= 0.0 || dir.y < 0.01) { return base; }
@@ -1748,10 +1793,12 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
     var sky = sampleEnvironment(viewDirWorld, 0.0, camera.ambient.rgb) * 0.8;
     if (camera.sky.x > 0.5) {
       sky = environment(viewDirWorld, 0.0);
-      // The sun itself, darkened toward its rim like the real one.
-      let mu = dot(viewDirWorld, camera.sunDir.xyz);
-      let disc = smoothstep(0.99990, 0.99996, mu);
+      // The sun itself, darkened toward its rim like the real one. At night the
+      // light colour is the moon's, so the disc only shows while the sun lights.
+      let mu = dot(viewDirWorld, camera.night.xyz);
+      let disc = smoothstep(0.99990, 0.99996, mu) * (1.0 - camera.night.w);
       sky = sky + camera.sunColor.rgb * disc * camera.sky.y * 60.0 * (0.6 + 0.4 * smoothstep(0.99996, 0.99999, mu));
+      sky = nightSky(viewDirWorld, sky);
       sky = cloudLayer(viewDirWorld, sky);
     }
     return vec4<f32>(sanitize(applyVolume(sky, in.uv)), 1.0);

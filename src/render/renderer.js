@@ -14,7 +14,7 @@ import { skyAmbient, sunTransmittance, sunDirection } from './sky.js';
 
 const INSTANCE_FLOATS = 32;   // mat4(16) + color(4) + pbr(4) + surface(4) + extra(4)
 const LIGHT_FLOATS = 12;      // posRange(4) + colorPower(4) + shadowInfo(4)
-const CAMERA_FLOATS = 256;
+const CAMERA_FLOATS = 264;
 const MAX_LIGHTS = 256;
 const FACE_SLOT_BYTES = 256;  // uniform dynamic offsets must be 256-aligned
 const CASCADES = 4;
@@ -256,6 +256,21 @@ export class Renderer {
       cloudShadows: ko.cloudShadows ?? 0.35,
       autoAmbient: ko.autoAmbient ?? true,
       ambientStrength: ko.ambientStrength ?? 1,
+    };
+
+    /**
+     * The moon: when the sun is below the horizon it takes over as the light
+     * (dimmer, bluish, with its own shadows), and the night sky gets stars.
+     * `direction` null = opposite the sun, a little higher.
+     */
+    const mo = options.moon ?? {};
+    this.moon = {
+      enabled: mo.enabled ?? true,
+      intensity: mo.intensity ?? 0.35,
+      color: mo.color ?? [0.56, 0.66, 0.9],
+      direction: mo.direction ?? null,
+      size: mo.size ?? 3,
+      stars: mo.stars ?? 1,
     };
 
     /** Wind for materials with `wind` set: direction (x, z), strength, gust speed. */
@@ -1549,20 +1564,38 @@ export class Renderer {
    * the atmosphere model. Only recomputed when the sun or the air changes.
    */
   _updateSun(camera) {
-    const sun = this.sun, sky = this.sky;
+    const sun = this.sun, sky = this.sky, moon = this.moon;
     const L = sun.direction;
     const len = Math.hypot(L[0], L[1], L[2]) || 1;
-    const dir = [L[0] / len, L[1] / len, L[2] / len];
+    const sunDir = [L[0] / len, L[1] / len, L[2] / len];
+    // Below the horizon the moon lights the world; the sky still follows the sun.
+    const moonOn = moon.enabled && sky.enabled;
+    let moonDir = [0, -1, 0];
+    if (moonOn) {
+      const m = moon.direction ?? [-sunDir[0], -sunDir[1] * 0.85 + 0.15, -sunDir[2]];
+      const ml = Math.hypot(m[0], m[1], m[2]) || 1;
+      moonDir = [m[0] / ml, m[1] / ml, m[2] / ml];
+    }
+    const t = Math.min(Math.max((0.02 - sunDir[1]) / 0.14, 0), 1);
+    const night = moonOn ? t * t * (3 - 2 * t) : 0;
+    const byMoon = moonOn && sunDir[1] < -0.02;
+    const dir = byMoon ? moonDir : sunDir;
     this._sunDir = dir;
+    this._trueSun = sunDir;
+    this._moonDir = moonDir;
+    this._night = night;
     const alt = Math.round(Math.max(camera.position[1], 0) / 200) * 200;
-    const key = `${dir.map((v) => v.toFixed(4)).join()},${sky.haze},${alt},${sun.intensity},${sky.brightness},${sky.ambientStrength},${sun.color}`;
+    const key = `${sunDir.map((v) => v.toFixed(4)).join()},${moonDir.map((v) => v.toFixed(3)).join()},${sky.haze},${alt},${sun.intensity},${sky.brightness},${sky.ambientStrength},${sun.color},${moon.intensity},${moon.color},${moonOn}`;
     const st = this._sunState;
     if (st.key === key) return;
     st.key = key;
     // Multiple scattering, which a single-scattering model leaves out, roughly
     // triples the light the sky sends down; without it shade reads too dark.
     const scatter = 3;
-    if (sun.color) {
+    const mk = moon.intensity * night * Math.min(Math.max(moonDir[1] / 0.15, 0), 1);
+    if (byMoon) {
+      st.color = moon.color.map((c) => c * mk);
+    } else if (sun.color) {
       st.color = sun.color.map((c) => c * sun.intensity);
     } else if (sky.enabled) {
       const T = sunTransmittance(dir, sky.haze, alt);
@@ -1572,8 +1605,9 @@ export class Renderer {
     }
     st.skyScale = sun.intensity * scatter * sky.brightness;
     if (sky.enabled) {
-      const A = skyAmbient(dir, sky.haze, alt);
-      st.ambient = A.map((c) => c * st.skyScale * sky.ambientStrength);
+      const A = skyAmbient(sunDir, sky.haze, alt);
+      // Night: moonlight scattered by the sky, and a little starlight.
+      st.ambient = A.map((c, i) => (c * st.skyScale + moon.color[i] * (mk * 0.3 + 0.012 * night * moon.intensity)) * sky.ambientStrength);
       // Light bounced off the ground below, relative to the sky above.
       const T = st.color;
       const skyLum = st.ambient[0] * 0.2126 + st.ambient[1] * 0.7152 + st.ambient[2] * 0.0722;
@@ -1985,6 +2019,10 @@ export class Renderer {
     for (let i = 0; i < 12; i++) cd[220 + i] = tu ? tu[i] : 0;
     cd[232] = this.fogHeight.base; cd[233] = this.fogHeight.falloff;
     cd[234] = skyOn ? sky.cloudShadows : 0; cd[235] = 0;
+    const ts = this._trueSun ?? sd, md = this._moonDir ?? [0, -1, 0];
+    cd[256] = ts[0]; cd[257] = ts[1]; cd[258] = ts[2]; cd[259] = this._night ?? 0;
+    cd[260] = md[0]; cd[261] = md[1]; cd[262] = md[2];
+    cd[263] = skyOn && this.moon.enabled ? this.moon.size : 0;
     if (this._prevViewProj) cd.set(this._prevViewProj, 240); else cd.set(camera.viewProj, 240);
     (this._prevViewProj ??= new Float32Array(16)).set(camera.viewProj);
     this.device.queue.writeBuffer(this.cameraBuffer, 0, cd);

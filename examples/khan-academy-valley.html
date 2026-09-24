@@ -1040,6 +1040,8 @@
                     cam.jumpHeld = !!k.Space;
 
                     vl.phys.refresh(cam);
+                    var airborne = !cam.ground && !cam.swim;
+                    var fallSpeed = -cam.vy;
 
                     // Small fixed steps so fast falls can't pass through floors
                     var steps = Math.min(12, Math.ceil(dt / (1 / 120)));
@@ -1056,12 +1058,29 @@
                         cam.vy = 0;
                     }
 
+                    // A hard enough landing is heard
+                    if (airborne && cam.ground && fallSpeed > 3) {
+                        cam.landed = Math.min(1, (fallSpeed - 3) / 8 + 0.3);
+                    }
+
                     // Head bob while walking on land
                     var moving = Math.sqrt(cam.vx * cam.vx + cam.vz * cam.vz);
+                    var stepBefore = Math.floor(cam.bob / Math.PI);
                     if (cam.ground && !cam.swim && moving > 0.5) {
                         cam.bob += dt * moving * 2.1;
                     } else {
                         cam.bob *= Math.exp(-6 * dt);
+                    }
+                    // One footstep per half cycle of the bob; strokes while swimming
+                    if (Math.floor(cam.bob / Math.PI) !== stepBefore && cam.ground && moving > 0.5) {
+                        cam.stepped = true;
+                    }
+                    if (cam.swim && moving > 0.4) {
+                        cam.stroke = (cam.stroke || 0) + dt * moving * 0.9;
+                        if (cam.stroke > 1) {
+                            cam.stroke = 0;
+                            cam.stepped = true;
+                        }
                     }
                     var bob = Math.sin(cam.bob) * 0.035 * Math.min(1, moving / 3);
 
@@ -1600,158 +1619,29 @@
                         function () { return cam.sens; },
                         function (v) { cam.sens = v; });
 
-                    section("Time of day and sky");
+                    section("Sound", true);
+                    slider("Volume", 0, 1.5, 0.05,
+                        function () { return window.ValleySound ? ValleySound.volume : 0.8; },
+                        function (v) {
+                            if (window.ValleySound) {
+                                ValleySound.setVolume(v);
+                            }
+                        });
+
+                    // The time of day only as a readout; it runs on its own
                     var clock = document.createElement("div");
                     clock.className = "info";
-                    body.appendChild(clock);
+                    list.appendChild(clock);
                     function showClock() {
                         var h = world.day.hour;
                         var hh = Math.floor(h), mm = Math.floor((h - hh) * 60);
-                        clock.textContent = "Time " + (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm;
+                        clock.textContent = "Time in the valley " + (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm;
                     }
                     setInterval(showClock, 1000);
                     showClock();
-                    slider("Time of day (hours)", 0, 24, 0.1,
-                        function () { return world.day.hour; },
-                        function (v) { world.day.hour = v; world.setSun(); showClock(); });
-                    slider("Minutes for a whole day", 2, 120, 1,
-                        function () { return world.day.minutes; },
-                        function (v) { world.day.minutes = v; });
-                    slider("Moonlight", 0, 1.5, 0.05,
-                        function () { return r.moon.intensity; },
-                        function (v) { r.moon.intensity = v; });
-                    slider("Stars and moon size", 0, 3, 0.05,
-                        function () { return r.moon.size; },
-                        function (v) { r.moon.size = v; });
-                    slider("Sunlight", 0, 8, 0.1,
-                        function () { return r.sun.intensity; },
-                        function (v) { r.sun.intensity = v; });
-                    slider("Sky brightness", 0.2, 3, 0.05,
-                        function () { return r.sky.brightness; },
-                        function (v) { r.sky.brightness = v; });
-                    slider("Sky light on the ground", 0, 3, 0.05,
-                        function () { return r.sky.ambientStrength; },
-                        function (v) { r.sky.ambientStrength = v; });
-                    slider("Haze", 0.2, 6, 0.1,
-                        function () { return r.sky.haze; },
-                        function (v) { r.sky.haze = v; });
-                    slider("Clouds", 0, 1, 0.01,
-                        function () { return r.sky.clouds; },
-                        function (v) { r.sky.clouds = v; });
-                    slider("Cloud speed", 0, 8, 0.1,
-                        function () { return r.sky.cloudSpeed; },
-                        function (v) { r.sky.cloudSpeed = v; });
-                    slider("Cloud shadows", 0, 1, 0.01,
-                        function () { return r.sky.cloudShadows; },
-                        function (v) { r.sky.cloudShadows = v; });
-                    slider("Sun disc", 0, 3, 0.05,
-                        function () { return r.sky.sunDisc; },
-                        function (v) { r.sky.sunDisc = v; });
-
-                    section("Wind");
-                    slider("Strength", 0, 3, 0.05,
-                        function () { return r.wind.strength; },
-                        function (v) { r.wind.strength = v; });
-                    slider("Gust speed", 0, 3, 0.05,
-                        function () { return r.wind.speed; },
-                        function (v) { r.wind.speed = v; });
-                    slider("Grass sway", 0, 3, 0.05,
-                        function () { return t.grass.sway; },
-                        function (v) { t.grass.sway = v; });
-
-                    section("Water");
-                    slider("Waves", 0, 3, 0.05,
-                        function () { return t.water.waves; },
-                        function (v) { t.water.waves = v; });
-                    slider("Clarity", 0, 1, 0.01,
-                        function () { return t.water.clarity; },
-                        function (v) { t.water.clarity = v; });
-
-                    section("Fog and light shafts");
-                    slider("Morning mist", 0, 2, 0.05,
-                        function () { return world.fog.mist; },
-                        function (v) { world.fog.mist = v; world.setSun(); });
-                    slider("Distance fog", 0, 0.01, 0.0001,
-                        function () { return world.fog.density; },
-                        function (v) { world.fog.density = v; world.setSun(); });
-                    slider("Fog thins with height", 0, 0.1, 0.001,
-                        function () { return world.fog.falloff; },
-                        function (v) { world.fog.falloff = v; world.setSun(); });
-                    slider("Sky colour in the fog", 0, 1, 0.05,
-                        function () { return r.aerialPerspective; },
-                        function (v) { r.aerialPerspective = v; });
-                    toggle("Light shafts (volumetric)",
-                        function () { return r.volumetric.enabled; },
-                        function (v) { r.volumetric.enabled = v; });
-                    slider("Shaft density", 0, 0.03, 0.0005,
-                        function () { return world.fog.shafts; },
-                        function (v) { world.fog.shafts = v; world.setSun(); });
-                    slider("Shaft brightness", 0, 4, 0.05,
-                        function () { return r.volumetric.lightScatter; },
-                        function (v) { r.volumetric.lightScatter = v; });
-                    slider("Shaft reach (m)", 20, 200, 5,
-                        function () { return r.volumetric.maxDistance; },
-                        function (v) { r.volumetric.maxDistance = v; });
-
-                    section("Camera and exposure");
-                    slider("Exposure", 0.1, 3, 0.05,
-                        function () { return r.exposure; },
-                        function (v) { r.exposure = v; });
-                    toggle("Auto exposure",
-                        function () { return r.autoExposure.enabled; },
-                        function (v) { r.autoExposure.enabled = v; });
-                    slider("Exposure compensation", -3, 3, 0.1,
-                        function () { return r.exposureCompensation; },
-                        function (v) { r.exposureCompensation = v; });
-                    toggle("Depth of field",
-                        function () { return r.dof.enabled; },
-                        function (v) { r.dof.enabled = v; });
-                    slider("Blur amount (px)", 1, 20, 1,
-                        function () { return r.dof.amount; },
-                        function (v) { r.dof.amount = v; });
-
-                    section("Effects");
-                    slider("Reflections (SSR)", 0, 1, 0.05,
-                        function () { return r.ssr.intensity; },
-                        function (v) { r.ssr.intensity = v; });
-                    slider("Ambient occlusion", 0, 2, 0.05,
-                        function () { return r.ao.intensity; },
-                        function (v) { r.ao.intensity = v; });
-                    slider("Occlusion radius", 0.2, 4, 0.05,
-                        function () { return r.ao.radius; },
-                        function (v) { r.ao.radius = v; });
-                    slider("Bounce light (SSIL)", 0, 3, 0.05,
-                        function () { return r.ssil.intensity; },
-                        function (v) { r.ssil.intensity = v; });
-                    slider("Bloom", 0, 1.5, 0.05,
-                        function () { return r.bloom.strength; },
-                        function (v) { r.bloom.strength = v; });
-                    slider("Bloom threshold", 0, 6, 0.05,
-                        function () { return r.bloom.threshold; },
-                        function (v) { r.bloom.threshold = v; });
-                    slider("Firelight", 0, 3, 0.05,
-                        function () { return world.fire; },
-                        function (v) { world.fire = v; });
-
-                    section("Tonemap and colour");
-                    choice("Tonemapper", [
-                        ["linear", "Linear"], ["reinhard", "Reinhard"], ["filmic", "Filmic"],
-                        ["aces", "ACES"], ["agx", "AgX"]
-                    ],
-                        function () { return r.tonemap.mode; },
-                        function (v) { r.tonemap.mode = v; });
-                    slider("Brightness", 0.2, 2, 0.05,
-                        function () { return r.tonemap.brightness; },
-                        function (v) { r.tonemap.brightness = v; });
-                    slider("Contrast", 0.5, 1.8, 0.05,
-                        function () { return r.tonemap.contrast; },
-                        function (v) { r.tonemap.contrast = v; });
-                    slider("Saturation", 0, 2, 0.05,
-                        function () { return r.tonemap.saturation; },
-                        function (v) { r.tonemap.saturation = v; });
 
                     // One reset for everything, outside the sections
-                    button("Reset everything to defaults", function () {
+                    button("Reset settings", function () {
                         for (var i = 0; i < defaults.length; i++) {
                             defaults[i]();
                         }
@@ -1998,7 +1888,11 @@
                     var h = world.day.hour;
                     var d = Math.abs(h - 6.6);
                     var morning = Math.exp(-d * d / 2.2);
-                    var night = h < 5 || h > 20.5 ? 0.35 : 0;
+                    // A lighter haze fades in after dusk and out before dawn
+                    var eve = Math.max(0, Math.min(1, (h - 20) / 1.5));
+                    var dawn = Math.max(0, Math.min(1, (5.5 - h) / 1.5));
+                    var n = Math.max(eve, dawn);
+                    var night = 0.35 * n * n * (3 - 2 * n);
                     var mist = Math.max(morning, night) * f.mist;
                     r.fogDensity = f.density + mist * 0.009;
                     r.fogHeight.falloff = f.falloff + mist * 0.05;
@@ -2048,6 +1942,101 @@
                     var x = f.x + 5, z = f.z + 52;
                     place(x, z, yawTo(x, z, f.x, f.z));
                 };
+
+                // Sound: what the listener hears depends on where they are
+                var ear = { waterTimer: 0, water: 0, waterX: 0, waterZ: 0, fires: null };
+                function listen(app, dt) {
+                    var snd = window.ValleySound;
+                    if (!snd || !snd.on) {
+                        cam.stepped = false;
+                        cam.landed = 0;
+                        return;
+                    }
+                    var t = vl.phys.terrain;
+                    if (!ear.fires) {
+                        ear.fires = [];
+                        var ls = world.map.lights;
+                        for (var i = 0; i < ls.length; i++) {
+                            if (ls[i].fire) {
+                                ear.fires.push(ls[i].pos);
+                            }
+                        }
+                    }
+
+                    // The nearest water, looked for in rings a few times a second
+                    ear.waterTimer -= dt;
+                    if (ear.waterTimer <= 0) {
+                        ear.waterTimer = 0.25;
+                        var best = 1e9;
+                        var rings = [3, 8, 16, 28, 45];
+                        for (var r = 0; r < rings.length && best > 1e8; r++) {
+                            for (var a = 0; a < 12; a++) {
+                                var ang = a / 12 * Math.PI * 2;
+                                var wx = cam.x + Math.cos(ang) * rings[r];
+                                var wz = cam.z + Math.sin(ang) * rings[r];
+                                if (t.heightAt(wx, wz) < vl.phys.water) {
+                                    best = rings[r];
+                                    ear.waterX = wx;
+                                    ear.waterZ = wz;
+                                    break;
+                                }
+                            }
+                        }
+                        if (t.heightAt(cam.x, cam.z) < vl.phys.water) {
+                            best = 0;
+                            ear.waterX = cam.x;
+                            ear.waterZ = cam.z;
+                        }
+                        ear.water = Math.max(0, 1 - best / 50);
+                    }
+
+                    // Trees close by make it a forest
+                    var trunks = 0;
+                    var near = vl.phys.near;
+                    for (var k = 0; k < near.length; k++) {
+                        if (vl.phys.objs[near[k]].trunk) {
+                            trunks++;
+                        }
+                    }
+
+                    var ground = t.heightAt(cam.x, cam.z);
+                    var surface = "grass";
+                    if (cam.swim) {
+                        surface = "water";
+                    } else if (cam.y > ground + 0.25) {
+                        surface = "wood";
+                    }
+
+                    snd.update({
+                        dt: dt,
+                        x: cam.x,
+                        y: cam.eyeY,
+                        z: cam.z,
+                        yaw: cam.yaw,
+                        daylight: Math.max(0, Math.min(1, (world.day.elevation + 4) / 12)),
+                        height: Math.max(0, cam.eyeY - 6),
+                        forest: Math.min(1, trunks / 5),
+                        water: ear.water,
+                        waterX: ear.waterX,
+                        waterZ: ear.waterZ,
+                        fires: ear.fires,
+                        step: cam.mode === "walk" && cam.stepped,
+                        surface: surface,
+                        land: cam.mode === "walk" ? (cam.landed || 0) : 0,
+                        wind: app.renderer.wind.strength
+                    });
+                    cam.stepped = false;
+                    cam.landed = 0;
+                }
+
+                // Browsers only allow sound after a click or a key
+                function wake() {
+                    if (window.ValleySound) {
+                        ValleySound.start();
+                    }
+                }
+                vl.canvas.addEventListener("mousedown", wake);
+                window.addEventListener("keydown", wake);
 
                 // Numbers in the corner
                 var fps = { frames: 0, time: 0, value: 0, ms: 0 };
@@ -2160,6 +2149,7 @@
                     app.onFrame(function (dt) {
                         moveSun(dt);
                         flicker(app);
+                        listen(app, dt);
                         vl.moveCam(app, dt);
                         showStats(app, dt);
                     });
@@ -2170,6 +2160,9 @@
                     app.start();
 
                     document.getElementById("load").className = "done";
+
+                    // Sound comes last and is optional: without it the valley is just quiet
+                    vl.loadScript(vl.base + "valley-sound.js").catch(function () {});
                     if (vl.full.popped) {
                         vl.full.prompt();
                     }

@@ -484,8 +484,12 @@ export class Terrain {
     const [lx, ly, lz] = H.dir;
     const flat = Math.hypot(lx, lz);
     const cell = this.size / (G - 1);
-    const rows = Math.min(G - H.row, 24);
-    for (let j = H.row; j < H.row + rows; j++) {
+    // About two milliseconds of work per frame, however fast the machine is
+    const t0 = performance.now();
+    let j = H.row;
+    // (the very first map is made in one go, during loading)
+    const budget = H.done ? 2 : 1e9;
+    for (; j < G && performance.now() - t0 < budget; j++) {
       for (let i = 0; i < G; i++) {
         const x = this.origin[0] + i * cell, z = this.origin[1] + j * cell;
         let top = -1e9;
@@ -503,17 +507,32 @@ export class Terrain {
         H.work[j * G + i] = top;
       }
     }
-    H.row += rows;
+    H.row = j;
     if (H.row < G) return;
     H.row = -1;
     if (!H.tex) {
       H.tex = this.device.createTexture({
-        label: 'axion-terrain-horizon', size: [G, G], format: 'r32float',
+        label: 'axion-terrain-horizon', size: [G, G], format: 'rg32float',
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
       });
       this.renderer.horizonView = H.tex.createView();
     }
-    this.device.queue.writeTexture({ texture: H.tex }, H.work, { bytesPerRow: G * 4 }, [G, G]);
+    // The new heights in red, the ones they replace in green: the shader
+    // cross-fades between them, so a moving sun slides the shadows instead of
+    // stepping them.
+    const pair = new Float32Array(G * G * 2);
+    const old = H.done ?? H.work;
+    for (let k = 0; k < G * G; k++) { pair[k * 2] = H.work[k]; pair[k * 2 + 1] = old[k]; }
+    H.done = H.work;
+    H.start = performance.now();
+    this.device.queue.writeTexture({ texture: H.tex }, pair, { bytesPerRow: G * 8 }, [G, G]);
+  }
+
+  /** How far the horizon shadows have faded from the previous light direction to the new one. */
+  horizonBlend() {
+    const H = this._horizon;
+    if (!H || !H.start) return 1;
+    return Math.min((performance.now() - H.start) / 900, 1);
   }
 
   /** Called once per frame by the renderer, before any pass is encoded. */

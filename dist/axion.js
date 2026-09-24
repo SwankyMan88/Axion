@@ -425,7 +425,7 @@ struct Camera {
   terrain  : vec4<f32>,   // x = origin x, y = origin z, z = size, w = terrain on
   terrain2 : vec4<f32>,   // x = height samples per side, y = water level, z = water on, w = grass fade
   grass    : vec4<f32>,   // x = radius, y = blade height, z = blade width, w = density
-  extra    : vec4<f32>,   // x = fog height base, y = fog height falloff, z = cloud shadows, w = unused
+  extra    : vec4<f32>,   // x = fog height base, y = fog height falloff, z = cloud shadows, w = horizon shadow blend
   csmWorld : vec4<f32>,   // world-space width of each cascade
   prevViewProj : mat4x4<f32>,
   night    : vec4<f32>,   // xyz = direction toward the real sun (the sky's), w = how much night (0..1)
@@ -901,10 +901,16 @@ fn horizonShadow(P : vec3<f32>) -> f32 {
                 vec2<f32>(0.0), vec2<f32>(dims - 1) - 0.001);
   let i = vec2<i32>(floor(g));
   let f = g - floor(g);
-  let a = textureLoad(horizonTex, i, 0).r;
-  let b = textureLoad(horizonTex, i + vec2<i32>(1, 0), 0).r;
-  let c = textureLoad(horizonTex, i + vec2<i32>(0, 1), 0).r;
-  let d = textureLoad(horizonTex, i + vec2<i32>(1, 1), 0).r;
+  // Cross-fade from the previous light direction (green) to the current one (red)
+  let k = clamp(camera.extra.w, 0.0, 1.0);
+  let ta = textureLoad(horizonTex, i, 0);
+  let tb = textureLoad(horizonTex, i + vec2<i32>(1, 0), 0);
+  let tc = textureLoad(horizonTex, i + vec2<i32>(0, 1), 0);
+  let td = textureLoad(horizonTex, i + vec2<i32>(1, 1), 0);
+  let a = mix(ta.g, ta.r, k);
+  let b = mix(tb.g, tb.r, k);
+  let c = mix(tc.g, tc.r, k);
+  let d = mix(td.g, td.r, k);
   let top = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
   return smoothstep(top - 1.5, top + 2.5, P.y);
 }
@@ -1470,10 +1476,16 @@ fn horizonShadow(P : vec3<f32>) -> f32 {
                 vec2<f32>(0.0), vec2<f32>(dims - 1) - 0.001);
   let i = vec2<i32>(floor(g));
   let f = g - floor(g);
-  let a = textureLoad(horizonTex, i, 0).r;
-  let b = textureLoad(horizonTex, i + vec2<i32>(1, 0), 0).r;
-  let c = textureLoad(horizonTex, i + vec2<i32>(0, 1), 0).r;
-  let d = textureLoad(horizonTex, i + vec2<i32>(1, 1), 0).r;
+  // Cross-fade from the previous light direction (green) to the current one (red)
+  let k = clamp(camera.extra.w, 0.0, 1.0);
+  let ta = textureLoad(horizonTex, i, 0);
+  let tb = textureLoad(horizonTex, i + vec2<i32>(1, 0), 0);
+  let tc = textureLoad(horizonTex, i + vec2<i32>(0, 1), 0);
+  let td = textureLoad(horizonTex, i + vec2<i32>(1, 1), 0);
+  let a = mix(ta.g, ta.r, k);
+  let b = mix(tb.g, tb.r, k);
+  let c = mix(tc.g, tc.r, k);
+  let d = mix(td.g, td.r, k);
   let top = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
   return smoothstep(top - 1.5, top + 2.5, P.y);
 }
@@ -5536,7 +5548,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       cd[232] = this.fogHeight.base;
       cd[233] = this.fogHeight.falloff;
       cd[234] = skyOn ? sky.cloudShadows : 0;
-      cd[235] = 0;
+      cd[235] = this.terrain ? this.terrain.horizonBlend() : 1;
       const ts = this._trueSun ?? sd, md = this._moonDir ?? [0, -1, 0];
       cd[256] = ts[0];
       cd[257] = ts[1];
@@ -6950,8 +6962,10 @@ fn vs(@builtin(instance_index) ii : u32, @location(0) grid : vec3<f32>) -> @buil
       const [lx, ly, lz] = H.dir;
       const flat = Math.hypot(lx, lz);
       const cell = this.size / (G - 1);
-      const rows = Math.min(G - H.row, 24);
-      for (let j = H.row; j < H.row + rows; j++) {
+      const t0 = performance.now();
+      let j = H.row;
+      const budget = H.done ? 2 : 1e9;
+      for (; j < G && performance.now() - t0 < budget; j++) {
         for (let i = 0; i < G; i++) {
           const x = this.origin[0] + i * cell, z = this.origin[1] + j * cell;
           let top = -1e9;
@@ -6969,19 +6983,33 @@ fn vs(@builtin(instance_index) ii : u32, @location(0) grid : vec3<f32>) -> @buil
           H.work[j * G + i] = top;
         }
       }
-      H.row += rows;
+      H.row = j;
       if (H.row < G) return;
       H.row = -1;
       if (!H.tex) {
         H.tex = this.device.createTexture({
           label: "axion-terrain-horizon",
           size: [G, G],
-          format: "r32float",
+          format: "rg32float",
           usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
         });
         this.renderer.horizonView = H.tex.createView();
       }
-      this.device.queue.writeTexture({ texture: H.tex }, H.work, { bytesPerRow: G * 4 }, [G, G]);
+      const pair = new Float32Array(G * G * 2);
+      const old = H.done ?? H.work;
+      for (let k = 0; k < G * G; k++) {
+        pair[k * 2] = H.work[k];
+        pair[k * 2 + 1] = old[k];
+      }
+      H.done = H.work;
+      H.start = performance.now();
+      this.device.queue.writeTexture({ texture: H.tex }, pair, { bytesPerRow: G * 8 }, [G, G]);
+    }
+    /** How far the horizon shadows have faded from the previous light direction to the new one. */
+    horizonBlend() {
+      const H = this._horizon;
+      if (!H || !H.start) return 1;
+      return Math.min((performance.now() - H.start) / 900, 1);
     }
     /** Called once per frame by the renderer, before any pass is encoded. */
     frame({ camera, frustum, cascades, cascadeRedraw }) {

@@ -2030,7 +2030,7 @@ export class Renderer {
     const tu = this.terrain ? this.terrain.uniforms() : null;
     for (let i = 0; i < 12; i++) cd[220 + i] = tu ? tu[i] : 0;
     cd[232] = this.fogHeight.base; cd[233] = this.fogHeight.falloff;
-    cd[234] = skyOn ? sky.cloudShadows : 0; cd[235] = 0;
+    cd[234] = skyOn ? sky.cloudShadows : 0; cd[235] = this.terrain ? this.terrain.horizonBlend() : 1;
     const ts = this._trueSun ?? sd, md = this._moonDir ?? [0, -1, 0];
     cd[256] = ts[0]; cd[257] = ts[1]; cd[258] = ts[2]; cd[259] = this._night ?? 0;
     cd[260] = md[0]; cd[261] = md[1]; cd[262] = md[2];

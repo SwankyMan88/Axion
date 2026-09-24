@@ -57,7 +57,7 @@ struct Camera {
   terrain  : vec4<f32>,   // x = origin x, y = origin z, z = size, w = terrain on
   terrain2 : vec4<f32>,   // x = height samples per side, y = water level, z = water on, w = grass fade
   grass    : vec4<f32>,   // x = radius, y = blade height, z = blade width, w = density
-  extra    : vec4<f32>,   // x = fog height base, y = fog height falloff, z = cloud shadows, w = unused
+  extra    : vec4<f32>,   // x = fog height base, y = fog height falloff, z = cloud shadows, w = horizon shadow blend
   csmWorld : vec4<f32>,   // world-space width of each cascade
   prevViewProj : mat4x4<f32>,
   night    : vec4<f32>,   // xyz = direction toward the real sun (the sky's), w = how much night (0..1)
@@ -542,10 +542,16 @@ fn horizonShadow(P : vec3<f32>) -> f32 {
                 vec2<f32>(0.0), vec2<f32>(dims - 1) - 0.001);
   let i = vec2<i32>(floor(g));
   let f = g - floor(g);
-  let a = textureLoad(horizonTex, i, 0).r;
-  let b = textureLoad(horizonTex, i + vec2<i32>(1, 0), 0).r;
-  let c = textureLoad(horizonTex, i + vec2<i32>(0, 1), 0).r;
-  let d = textureLoad(horizonTex, i + vec2<i32>(1, 1), 0).r;
+  // Cross-fade from the previous light direction (green) to the current one (red)
+  let k = clamp(camera.extra.w, 0.0, 1.0);
+  let ta = textureLoad(horizonTex, i, 0);
+  let tb = textureLoad(horizonTex, i + vec2<i32>(1, 0), 0);
+  let tc = textureLoad(horizonTex, i + vec2<i32>(0, 1), 0);
+  let td = textureLoad(horizonTex, i + vec2<i32>(1, 1), 0);
+  let a = mix(ta.g, ta.r, k);
+  let b = mix(tb.g, tb.r, k);
+  let c = mix(tc.g, tc.r, k);
+  let d = mix(td.g, td.r, k);
   let top = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
   return smoothstep(top - 1.5, top + 2.5, P.y);
 }
@@ -1109,10 +1115,16 @@ fn horizonShadow(P : vec3<f32>) -> f32 {
                 vec2<f32>(0.0), vec2<f32>(dims - 1) - 0.001);
   let i = vec2<i32>(floor(g));
   let f = g - floor(g);
-  let a = textureLoad(horizonTex, i, 0).r;
-  let b = textureLoad(horizonTex, i + vec2<i32>(1, 0), 0).r;
-  let c = textureLoad(horizonTex, i + vec2<i32>(0, 1), 0).r;
-  let d = textureLoad(horizonTex, i + vec2<i32>(1, 1), 0).r;
+  // Cross-fade from the previous light direction (green) to the current one (red)
+  let k = clamp(camera.extra.w, 0.0, 1.0);
+  let ta = textureLoad(horizonTex, i, 0);
+  let tb = textureLoad(horizonTex, i + vec2<i32>(1, 0), 0);
+  let tc = textureLoad(horizonTex, i + vec2<i32>(0, 1), 0);
+  let td = textureLoad(horizonTex, i + vec2<i32>(1, 1), 0);
+  let a = mix(ta.g, ta.r, k);
+  let b = mix(tb.g, tb.r, k);
+  let c = mix(tc.g, tc.r, k);
+  let d = mix(td.g, td.r, k);
   let top = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
   return smoothstep(top - 1.5, top + 2.5, P.y);
 }

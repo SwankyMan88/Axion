@@ -16,7 +16,7 @@
 
     var ctx, master, noiseBuf;
     var wind, water, fire, crickets;
-    var birdTimer = 2, cricketPhase = 0, crackleTimer = 0;
+    var birdTimer = 2, cricketPhase = 0, crackleTimer = 0, splashTimer = 1;
     var last = { x: 0, z: 0, yaw: 0 };
 
     // A few seconds of white noise, looped by every noisy sound
@@ -57,6 +57,43 @@
         return ctx.createStereoPanner ? ctx.createStereoPanner() : gain(1);
     }
 
+    // A sound placed in the world: heard from its direction, quieter with distance
+    function spot(x, y, z, ref) {
+        var p = ctx.createPanner();
+        p.panningModel = "HRTF";
+        p.distanceModel = "inverse";
+        p.refDistance = ref || 4;
+        p.rolloffFactor = 1;
+        if (p.positionX) {
+            p.positionX.value = x;
+            p.positionY.value = y;
+            p.positionZ.value = z;
+        } else {
+            p.setPosition(x, y, z);
+        }
+        p.connect(master);
+        return p;
+    }
+
+    function placeListener(x, y, z, yaw) {
+        var L = ctx.listener;
+        var fx = -Math.sin(yaw), fz = -Math.cos(yaw);
+        if (L.positionX) {
+            L.positionX.value = x;
+            L.positionY.value = y;
+            L.positionZ.value = z;
+            L.forwardX.value = fx;
+            L.forwardY.value = 0;
+            L.forwardZ.value = fz;
+            L.upX.value = 0;
+            L.upY.value = 1;
+            L.upZ.value = 0;
+        } else {
+            L.setPosition(x, y, z);
+            L.setOrientation(fx, 0, fz, 0, 1, 0);
+        }
+    }
+
     // Moves an audio value smoothly toward a target
     function ease(param, v, time) {
         param.setTargetAtTime(v, ctx.currentTime, time || 0.3);
@@ -92,7 +129,14 @@
         high.connect(hf);
         hf.connect(hg);
         hg.connect(master);
-        return { low: lg, high: hg, hf: hf, t: 0 };
+        // Leaves: fine hiss that flutters with the gusts, only among trees
+        var leaf = noiseSource();
+        var ff = filter("highpass", 3500, 0.5);
+        var fg = gain(0);
+        leaf.connect(ff);
+        ff.connect(fg);
+        fg.connect(master);
+        return { low: lg, high: hg, hf: hf, leaves: fg, t: 0 };
     }
 
     function buildWater() {
@@ -168,37 +212,122 @@
         osc.stop(t + length + 0.05);
     }
 
-    // A bird: a few quick whistled notes with sliding pitch
-    function bird(pan, far) {
+    // A bird singing from a tree: a phrase of quick whistled notes, one of a
+    // few kinds of song so the forest doesn't sound like one bird
+    function bird(tree) {
         var t = ctx.currentTime;
-        var base = 2200 + Math.random() * 2600;
-        var notes = 2 + Math.floor(Math.random() * 5);
-        var kind = Math.random();
-        var p = panner();
-        var out = gain(0.07 * (1 - far * 0.7));
-        var f = filter("lowpass", 9000 - far * 5000, 0.5);
-        p.connect(out);
-        out.connect(f);
-        f.connect(master);
-        if (p.pan) {
-            p.pan.value = pan;
-        }
+        var out = spot(tree[0], tree[1], tree[2], 6);
+        var bus = gain(0.11);
+        var f = filter("lowpass", 9000, 0.5);
+        bus.connect(f);
+        f.connect(out);
+
+        var kind = Math.floor(Math.random() * 4);
+        var base = [3200, 2400, 4200, 1800][kind] * (0.85 + Math.random() * 0.3);
+        var notes = [3, 6, 2, 4][kind] + Math.floor(Math.random() * 3);
+        var at = t;
         for (var i = 0; i < notes; i++) {
             var osc = ctx.createOscillator();
             var g = gain(0);
             osc.connect(g);
-            g.connect(p);
-            var start = t + i * (0.09 + Math.random() * 0.08);
-            var len = 0.05 + Math.random() * 0.08;
-            var f0 = base * (0.85 + Math.random() * 0.3);
-            var f1 = kind < 0.5 ? f0 * 1.35 : f0 * 0.7;
-            osc.frequency.setValueAtTime(f0, start);
-            osc.frequency.exponentialRampToValueAtTime(f1, start + len);
-            g.gain.setValueAtTime(0, start);
-            g.gain.linearRampToValueAtTime(1, start + 0.01);
-            g.gain.exponentialRampToValueAtTime(0.001, start + len);
-            osc.start(start);
-            osc.stop(start + len + 0.02);
+            g.connect(bus);
+            var len, f0, f1;
+            if (kind === 0) {            // rising whistles
+                len = 0.08; f0 = base; f1 = base * 1.4;
+            } else if (kind === 1) {     // fast falling trill
+                len = 0.035; f0 = base * (1.1 - i * 0.03); f1 = f0 * 0.8;
+            } else if (kind === 2) {     // two long clear notes
+                len = 0.25; f0 = base * (i ? 0.84 : 1); f1 = f0;
+            } else {                     // warble
+                len = 0.12; f0 = base * (i % 2 ? 1.2 : 1); f1 = f0 * (i % 2 ? 0.9 : 1.1);
+            }
+            osc.frequency.setValueAtTime(f0, at);
+            osc.frequency.exponentialRampToValueAtTime(f1, at + len);
+            // A little vibrato on the long notes
+            if (kind === 2) {
+                var lfo = ctx.createOscillator();
+                var depth = gain(base * 0.02);
+                lfo.frequency.value = 28;
+                lfo.connect(depth);
+                depth.connect(osc.frequency);
+                lfo.start(at);
+                lfo.stop(at + len + 0.05);
+            }
+            g.gain.setValueAtTime(0, at);
+            g.gain.linearRampToValueAtTime(1, at + 0.012);
+            g.gain.exponentialRampToValueAtTime(0.001, at + len);
+            osc.start(at);
+            osc.stop(at + len + 0.03);
+            at += len + (kind === 1 ? 0.015 : 0.05 + Math.random() * 0.06);
+        }
+    }
+
+    // A small wave breaking on the shore: a wash of noise that falls in pitch,
+    // then a scatter of droplets
+    function splash(x, z, level) {
+        var t = ctx.currentTime;
+        var out = spot(x, 0.2, z, 5);
+        var src = ctx.createBufferSource();
+        src.buffer = noiseBuf;
+        var f = filter("lowpass", 2400, 0.8);
+        var g = gain(0);
+        src.connect(f);
+        f.connect(g);
+        g.connect(out);
+        var len = 0.5 + Math.random() * 0.7;
+        f.frequency.setValueAtTime(2600, t);
+        f.frequency.exponentialRampToValueAtTime(350, t + len);
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(0.5 * level, t + 0.08);
+        g.gain.exponentialRampToValueAtTime(0.001, t + len);
+        src.start(t, Math.random() * 2, len + 0.1);
+
+        var drops = 3 + Math.floor(Math.random() * 6);
+        for (var i = 0; i < drops; i++) {
+            var at = t + 0.1 + Math.random() * len * 0.8;
+            var osc = ctx.createOscillator();
+            var dg = gain(0);
+            osc.connect(dg);
+            dg.connect(out);
+            var f0 = 700 + Math.random() * 1400;
+            osc.frequency.setValueAtTime(f0, at);
+            osc.frequency.exponentialRampToValueAtTime(f0 * 2.2, at + 0.03);
+            dg.gain.setValueAtTime(0.12 * level, at);
+            dg.gain.exponentialRampToValueAtTime(0.001, at + 0.04);
+            osc.start(at);
+            osc.stop(at + 0.06);
+        }
+    }
+
+    // One footfall: a soft thump and a crunch made of a few tiny scrapes
+    function footstep(surface) {
+        var t = ctx.currentTime;
+        if (surface === "wood") {
+            knock(105 + Math.random() * 35, 0.4, 0.14);
+            knock(210 + Math.random() * 40, 0.08, 0.06);
+            burst(1600, 1, 0.07, 0.05);
+            return;
+        }
+        if (surface === "water") {
+            burst(800 + Math.random() * 400, 0.8, 0.32, 0.4, 0, "lowpass");
+            burst(3000, 1.5, 0.07, 0.25);
+            return;
+        }
+        knock(60 + Math.random() * 15, 0.22, 0.09);
+        var bits = 4 + Math.floor(Math.random() * 4);
+        for (var i = 0; i < bits; i++) {
+            var src = ctx.createBufferSource();
+            src.buffer = noiseBuf;
+            var f = filter("bandpass", 1800 + Math.random() * 3500, 1.4);
+            var g = gain(0);
+            src.connect(f);
+            f.connect(g);
+            g.connect(master);
+            var at = t + i * (0.012 + Math.random() * 0.02);
+            g.gain.setValueAtTime(0, at);
+            g.gain.linearRampToValueAtTime(0.09 + Math.random() * 0.08, at + 0.004);
+            g.gain.exponentialRampToValueAtTime(0.001, at + 0.03 + Math.random() * 0.04);
+            src.start(at, Math.random() * 2, 0.1);
         }
     }
 
@@ -238,7 +367,8 @@
      *   dt, x, y, z, yaw,          listener (eye) position and heading
      *   daylight,                  0 night .. 1 day
      *   height,                    metres above the valley floor
-     *   forest,                    0 open .. 1 deep forest (for birds)
+     *   forest,                    0 open .. 1 deep forest (for leaves and wind)
+ *   trees: [[x, y, z], ...],   tree crowns nearby, where birds sing from
      *   water,                     0 .. 1, how close the shore is
      *   waterX, waterZ,            where the nearest water is
      *   fires: [[x, y, z], ...],   burning fires
@@ -255,6 +385,7 @@
         last.x = st.x;
         last.z = st.z;
         last.yaw = st.yaw;
+        placeListener(st.x, st.y, st.z, st.yaw);
 
         // Wind: stronger up high and in the open, gusting slowly
         wind.t += dt;
@@ -264,10 +395,19 @@
         ease(wind.low.gain, 0.12 * w, 0.8);
         ease(wind.high.gain, 0.025 * w * (0.4 + up), 0.8);
         ease(wind.hf.frequency, 900 + 900 * gust + up * 600, 1);
+        var flutter = 0.6 + 0.4 * Math.sin(wind.t * 7.3) * Math.sin(wind.t * 3.1);
+        ease(wind.leaves.gain, 0.03 * st.forest * gust * flutter * (st.wind || 1), 0.15);
 
         // Water lapping: swells every few seconds
         water.t += dt;
         var lap = 0.55 + 0.45 * Math.sin(water.t * 1.7) * Math.sin(water.t * 0.53 + 2.1);
+        splashTimer -= dt;
+        if (st.water > 0.2 && splashTimer <= 0) {
+            splashTimer = 0.8 + Math.random() * 2.5;
+            // Somewhere along the shore beside the nearest water
+            var sx = st.waterX + (Math.random() - 0.5) * 12, sz = st.waterZ + (Math.random() - 0.5) * 12;
+            splash(sx, sz, st.water);
+        }
         ease(water.g.gain, 0.16 * st.water * lap, 0.25);
         ease(water.f.frequency, 400 + 500 * lap, 0.25);
         setPan(water.p, panFor(st.waterX, st.waterZ) * 0.8);
@@ -298,9 +438,10 @@
         var day = st.daylight;
         birdTimer -= dt;
         if (birdTimer <= 0) {
-            birdTimer = (1.2 + Math.random() * 5) / (0.4 + st.forest);
-            if (day > 0.3 && Math.random() < day) {
-                bird(Math.random() * 1.6 - 0.8, Math.random());
+            var trees = st.trees || [];
+            birdTimer = trees.length ? 0.8 + Math.random() * 3.5 / (0.3 + trees.length / 10) : 4 + Math.random() * 6;
+            if (day > 0.3 && Math.random() < day && trees.length) {
+                bird(trees[Math.floor(Math.random() * trees.length)]);
             }
         }
         cricketPhase += dt;
@@ -312,16 +453,7 @@
 
         // Footsteps and landings
         if (st.step) {
-            if (st.surface === "wood") {
-                knock(110 + Math.random() * 30, 0.35, 0.12);
-                burst(1800, 1, 0.08, 0.05);
-            } else if (st.surface === "water") {
-                burst(900 + Math.random() * 500, 0.8, 0.3, 0.35, 0, "lowpass");
-                burst(3000, 1.5, 0.06, 0.25);
-            } else {
-                burst(2600 + Math.random() * 1500, 0.6, 0.18, 0.09);
-                burst(600, 0.8, 0.12, 0.07, 0, "lowpass");
-            }
+            footstep(st.surface);
         }
         if (st.land > 0) {
             knock(70, 0.4 * st.land, 0.2);

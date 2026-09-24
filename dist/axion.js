@@ -1,4 +1,4 @@
-/*! Axion 0.9.0 — WebGPU, data-oriented 3D engine. MIT. */
+/*! Axion 0.9.1 — WebGPU, data-oriented 3D engine. MIT. */
 var Axion = (() => {
   var __defProp = Object.defineProperty;
   var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -8260,6 +8260,6 @@ fn vs(@builtin(instance_index) ii : u32, @location(0) grid : vec3<f32>) -> @buil
   }
 
   // src/index.js
-  var VERSION = "0.9.0";
+  var VERSION = "0.9.1";
   return __toCommonJS(index_exports);
 })();

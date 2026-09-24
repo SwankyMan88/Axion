@@ -314,7 +314,7 @@
             <div id="bar"><div id="thumb"></div></div>
         </div>
 
-        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.9.0/dist/axion.min.js"></script><!-- My 3D engine Axion -->
+        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.9.1/dist/axion.min.js"></script><!-- My 3D engine Axion -->
 
         <!-- Shared state -->
         <script>
@@ -322,7 +322,7 @@
                 var vl = window.vl = {};
 
                 // Where the world's asset packs live
-                vl.base = "https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.9.0/assets/";
+                vl.base = "https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.9.1/assets/";
                 vl.packs = ["valley-map", "valley-trees", "valley-nature", "valley-props"];
 
                 vl.canvas = document.getElementById("c");
@@ -1944,7 +1944,7 @@
                 };
 
                 // Sound: what the listener hears depends on where they are
-                var ear = { waterTimer: 0, water: 0, waterX: 0, waterZ: 0, fires: null };
+                var ear = { waterTimer: 0, water: 0, waterX: 0, waterZ: 0, fires: null, treeTimer: 0, trees: [] };
                 function listen(app, dt) {
                     var snd = window.ValleySound;
                     if (!snd || !snd.on) {
@@ -1990,6 +1990,40 @@
                         ear.water = Math.max(0, 1 - best / 50);
                     }
 
+                    // Tree crowns within earshot, for the birds, once a second
+                    ear.treeTimer -= dt;
+                    if (ear.treeTimer <= 0) {
+                        ear.treeTimer = 1;
+                        var found = [];
+                        var ph = vl.phys, cs = ph.cell;
+                        var cx = Math.floor(cam.x / cs), cz = Math.floor(cam.z / cs);
+                        for (var gx = cx - 3; gx <= cx + 3; gx++) {
+                            for (var gz = cz - 3; gz <= cz + 3; gz++) {
+                                var cellList = ph.grid[gx * 4096 + gz];
+                                if (!cellList) {
+                                    continue;
+                                }
+                                for (var q = 0; q < cellList.length; q++) {
+                                    var o = ph.objs[cellList[q]];
+                                    if (!o.trunk || o.height < 4) {
+                                        continue;
+                                    }
+                                    var ddx = o.x - cam.x, ddz = o.z - cam.z;
+                                    var dd = ddx * ddx + ddz * ddz;
+                                    if (dd < 45 * 45) {
+                                        found.push([dd, o]);
+                                    }
+                                }
+                            }
+                        }
+                        found.sort(function (u, v) { return u[0] - v[0]; });
+                        ear.trees = [];
+                        for (q = 0; q < found.length && q < 14; q++) {
+                            var tr = found[q][1];
+                            ear.trees.push([tr.x, tr.y + tr.height * 0.7, tr.z]);
+                        }
+                    }
+
                     // Trees close by make it a forest
                     var trunks = 0;
                     var near = vl.phys.near;
@@ -2016,6 +2050,7 @@
                         daylight: Math.max(0, Math.min(1, (world.day.elevation + 4) / 12)),
                         height: Math.max(0, cam.eyeY - 6),
                         forest: Math.min(1, trunks / 5),
+                        trees: ear.trees,
                         water: ear.water,
                         waterX: ear.waterX,
                         waterZ: ear.waterZ,

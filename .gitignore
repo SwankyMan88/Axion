@@ -10,3 +10,6 @@ demo/assets/sponza-web/
 
 # Poly Haven originals for the Pine Valley packs (scripts/fetch-valley.mjs)
 ph/
+
+# Intermediate Pine Valley packs; the demo ships them joined as pine-valley-1/2.js
+assets/valley-*.js

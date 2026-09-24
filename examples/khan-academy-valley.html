@@ -314,7 +314,7 @@
             <div id="bar"><div id="thumb"></div></div>
         </div>
 
-        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.9.1/dist/axion.min.js"></script><!-- My 3D engine Axion -->
+        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.9.2/dist/axion.min.js"></script><!-- My 3D engine Axion -->
 
         <!-- Shared state -->
         <script>
@@ -322,8 +322,15 @@
                 var vl = window.vl = {};
 
                 // Where the world's asset packs live
-                vl.base = "https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.9.1/assets/";
-                vl.packs = ["valley-map", "valley-trees", "valley-nature", "valley-props"];
+                vl.base = "https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.9.2/assets/";
+                // The world comes in two files; each holds some of the packs
+                vl.files = ["pine-valley-1", "pine-valley-2"];
+                vl.packs = [
+                    { name: "valley-map", file: 0 },
+                    { name: "valley-trees", file: 0 },
+                    { name: "valley-nature", file: 1 },
+                    { name: "valley-props", file: 1 }
+                ];
 
                 vl.canvas = document.getElementById("c");
                 vl.msg = document.getElementById("msg");
@@ -474,38 +481,58 @@
 
                 // Adds a script tag and waits for it. The tag name is split so
                 // nothing that processes this page can mistake it for a real tag.
-                vl.loadScript = function (url) {
+                function addScript(url) {
                     return new Promise(function (ok, fail) {
                         var s = document.createElement("scr" + "ipt");
                         s.src = url;
                         s.onload = ok;
                         s.onerror = function () {
+                            s.parentNode.removeChild(s);
                             fail(new Error("couldn't load " + url));
                         };
                         document.head.appendChild(s);
                     });
+                }
+
+                // The CDN sometimes turns away the first request for a new
+                // version while it fetches it, so a failed file is tried again
+                vl.loadScript = function (url) {
+                    var tries = 0;
+                    function attempt() {
+                        var u = tries ? url + "?try=" + tries : url;
+                        return addScript(u).catch(function (e) {
+                            tries++;
+                            if (tries > 4) {
+                                throw e;
+                            }
+                            vl.progress("the download stalled, trying again (" + tries + ")…");
+                            return new Promise(function (ok) {
+                                setTimeout(ok, 1500 * tries);
+                            }).then(attempt);
+                        });
+                    }
+                    return attempt();
                 };
 
-                // Downloads every pack at once, then hands them over in order;
-                // `each(name, i)` runs once a pack is in, one at a time
+                // Downloads both files at once, then hands the packs over in
+                // order; `each(name, i)` runs once a pack's file is in
                 vl.loadPacks = function (each) {
                     var waits = [];
-                    for (var j = 0; j < vl.packs.length; j++) {
-                        var have = window.AxionAssets && window.AxionAssets[vl.packs[j]];
-                        waits.push(have ? Promise.resolve() : vl.loadScript(vl.base + vl.packs[j] + ".js"));
+                    for (var j = 0; j < vl.files.length; j++) {
+                        waits.push(vl.loadScript(vl.base + vl.files[j] + ".js"));
                     }
                     var i = 0;
                     function next() {
                         if (i >= vl.packs.length) {
                             return Promise.resolve();
                         }
-                        var name = vl.packs[i];
-                        return waits[i].then(function () {
-                            return each(name, i);
+                        var pack = vl.packs[i];
+                        return waits[pack.file].then(function () {
+                            return each(pack.name, i);
                         }).then(function () {
                             // The packed text is several megabytes; drop it once decoded
                             if (window.AxionAssets) {
-                                delete window.AxionAssets[name];
+                                delete window.AxionAssets[pack.name];
                             }
                             i++;
                             return next();
@@ -2104,7 +2131,7 @@
                 };
                 var shares = [0.06, 0.4, 0.72, 0.9];
 
-                vl.progress("downloading (about 27 MB)…", 0.02);
+                vl.progress("downloading the valley (about 28 MB)…", 0.02);
 
                 Axion.App.create(vl.canvas, {
                     maxDpr: 1,
@@ -2166,7 +2193,7 @@
                         return Axion.loadModels(app, entry, { maxTextureSize: 1024 }).then(function (res) {
                             placeModels(app, res.models);
                             if (i + 1 < vl.packs.length) {
-                                vl.progress("downloading " + names[vl.packs[i + 1]] + "…", shares[i] + 0.02);
+                                vl.progress("downloading " + names[vl.packs[i + 1].name] + "…", shares[i] + 0.02);
                             }
                         });
                     });
@@ -2196,8 +2223,6 @@
 
                     document.getElementById("load").className = "done";
 
-                    // Sound comes last and is optional: without it the valley is just quiet
-                    vl.loadScript(vl.base + "valley-sound.js").catch(function () {});
                     if (vl.full.popped) {
                         vl.full.prompt();
                     }

@@ -13,3 +13,6 @@ ph/
 
 # Intermediate Pine Valley packs; the demo ships them joined as pine-valley-1/2.js
 assets/valley-*.js
+
+# The valley's recordings as JSON; they ship inside assets/pine-valley-2.js
+scripts/valley/sound-clips.json

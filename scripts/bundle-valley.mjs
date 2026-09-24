@@ -17,7 +17,15 @@ const parts = {
 
 for (const [out, files] of Object.entries(parts)) {
   let text = `/* Pine Valley for Axion, part ${out.slice(-1)} of 2. Poly Haven models and textures, CC0. See assets/NOTICE.md. */\n`;
-  for (const f of files) text += (await readFile(new URL(`../assets/${f}`, import.meta.url), 'utf8')) + '\n';
+  for (const f of files) {
+    let part = await readFile(new URL(`../assets/${f}`, import.meta.url), 'utf8');
+    // The sound script carries its recordings, kept separately as JSON
+    if (f.endsWith('sound.js')) {
+      const clips = await readFile(new URL('./valley/sound-clips.json', import.meta.url), 'utf8');
+      part = part.replace('/*CLIPS*/null', clips);
+    }
+    text += part + '\n';
+  }
   await writeFile(new URL(`../assets/${out}.js`, import.meta.url), text);
   console.log(`${out}.js ${(text.length / 1e6).toFixed(2)} MB`);
 }

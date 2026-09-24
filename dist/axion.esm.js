@@ -1,4 +1,4 @@
-/*! Axion 0.9.2 — WebGPU, data-oriented 3D engine. MIT. */
+/*! Axion 0.9.3 — WebGPU, data-oriented 3D engine. MIT. */
 var __defProp = Object.defineProperty;
 var __export = (target, all) => {
   for (var name in all)
@@ -8169,7 +8169,7 @@ async function loadModels(app, source, { onProgress = () => {
 }
 
 // src/index.js
-var VERSION = "0.9.2";
+var VERSION = "0.9.3";
 export {
   AO_BLUR_WGSL,
   AO_WGSL,

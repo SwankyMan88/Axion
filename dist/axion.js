@@ -1,4 +1,4 @@
-/*! Axion 0.9.6 — WebGPU, data-oriented 3D engine. MIT. */
+/*! Axion 0.9.7 — WebGPU, data-oriented 3D engine. MIT. */
 var Axion = (() => {
   var __defProp = Object.defineProperty;
   var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -6272,27 +6272,56 @@ fn vsWater(@builtin(instance_index) ii : u32, @location(0) grid : vec3<f32>) -> 
   return o;
 }
 
-/** Slope of a few crossing wave trains, for the water normal. */
+/**
+ * Slope of the lake surface, for the water normal. Wind-driven ripples: wave
+ * trains spread around the wind's direction with wavelengths that never line
+ * up, a slow patchwork of calmer and gustier water drifting downwind (the
+ * dark "cat's paws" on a real lake), and fine noise on top, so no pattern
+ * repeats across the lake.
+ */
 fn waveSlope(xz : vec2<f32>, t : f32) -> vec2<f32> {
+  var wd = camera.wind.xy;
+  if (dot(wd, wd) < 1e-4) { wd = vec2<f32>(0.8, 0.6); }
+  wd = normalize(wd);
+  let side = vec2<f32>(-wd.y, wd.x);
+
+  // Gust patches, drifting with the wind
+  let drift = xz - wd * t * 1.6;
+  let gust = 0.35 + 0.9 * smoothstep(0.3, 0.75, fbm2(drift * 0.012, 3));
+
   var g = vec2<f32>(0.0);
-  let dirs = array<vec2<f32>, 5>(
-    vec2<f32>(0.8, 0.6), vec2<f32>(-0.45, 0.89), vec2<f32>(0.97, -0.24),
-    vec2<f32>(-0.7, -0.71), vec2<f32>(0.2, 0.98));
-  let lens = array<f32, 5>(4.1, 2.3, 1.37, 0.83, 0.51);
-  for (var i = 0; i < 5; i = i + 1) {
+  let spread = array<f32, 8>(0.0, 0.55, -0.42, 0.95, -0.8, 0.25, -1.2, 1.35);
+  let lens = array<f32, 8>(5.3, 3.1, 2.37, 1.61, 1.13, 0.83, 0.59, 0.41);
+  let phase = array<f32, 8>(0.0, 1.7, 4.1, 2.6, 5.3, 0.9, 3.8, 2.2);
+  for (var i = 0; i < 8; i = i + 1) {
+    let dir = normalize(wd * cos(spread[i]) + side * sin(spread[i]));
     let k = 6.2831853 / lens[i];
     let c = sqrt(9.81 / k);
-    let ph = dot(dirs[i], xz) * k - c * k * t * 0.35;
-    let a = 0.012 * lens[i];
-    g = g + dirs[i] * (a * k * cos(ph));
+    // Each train warps a little across the lake so crests aren't ruler-straight
+    let bend = noise2(xz * (0.05 + f32(i) * 0.013) + vec2<f32>(f32(i) * 7.1, 3.3)) * 2.4;
+    let ph = dot(dir, xz) * k + bend - c * k * t * 0.35 + phase[i];
+    let a = 0.011 * lens[i] * (0.6 + 0.4 * sin(f32(i) * 2.3 + dot(xz, side) * 0.01));
+    g = g + dir * (a * k * cos(ph));
   }
-  // Fine noise on top so the surface is never regular.
-  let e = 0.15;
-  let n0 = noise2(xz * 1.3 + vec2<f32>(t * 0.21, t * 0.17));
-  let nx = noise2((xz + vec2<f32>(e, 0.0)) * 1.3 + vec2<f32>(t * 0.21, t * 0.17));
-  let nz = noise2((xz + vec2<f32>(0.0, e)) * 1.3 + vec2<f32>(t * 0.21, t * 0.17));
-  g = g + vec2<f32>(nx - n0, nz - n0) / e * 0.05;
-  return g;
+  g = g * gust;
+
+  // Fine chop: two layers of noise sliding at different speeds
+  let e = 0.12;
+  let s1 = xz * 1.7 + wd * t * 0.55;
+  let s2 = xz * 3.9 - side * t * 0.35 + wd * t * 0.9;
+  let n1 = noise2(s1);
+  let n2 = noise2(s2);
+  let dx = (noise2(s1 + vec2<f32>(e * 1.7, 0.0)) - n1) + (noise2(s2 + vec2<f32>(e * 3.9, 0.0)) - n2) * 0.5;
+  let dz = (noise2(s1 + vec2<f32>(0.0, e * 1.7)) - n1) + (noise2(s2 + vec2<f32>(0.0, e * 3.9)) - n2) * 0.5;
+  g = g + vec2<f32>(dx, dz) / e * 0.035 * (0.5 + gust * 0.5);
+  return g * (0.5 + 0.5 * camera.wind.z);
+}
+
+/** Top of the ground at xz, with the forest canopy on it where there is forest. */
+fn canopyTop(xz : vec2<f32>) -> f32 {
+  let h = heightAt(xz);
+  let forest = textureSampleLevel(splatTex, clampSampler, terrainUV(xz), 0.0).r;
+  return h + smoothstep(0.25, 0.6, forest) * 14.0;
 }
 
 /**
@@ -6363,12 +6392,6 @@ fn mirrorMarch(start : vec3<f32>, R : vec3<f32>) -> vec4<f32> {
   return vec4<f32>(lit, hi);
 }
 
-/** Top of the ground at xz, with the forest canopy on it where there is forest. */
-fn canopyTop(xz : vec2<f32>) -> f32 {
-  let h = heightAt(xz);
-  let forest = textureSampleLevel(splatTex, clampSampler, terrainUV(xz), 0.0).r;
-  return h + smoothstep(0.25, 0.6, forest) * 14.0;
-}
 
 @fragment
 fn fsWater(in : WOut) -> GBuffer {
@@ -6395,8 +6418,8 @@ fn fsWater(in : WOut) -> GBuffer {
   var albedo = mix(tp.water.rgb, tp.water2.rgb, absorb);
   // A thin line of foam where the water meets the shore.
   let foamNoise = noise2(world.xz * 2.7 + vec2<f32>(t * 0.3, 0.0));
-  let foam = (1.0 - smoothstep(0.0, 0.25, depth)) * smoothstep(0.35, 0.7, foamNoise);
-  albedo = mix(albedo, vec3<f32>(0.62, 0.66, 0.66), foam * 0.4);
+  let foam = (1.0 - smoothstep(0.0, 0.12, depth)) * smoothstep(0.45, 0.8, foamNoise);
+  albedo = mix(albedo, vec3<f32>(0.62, 0.66, 0.66), foam * 0.25);
 
   var s : Surface;
   s.P = world;
@@ -8371,6 +8394,6 @@ fn vs(@builtin(instance_index) ii : u32, @location(0) grid : vec3<f32>) -> @buil
   }
 
   // src/index.js
-  var VERSION = "0.9.6";
+  var VERSION = "0.9.7";
   return __toCommonJS(index_exports);
 })();

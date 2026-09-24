@@ -21,7 +21,7 @@
 
 /* ------------------------------------------------------------- shared ---- */
 
-const COMMON = /* wgsl */`
+export const COMMON = /* wgsl */`
 struct Camera {
   viewProj : mat4x4<f32>,
   view     : mat4x4<f32>,
@@ -46,7 +46,20 @@ struct Camera {
   expo     : vec4<f32>,   // x = min log2 exposure, y = max log2 exposure, z = adapt speed, w = frame dt
   dof      : vec4<f32>,   // x = focus distance, y = in-focus half range, z = transition, w = max blur px
   dof2     : vec4<f32>,   // x = near on, y = far on, z = auto focus, w = enabled
-  pad      : vec4<f32>,
+  sky      : vec4<f32>,   // x = sky on, y = sun disc, z = cloud cover, w = cloud time
+  sunDir   : vec4<f32>,   // xyz = direction toward the sun, w = sun on
+  sunColor : vec4<f32>,   // rgb = sun radiance at the ground, w = sun shadows on
+  csmSplits : vec4<f32>,  // view distance where each shadow cascade ends
+  csmParams : vec4<f32>,  // x = map size, y = PCF radius (texels), z = normal bias (texels), w = unused
+  csm      : array<mat4x4<f32>, 4>,   // light view-projection per cascade
+  wind     : vec4<f32>,   // xy = direction (xz), z = strength, w = time
+  sky2     : vec4<f32>,   // x = sky brightness, y = cloud height, z = cloud scale, w = haze
+  terrain  : vec4<f32>,   // x = origin x, y = origin z, z = size, w = terrain on
+  terrain2 : vec4<f32>,   // x = height samples per side, y = water level, z = water on, w = grass fade
+  grass    : vec4<f32>,   // x = radius, y = blade height, z = blade width, w = density
+  extra    : vec4<f32>,   // x = fog height base, y = fog height falloff, z = cloud shadows, w = unused
+  csmWorld : vec4<f32>,   // world-space width of each cascade
+  prevViewProj : mat4x4<f32>,
 };
 
 const PI : f32 = 3.14159265359;
@@ -202,7 +215,7 @@ export const CUBE_FACES = [
   { f: [0, 0, -1], u: [0, -1, 0] },
 ];
 
-const CUBE_WGSL = /* wgsl */`
+export const CUBE_WGSL = /* wgsl */`
 const FACE_F = array<vec3<f32>, 6>(
   vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0),
   vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0),
@@ -220,7 +233,7 @@ fn faceIndex(v : vec3<f32>) -> i32 {
 }
 `;
 
-const MATERIAL_WGSL = /* wgsl */`
+export const MATERIAL_WGSL = /* wgsl */`
 /* Material textures: group 1, identical layout in the geometry and the
    alpha-tested shadow pass. Untextured materials bind 1x1 defaults. */
 struct MaterialParams {
@@ -246,7 +259,7 @@ struct Face {
 // Same layout as the geometry pass's instances; only the matrix is read here.
 struct Caster {
   model : mat4x4<f32>,
-  rest  : array<vec4<f32>, 3>,
+  rest  : array<vec4<f32>, 4>,
 };
 
 @group(0) @binding(0) var<uniform> face : Face;
@@ -284,90 +297,19 @@ fn fsMask(in : MaskOut) {
 }
 `;
 
-/* ------------------------------------------------------------ geometry -- */
+/* ------------------------------------------------------------- noise ---- */
 
-export const STANDARD_WGSL = /* wgsl */`
-${COMMON}
-${CUBE_WGSL}
-
-struct Instance {
-  model : mat4x4<f32>,
-  color : vec4<f32>,   // rgb = albedo tint, a = alpha
-  pbr   : vec4<f32>,   // x = metallic, y = roughness, z = emissive, w = unused
-  surf  : vec4<f32>,   // x = noise scale, y = noise strength, z = bump, w = oxide
-};
-
-struct Light {
-  posRange   : vec4<f32>,  // xyz = world position, w = range
-  colorPower : vec4<f32>,  // rgb = color, a = intensity
-  shadowInfo : vec4<f32>,  // x = shadow slot (-1 = none), y = near, z = bias, w = far
-};
-
-@group(0) @binding(0) var<uniform> camera : Camera;
-@group(0) @binding(1) var<storage, read> instances : array<Instance>;
-@group(0) @binding(2) var<storage, read> lights : array<Light>;
-@group(0) @binding(3) var shadowMaps : texture_depth_2d_array;
-@group(0) @binding(4) var shadowSampler : sampler_comparison;
-// Slots that survived culling this frame; instance_index walks this list.
-@group(0) @binding(5) var<storage, read> visible : array<u32>;
-${MATERIAL_WGSL}
-struct VSOut {
-  @invariant @builtin(position) clip : vec4<f32>,
-  @location(0) worldPos   : vec3<f32>,
-  @location(1) normal     : vec3<f32>,
-  @location(2) uv         : vec2<f32>,
-  // Per-object values: flat, so the rasterizer copies them instead of interpolating.
-  @location(3) @interpolate(flat) color : vec4<f32>,
-  @location(4) @interpolate(flat) pbr   : vec4<f32>,
-  @location(5) @interpolate(flat) surf  : vec4<f32>,
-};
-
-struct GBuffer {
-  @location(0) color   : vec4<f32>,
-  @location(1) surface : vec4<f32>,
-  @location(2) albedo  : vec4<f32>,
-};
-
-@vertex
-fn vs(
-  @builtin(instance_index) ii : u32,
-  @location(0) position : vec3<f32>,
-  @location(1) normal   : vec3<f32>,
-  @location(2) uv       : vec2<f32>,
-) -> VSOut {
-  let inst = instances[visible[ii]];
-  let world = inst.model * vec4<f32>(position, 1.0);
-  let n = normalize((inst.model * vec4<f32>(normal, 0.0)).xyz);
-
-  var out : VSOut;
-  out.clip = camera.viewProj * world;
-  out.worldPos = world.xyz;
-  out.normal = n;
-  out.uv = uv;
-  out.color = inst.color;
-  out.pbr = inst.pbr;
-  out.surf = inst.surf;
-  return out;
-}
-
-/*
- * Depth prepass. Same math as vs above, and both outputs are @invariant, so
- * the main pass can test depth for equality and shade every pixel once.
- */
-@vertex
-fn vsDepth(@builtin(instance_index) ii : u32,
-           @location(0) position : vec3<f32>) -> @invariant @builtin(position) vec4<f32> {
-  let inst = instances[visible[ii]];
-  let world = inst.model * vec4<f32>(position, 1.0);
-  return camera.viewProj * world;
-}
-
-/* ----------------------------------------------------------- noise ----- */
-
+export const NOISE_WGSL = /* wgsl */`
 fn hash31(p : vec3<f32>) -> f32 {
   var q = fract(p * 0.3183099 + vec3<f32>(0.1, 0.1, 0.1));
   q = q * 17.0;
   return fract(q.x * q.y * q.z * (q.x + q.y + q.z));
+}
+
+fn hash21(p : vec2<f32>) -> f32 {
+  var q = fract(p * vec2<f32>(0.1031, 0.1030));
+  q = q + dot(q, q.yx + 33.33);
+  return fract((q.x + q.y) * q.x);
 }
 
 /** Trilinear value noise with a smootherstep fade — no visible lattice. */
@@ -392,6 +334,18 @@ fn valueNoise(p : vec3<f32>) -> f32 {
   return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
 }
 
+/** 2D value noise, same fade. */
+fn noise2(p : vec2<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+  let a = hash21(i);
+  let b = hash21(i + vec2<f32>(1.0, 0.0));
+  let c = hash21(i + vec2<f32>(0.0, 1.0));
+  let d = hash21(i + vec2<f32>(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
 /** Four-octave fBm. Lacunarity 2.02 to keep octaves from lining up. */
 fn fbm(p : vec3<f32>) -> f32 {
   var sum = 0.0;
@@ -405,8 +359,73 @@ fn fbm(p : vec3<f32>) -> f32 {
   return sum;
 }
 
-/* ---------------------------------------------------------- shadowing --- */
+fn fbm2(p : vec2<f32>, octaves : i32) -> f32 {
+  var sum = 0.0;
+  var amp = 0.5;
+  var q = p;
+  for (var i = 0; i < octaves; i = i + 1) {
+    sum = sum + noise2(q) * amp;
+    q = vec2<f32>(q.x * 1.6 + q.y * 1.2, q.y * 1.6 - q.x * 1.2);   // rotate so octaves never line up
+    amp = amp * 0.5;
+  }
+  return sum;
+}
 
+/**
+ * Cloud layer density at a world position on the cloud plane. Shared by the
+ * sky, which draws the clouds, and the lighting, which uses the same field for
+ * the shadows they cast, so the two always agree.
+ */
+fn cloudDensity(xz : vec2<f32>) -> f32 {
+  let uv = xz * camera.sky2.z + vec2<f32>(camera.wind.x, camera.wind.y) * camera.sky.w;
+  let n = fbm2(uv, 5);
+  let cover = camera.sky.z;
+  return smoothstep(1.0 - cover, 1.0 - cover + 0.32, n + 0.12 * cover);
+}
+`;
+
+/* ------------------------------------------------------ scene bindings -- */
+
+/**
+ * Group 0 for every pass that draws surfaces into the G-buffer: objects,
+ * terrain, water and grass share one layout and one bind group, so switching
+ * between them never rebinds the frame.
+ */
+export const SCENE_WGSL = /* wgsl */`
+struct Light {
+  posRange   : vec4<f32>,  // xyz = world position, w = range
+  colorPower : vec4<f32>,  // rgb = color, a = intensity
+  shadowInfo : vec4<f32>,  // x = shadow slot (-1 = none), y = near, z = bias, w = far
+};
+
+@group(0) @binding(0) var<uniform> camera : Camera;
+@group(0) @binding(2) var<storage, read> lights : array<Light>;
+@group(0) @binding(3) var shadowMaps : texture_depth_2d_array;
+@group(0) @binding(4) var shadowSampler : sampler_comparison;
+@group(0) @binding(6) var sunShadowMaps : texture_depth_2d_array;
+
+struct GBuffer {
+  @location(0) color   : vec4<f32>,
+  @location(1) surface : vec4<f32>,
+  @location(2) albedo  : vec4<f32>,
+};
+
+/** Pack a lit surface into the three targets the resolve pass reads. */
+fn gbuffer(lit : vec3<f32>, alpha : f32, N : vec3<f32>, albedo : vec3<f32>,
+           roughness : f32, metallic : f32) -> GBuffer {
+  var out : GBuffer;
+  out.color = vec4<f32>(sanitize(lit), alpha);
+  let viewN = normalize((camera.view * vec4<f32>(N, 0.0)).xyz);
+  let oct = octEncode(viewN);
+  out.surface = vec4<f32>(oct.x, oct.y, roughness, metallic);
+  out.albedo = vec4<f32>(albedo, 1.0);
+  return out;
+}
+`;
+
+/* ------------------------------------------------------------ lighting -- */
+
+export const LIGHTING_WGSL = /* wgsl */`
 /**
  * Point-light shadow lookup.
  *
@@ -459,7 +478,63 @@ fn sampleShadow(slot : i32, toFrag : vec3<f32>, nDotL : f32,
   return sum / 12.0;
 }
 
-/* ---------------------------------------------------------- lighting --- */
+/**
+ * Sun shadow from the cascades.
+ *
+ * The cascade is picked by view distance. Over the last part of each cascade
+ * the choice is dithered toward the next one, so the seam between two maps of
+ * different resolution dissolves instead of drawing a line across the ground.
+ * The lookup point is pushed off the surface along its normal by a few texels
+ * of the chosen cascade — acne goes away without the bias that would float
+ * shadows off their contact points.
+ */
+fn sunShadow(P : vec3<f32>, geomN : vec3<f32>, nDotL : f32, pixel : vec2<f32>) -> f32 {
+  if (camera.sunColor.w < 0.5) { return 1.0; }
+  let viewZ = -(camera.view * vec4<f32>(P, 1.0)).z;
+  let splits = camera.csmSplits;
+  if (viewZ > splits.w) { return 1.0; }
+
+  var c = 0;
+  if (viewZ > splits.x) { c = 1; }
+  if (viewZ > splits.y) { c = 2; }
+  if (viewZ > splits.z) { c = 3; }
+
+  let end = splits[c];
+  var start = camera.proj.z;
+  if (c > 0) { start = splits[c - 1]; }
+  let band = (end - start) * 0.15;
+  let noise = (f32(interleavedIndex(pixel)) + 0.5) / 16.0;
+  if (c < 3 && viewZ > end - band && noise < (viewZ - (end - band)) / band) { c = c + 1; }
+
+  let texelWorld = camera.csmWorld[c] / camera.csmParams.x;
+  let slope = clamp(1.0 - nDotL, 0.0, 1.0);
+  let offset = geomN * texelWorld * camera.csmParams.z * (1.0 + slope * 2.0);
+  let lp = camera.csm[c] * vec4<f32>(P + offset, 1.0);
+  let uv = vec2<f32>(lp.x * 0.5 + 0.5, 0.5 - lp.y * 0.5);
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || lp.z > 1.0) { return 1.0; }
+
+  let radius = camera.csmParams.y / camera.csmParams.x;
+  let rot = f32(interleavedIndex(pixel)) * 0.3927;
+  var sum = 0.0;
+  for (var i = 0; i < 8; i = i + 1) {
+    let r = sqrt((f32(i) + 0.5) / 8.0);
+    let theta = f32(i) * 2.39996323 + rot;
+    let o = vec2<f32>(cos(theta), sin(theta)) * r * radius;
+    sum = sum + textureSampleCompareLevel(sunShadowMaps, shadowSampler, uv + o, c, lp.z);
+  }
+  let s = sum / 8.0;
+  return mix(s, 1.0, smoothstep(splits.w * 0.85, splits.w, viewZ));
+}
+
+/** Shadow the clouds cast: the cloud field where the sun ray through P crosses the cloud plane. */
+fn cloudShadow(P : vec3<f32>) -> f32 {
+  if (camera.extra.z <= 0.0 || camera.sky.x < 0.5 || camera.sky.z <= 0.0) { return 1.0; }
+  let L = camera.sunDir.xyz;
+  if (L.y < 0.02) { return 1.0; }
+  let t = (camera.sky2.y - P.y) / L.y;
+  let d = cloudDensity(P.xz + L.xz * t);
+  return 1.0 - d * camera.extra.z;
+}
 
 fn distributionGGX(nDotH : f32, roughness : f32) -> f32 {
   let a = roughness * roughness;
@@ -480,6 +555,235 @@ fn fresnelSchlick(cosTheta : f32, f0 : vec3<f32>) -> vec3<f32> {
   return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
+/** Cook-Torrance plus Lambert for one light direction, times n.l. */
+fn brdf(N : vec3<f32>, V : vec3<f32>, L : vec3<f32>, albedo : vec3<f32>,
+        roughness : f32, metallic : f32, nDotV : f32, nDotL : f32) -> vec3<f32> {
+  let f0 = mix(vec3<f32>(0.04), albedo, metallic);
+  let H = normalize(V + L);
+  let D = distributionGGX(max(dot(N, H), 0.0), roughness);
+  let G = geometrySmith(nDotV, nDotL, roughness);
+  let F = fresnelSchlick(max(dot(H, V), 0.0), f0);
+  let spec = (D * G * F) / max(4.0 * nDotV * nDotL, 1e-4);
+  let kD = (vec3<f32>(1.0) - F) * (1.0 - metallic);
+  return (kD * albedo / PI + spec) * nDotL;
+}
+
+struct Surface {
+  P : vec3<f32>,
+  N : vec3<f32>,          // shading normal
+  geomN : vec3<f32>,      // geometric normal, for shadow offsets
+  V : vec3<f32>,
+  albedo : vec3<f32>,
+  roughness : f32,
+  metallic : f32,
+  translucency : f32,     // light passing through thin leaves and blades
+};
+
+/**
+ * Direct light: the sun (cascaded shadows, cloud shadows) and every point
+ * light. Ambient is not here — the resolve pass adds it, under AO.
+ */
+fn shadeDirect(s : Surface, pixel : vec2<f32>) -> vec3<f32> {
+  let nDotV = max(dot(s.N, s.V), 1e-4);
+  var Lo = vec3<f32>(0.0);
+
+  if (camera.sunDir.w > 0.5) {
+    let L = camera.sunDir.xyz;
+    let nl = dot(s.N, L);
+    let nDotL = max(nl, 0.0);
+    if (nDotL > 0.0 || s.translucency > 0.0) {
+      let sh = sunShadow(s.P, s.geomN, max(dot(s.geomN, L), 0.0), pixel) * cloudShadow(s.P);
+      let radiance = camera.sunColor.rgb * sh;
+      if (nDotL > 0.0) {
+        Lo = Lo + brdf(s.N, s.V, L, s.albedo, s.roughness, s.metallic, nDotV, nDotL) * radiance;
+      }
+      if (s.translucency > 0.0) {
+        // Back-lit leaves glow: a wrapped diffuse from behind plus a forward
+        // scattering lobe toward a viewer looking at the sun through them.
+        let back = max(-nl, 0.0) * 0.6;
+        let through = pow(max(dot(-s.V, L), 0.0), 6.0);
+        Lo = Lo + s.albedo * radiance * s.translucency * (back + through) / PI;
+      }
+    }
+  }
+
+  let count = u32(camera.params.x);
+  for (var i : u32 = 0u; i < count; i = i + 1u) {
+    let light = lights[i];
+    let toLight = light.posRange.xyz - s.P;
+    let dist = length(toLight);
+    if (dist > light.posRange.w) { continue; }
+    let L = toLight / max(dist, 1e-4);
+    let nDotL = max(dot(s.N, L), 0.0);
+    if (nDotL <= 0.0) { continue; }
+
+    // Windowed inverse-square: reaches exactly zero at the light's range, so
+    // culling by range can never pop.
+    let ratio = dist / light.posRange.w;
+    let window = clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);
+    let atten = (window * window) / (dist * dist + 1.0);
+
+    var shadow = 1.0;
+    let slot = i32(light.shadowInfo.x);
+    if (slot >= 0) {
+      // Offset along the geometric normal before the lookup: this moves the
+      // sample off the surface that casts it, which kills acne without the
+      // depth bias that would otherwise detach the contact shadow.
+      let offset = s.geomN * camera.shadow.z;
+      shadow = sampleShadow(slot, (s.P + offset) - light.posRange.xyz, nDotL,
+                            light.shadowInfo.y, light.shadowInfo.z, light.shadowInfo.w);
+      if (shadow <= 0.001) { continue; }
+    }
+
+    let radiance = light.colorPower.rgb * light.colorPower.a * atten * shadow;
+    Lo = Lo + brdf(s.N, s.V, L, s.albedo, s.roughness, s.metallic, nDotV, nDotL) * radiance;
+  }
+  return Lo;
+}
+`;
+
+/* ------------------------------------------------------------ geometry -- */
+
+export const STANDARD_WGSL = /* wgsl */`
+${COMMON}
+${CUBE_WGSL}
+${NOISE_WGSL}
+${SCENE_WGSL}
+${LIGHTING_WGSL}
+
+struct Instance {
+  model : mat4x4<f32>,
+  color : vec4<f32>,   // rgb = albedo tint, a = alpha
+  pbr   : vec4<f32>,   // x = metallic, y = roughness, z = emissive, w = wind
+  surf  : vec4<f32>,   // x = noise scale, y = noise strength, z = bump, w = oxide
+  extra : vec4<f32>,   // x = translucency, y = fade-out distance, z = leaf flutter, w = unused
+};
+
+@group(0) @binding(1) var<storage, read> instances : array<Instance>;
+// Slots that survived culling this frame; instance_index walks this list.
+@group(0) @binding(5) var<storage, read> visible : array<u32>;
+${MATERIAL_WGSL}
+struct VSOut {
+  @invariant @builtin(position) clip : vec4<f32>,
+  @location(0) worldPos   : vec3<f32>,
+  @location(1) normal     : vec3<f32>,
+  @location(2) uv         : vec2<f32>,
+  // Per-object values: flat, so the rasterizer copies them instead of interpolating.
+  @location(3) @interpolate(flat) color : vec4<f32>,
+  @location(4) @interpolate(flat) pbr   : vec4<f32>,
+  @location(5) @interpolate(flat) surf  : vec4<f32>,
+  @location(6) @interpolate(flat) extra : vec4<f32>,
+};
+
+/**
+ * World position of one vertex of one instance: the model matrix, then the
+ * distance fade (objects shrink away just before their draw distance instead
+ * of popping), then wind. Every pass that must agree on depth calls this one
+ * function, so the prepass and the shaded pass can never disagree.
+ */
+fn instanceWorld(inst : Instance, position : vec3<f32>) -> vec3<f32> {
+  let origin = inst.model[3].xyz;
+  var local = position;
+  let fadeDist = inst.extra.y;
+  if (fadeDist > 0.0) {
+    let d = distance(origin, camera.position.xyz);
+    local = local * (1.0 - smoothstep(fadeDist * 0.82, fadeDist, d));
+  }
+  var world = (inst.model * vec4<f32>(local, 1.0)).xyz;
+
+  let wind = inst.pbr.w * camera.wind.z;
+  if (wind > 0.0) {
+    // Whole-plant sway grows with height above the root; a second, faster
+    // wave rides on top, and leaves flutter on their own.
+    let h = max(world.y - origin.y, 0.0);
+    let t = camera.wind.w;
+    let phase = dot(origin.xz, vec2<f32>(0.071, 0.053));
+    let gust = 0.65 + 0.35 * sin(t * 0.31 + phase * 0.4);
+    let sway = (sin(t * 1.1 + phase) * 0.7 + sin(t * 2.7 + phase * 1.9) * 0.3) * gust;
+    let bend = wind * sway * h * h * 0.0025;
+    let dir = vec3<f32>(camera.wind.x, 0.0, camera.wind.y);
+    world = world + dir * bend;
+    let flutter = inst.extra.z * wind;
+    if (flutter > 0.0) {
+      let k = dot(world, vec3<f32>(1.7, 2.3, 1.3));
+      world = world + vec3<f32>(sin(t * 6.1 + k), sin(t * 7.3 + k * 1.3) * 0.5, cos(t * 5.3 + k)) * flutter * 0.035;
+    }
+  }
+  return world;
+}
+
+@vertex
+fn vs(
+  @builtin(instance_index) ii : u32,
+  @location(0) position : vec3<f32>,
+  @location(1) normal   : vec3<f32>,
+  @location(2) uv       : vec2<f32>,
+) -> VSOut {
+  let inst = instances[visible[ii]];
+  let world = instanceWorld(inst, position);
+  let n = normalize((inst.model * vec4<f32>(normal, 0.0)).xyz);
+
+  var out : VSOut;
+  out.clip = camera.viewProj * vec4<f32>(world, 1.0);
+  out.worldPos = world;
+  out.normal = n;
+  out.uv = uv;
+  out.color = inst.color;
+  out.pbr = inst.pbr;
+  out.surf = inst.surf;
+  out.extra = inst.extra;
+  return out;
+}
+
+/*
+ * Depth prepass. Same math as vs above, and both outputs are @invariant, so
+ * the main pass can test depth for equality and shade every pixel once.
+ */
+@vertex
+fn vsDepth(@builtin(instance_index) ii : u32,
+           @location(0) position : vec3<f32>) -> @invariant @builtin(position) vec4<f32> {
+  let inst = instances[visible[ii]];
+  return camera.viewProj * vec4<f32>(instanceWorld(inst, position), 1.0);
+}
+
+struct MaskDepthOut {
+  @invariant @builtin(position) clip : vec4<f32>,
+  @location(0) uv : vec2<f32>,
+  @location(1) @interpolate(flat) alpha : f32,
+};
+
+/** Depth prepass for alpha-tested surfaces: the same cut-out as the main pass. */
+@vertex
+fn vsDepthMask(@builtin(instance_index) ii : u32,
+               @location(0) position : vec3<f32>,
+               @location(2) uv : vec2<f32>) -> MaskDepthOut {
+  let inst = instances[visible[ii]];
+  var o : MaskDepthOut;
+  o.clip = camera.viewProj * vec4<f32>(instanceWorld(inst, position), 1.0);
+  o.uv = uv;
+  o.alpha = inst.color.a;
+  return o;
+}
+
+/**
+ * Alpha for an alpha test, kept from thinning out with distance. Mips average
+ * alpha toward the middle, so a leaf that is solid up close dissolves into
+ * nothing far away; scaling by the mip level being read keeps its coverage.
+ */
+fn cutoutAlpha(a : f32, uv : vec2<f32>) -> f32 {
+  let size = vec2<f32>(textureDimensions(baseColorTex, 0));
+  let dx = dpdx(uv * size);
+  let dy = dpdy(uv * size);
+  let lod = max(0.5 * log2(max(dot(dx, dx), dot(dy, dy))), 0.0);
+  return a * (1.0 + lod * 0.25);
+}
+
+@fragment
+fn fsDepthMask(in : MaskDepthOut) {
+  let a = cutoutAlpha(textureSample(baseColorTex, matSampler, in.uv).a, in.uv) * in.alpha;
+  if (a < material.alphaCutoff) { discard; }
+}
+
 @fragment
 fn fs(in : VSOut, @builtin(front_facing) front : bool) -> GBuffer {
   // Everything that needs derivatives happens first, in uniform control flow:
@@ -492,17 +796,24 @@ fn fs(in : VSOut, @builtin(front_facing) front : bool) -> GBuffer {
   let dp2 = dpdy(in.worldPos);
   let duv1 = dpdx(in.uv);
   let duv2 = dpdy(in.uv);
+  let cut = cutoutAlpha(base.a, in.uv);
 
-  let alpha = in.color.a * base.a;
-  if (material.alphaCutoff > 0.0 && alpha < material.alphaCutoff) { discard; }
+  var alpha = in.color.a * base.a;
+  if (material.alphaCutoff > 0.0) {
+    if (in.color.a * cut < material.alphaCutoff) { discard; }
+    alpha = 1.0;
+  }
 
   var albedo = in.color.rgb * base.rgb;
   var metallic = clamp(in.pbr.x * mr.b, 0.0, 1.0);
   var roughness = clamp(in.pbr.y * mr.g, 0.04, 1.0);
 
-  // A double-sided surface seen from behind must be lit from behind.
-  var N = safeNormalize(in.normal, vec3<f32>(0.0, 1.0, 0.0));
-  if (!front) { N = -N; }
+  // A double-sided surface seen from behind must be lit from behind — except
+  // translucent foliage, whose normals are authored to point out of the crown
+  // on both sides: flipping them would leave half of every tree in the dark.
+  var geomN = safeNormalize(in.normal, vec3<f32>(0.0, 1.0, 0.0));
+  if (!front && in.extra.x <= 0.0) { geomN = -geomN; }
+  var N = geomN;
 
   if (material.hasNormalMap > 0.5) {
     /*
@@ -549,58 +860,19 @@ fn fs(in : VSOut, @builtin(front_facing) front : bool) -> GBuffer {
     metallic = clamp(metallic * (1.0 - wear * in.surf.w * 0.85), 0.0, 1.0);
   }
 
-  let V = normalize(camera.position.xyz - in.worldPos);
-  let nDotV = max(dot(N, V), 1e-4);
-  let f0 = mix(vec3<f32>(0.04), albedo, metallic);
-  var Lo = vec3<f32>(0.0);
+  var s : Surface;
+  s.P = in.worldPos;
+  s.N = N;
+  s.geomN = geomN;
+  s.V = normalize(camera.position.xyz - in.worldPos);
+  s.albedo = albedo;
+  s.roughness = roughness;
+  s.metallic = metallic;
+  s.translucency = in.extra.x;
+  let Lo = shadeDirect(s, in.clip.xy);
 
-  let count = u32(camera.params.x);
-  for (var i : u32 = 0u; i < count; i = i + 1u) {
-    let light = lights[i];
-    let toLight = light.posRange.xyz - in.worldPos;
-    let dist = length(toLight);
-    if (dist > light.posRange.w) { continue; }
-    let L = toLight / max(dist, 1e-4);
-    let nDotL = max(dot(N, L), 0.0);
-    if (nDotL <= 0.0) { continue; }
-    let H = normalize(V + L);
-
-    // Windowed inverse-square: reaches exactly zero at the light's range, so
-    // culling by range can never pop.
-    let ratio = dist / light.posRange.w;
-    let window = clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);
-    let atten = (window * window) / (dist * dist + 1.0);
-
-    var shadow = 1.0;
-    let slot = i32(light.shadowInfo.x);
-    if (slot >= 0) {
-      // Offset along the geometric normal before the lookup: this moves the
-      // sample off the surface that casts it, which kills acne without the
-      // depth bias that would otherwise detach the contact shadow.
-      let offset = normalize(in.normal) * camera.shadow.z;
-      shadow = sampleShadow(slot, (in.worldPos + offset) - light.posRange.xyz, nDotL,
-                            light.shadowInfo.y, light.shadowInfo.z, light.shadowInfo.w);
-      if (shadow <= 0.001) { continue; }
-    }
-
-    let radiance = light.colorPower.rgb * light.colorPower.a * atten * shadow;
-
-    let D = distributionGGX(max(dot(N, H), 0.0), roughness);
-    let G = geometrySmith(nDotV, nDotL, roughness);
-    let F = fresnelSchlick(max(dot(H, V), 0.0), f0);
-    let spec = (D * G * F) / max(4.0 * nDotV * nDotL, 1e-4);
-    let kD = (vec3<f32>(1.0) - F) * (1.0 - metallic);
-    Lo = Lo + (kD * albedo / PI + spec) * radiance * nDotL;
-  }
-
-  var out : GBuffer;
   // Ambient is deferred to the resolve pass so occlusion can modulate it.
-  out.color = vec4<f32>(sanitize(Lo + albedo * in.pbr.z), alpha);
-  let viewN = normalize((camera.view * vec4<f32>(N, 0.0)).xyz);
-  let oct = octEncode(viewN);
-  out.surface = vec4<f32>(oct.x, oct.y, roughness, metallic);
-  out.albedo = vec4<f32>(albedo, 1.0);
-  return out;
+  return gbuffer(Lo + albedo * in.pbr.z, alpha, N, albedo, roughness, metallic);
 }
 `;
 
@@ -773,7 +1045,9 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
     for (var x = -1; x <= 2; x = x + 1) {
       let uv = in.uv + vec2<f32>(f32(x), f32(y)) * texel;
       let z = linearDepth(loadDepth(uv), camera.proj.z);
-      let w = exp(-abs(z - centerZ) * 2.0);
+      // Tolerance grows with distance: far away, neighbouring pixels on one
+      // surface can be metres apart in depth, and a fixed scale would not blur there at all.
+      let w = exp(-abs(z - centerZ) / (0.5 + centerZ * 0.03));
       sum = sum + textureSampleLevel(aoTex, texSampler, uv, 0.0) * w;
       weight = weight + w;
     }
@@ -800,9 +1074,26 @@ struct Light {
 @group(0) @binding(3) var<storage, read> lights : array<Light>;
 @group(0) @binding(4) var shadowMaps : texture_depth_2d_array;
 @group(0) @binding(5) var shadowSampler : sampler_comparison;
+@group(0) @binding(6) var sunShadowMaps : texture_depth_2d_array;
 
 @vertex
 fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
+
+/** One tap of the sun's cascades: shafts of light between trunks. */
+fn sunTap(X : vec3<f32>) -> f32 {
+  if (camera.sunColor.w < 0.5) { return 1.0; }
+  let viewZ = -(camera.view * vec4<f32>(X, 1.0)).z;
+  let splits = camera.csmSplits;
+  if (viewZ > splits.w) { return 1.0; }
+  var c = 0;
+  if (viewZ > splits.x) { c = 1; }
+  if (viewZ > splits.y) { c = 2; }
+  if (viewZ > splits.z) { c = 3; }
+  let lp = camera.csm[c] * vec4<f32>(X, 1.0);
+  let uv = vec2<f32>(lp.x * 0.5 + 0.5, 0.5 - lp.y * 0.5);
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { return 1.0; }
+  return textureSampleCompareLevel(sunShadowMaps, shadowSampler, uv, c, lp.z);
+}
 
 /** Henyey-Greenstein: g > 0 scatters forward, toward the viewer looking at a light. */
 fn phaseHG(cosT : f32, g : f32) -> f32 {
@@ -863,6 +1154,10 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
     if (density < 1e-6) { continue; }
 
     var light = ambient;
+    if (camera.sunDir.w > 0.5) {
+      let phaseSun = phaseHG(dot(dir, camera.sunDir.xyz), camera.vol.z);
+      light = light + camera.sunColor.rgb * phaseSun * sunTap(X) * camera.vol2.w * 4.0;
+    }
     for (var li : u32 = 0u; li < count; li = li + 1u) {
       let l = lights[li];
       let toL = l.posRange.xyz - X;
@@ -1033,19 +1328,155 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
 }
 `;
 
+/* ---------------------------------------------------------------- sky --- */
+
+/**
+ * The sky lives in a small latitude-longitude texture, rebuilt only when the
+ * sun moves. Elevation is stored with a square-root mapping, so the band just
+ * above the horizon — where the colour changes fastest — gets most of the rows.
+ */
+const SKY_LOOKUP_WGSL = /* wgsl */`
+fn skyUV(dir : vec3<f32>) -> vec2<f32> {
+  let az = atan2(dir.z, dir.x);
+  let el = asin(clamp(dir.y, -1.0, 1.0));
+  let x = sign(el) * sqrt(abs(el) / (PI * 0.5));
+  return vec2<f32>(az / (2.0 * PI) + 0.5, 0.5 - 0.5 * x);
+}
+
+fn skyRadiance(dir : vec3<f32>) -> vec3<f32> {
+  return textureSampleLevel(skyLut, skySampler, skyUV(dir), 0.0).rgb * camera.sky2.x;
+}
+`;
+
+/**
+ * Single-scattering atmosphere (Rayleigh + Mie), marched per texel of the sky
+ * table. The same model runs in JavaScript to colour the sunlight and the
+ * ambient, so the light on the ground always matches the sky above it.
+ */
+export const SKY_WGSL = /* wgsl */`
+${COMMON}
+
+@group(0) @binding(0) var<uniform> camera : Camera;
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
+
+const RG : f32 = 6360000.0;
+const RT : f32 = 6420000.0;
+const BR : vec3<f32> = vec3<f32>(5.802e-6, 13.558e-6, 33.1e-6);
+const BM : f32 = 3.996e-6;
+const HR : f32 = 8000.0;
+const HM : f32 = 1200.0;
+
+/** Distance along d from a point at height h above the ground centre line to a sphere of radius r. */
+fn toSphere(oy : f32, dy : f32, r : f32) -> f32 {
+  let b = oy * dy;
+  let c = (oy - r) * (oy + r);
+  let disc = b * b - c;
+  if (disc < 0.0) { return -1.0; }
+  return -b + sqrt(disc);
+}
+
+fn hitsGround(oy : f32, dy : f32) -> f32 {
+  if (dy >= 0.0) { return -1.0; }
+  let b = oy * dy;
+  let c = (oy - RG) * (oy + RG);
+  let disc = b * b - c;
+  if (disc < 0.0) { return -1.0; }
+  return -b - sqrt(disc);
+}
+
+/** Optical depth (Rayleigh, Mie) from point p toward the sun, out to the top of the atmosphere. */
+fn towardSun(p : vec3<f32>, L : vec3<f32>) -> vec2<f32> {
+  let r = length(p);
+  let up = p / r;
+  let mu = dot(up, L);
+  if (hitsGround(r, mu) > 0.0) { return vec2<f32>(1e9, 1e9); }
+  let len = toSphere(r, mu, RT);
+  let steps = 6;
+  let ds = len / f32(steps);
+  var od = vec2<f32>(0.0);
+  for (var i = 0; i < steps; i = i + 1) {
+    let q = p + L * ((f32(i) + 0.5) * ds);
+    let h = length(q) - RG;
+    od = od + vec2<f32>(exp(-h / HR), exp(-h / HM)) * ds;
+  }
+  return od;
+}
+
+@fragment
+fn fs(in : FSOut) -> @location(0) vec4<f32> {
+  let x = 1.0 - in.uv.y * 2.0;
+  let el = sign(x) * x * x * PI * 0.5;
+  let az = (in.uv.x - 0.5) * 2.0 * PI;
+  let dir = vec3<f32>(cos(el) * cos(az), sin(el), cos(el) * sin(az));
+  let L = camera.sunDir.xyz;
+  let haze = max(camera.sky2.w, 0.0);
+
+  let oy = RG + clamp(camera.position.y, 0.0, 4000.0) + 50.0;
+  let o = vec3<f32>(0.0, oy, 0.0);
+  var len = toSphere(oy, dir.y, RT);
+  let ground = hitsGround(oy, dir.y);
+  if (ground > 0.0) { len = ground; }
+
+  let steps = 16;
+  let ds = len / f32(steps);
+  var sumR = vec3<f32>(0.0);
+  var sumM = vec3<f32>(0.0);
+  var odR = 0.0;
+  var odM = 0.0;
+  for (var i = 0; i < steps; i = i + 1) {
+    let p = o + dir * ((f32(i) + 0.5) * ds);
+    let h = length(p) - RG;
+    let dR = exp(-h / HR) * ds;
+    let dM = exp(-h / HM) * ds;
+    odR = odR + dR;
+    odM = odM + dM;
+    let toSun = towardSun(p, L);
+    let tau = BR * (odR + toSun.x) + BM * haze * 1.11 * (odM + toSun.y);
+    let att = exp(-tau);
+    sumR = sumR + att * dR;
+    sumM = sumM + att * dM;
+  }
+  let mu = dot(dir, L);
+  let phaseR = 3.0 / (16.0 * PI) * (1.0 + mu * mu);
+  let g = 0.76;
+  let phaseM = 3.0 / (8.0 * PI) * ((1.0 - g * g) * (1.0 + mu * mu)) /
+               ((2.0 + g * g) * pow(max(1.0 + g * g - 2.0 * g * mu, 1e-4), 1.5));
+  var col = sumR * BR * phaseR + sumM * BM * haze * phaseM;
+
+  // Rays that end on the ground see it lit by the sun through the same air.
+  if (ground > 0.0) {
+    let p = o + dir * ground;
+    let toSun = towardSun(p, L);
+    let sunT = exp(-(BR * toSun.x + BM * haze * 1.11 * toSun.y));
+    let viewT = exp(-(BR * odR + BM * haze * 1.11 * odM));
+    col = col + vec3<f32>(0.08) * sunT * max(L.y, 0.0) / PI * viewT;
+  }
+  return vec4<f32>(col, 1.0);
+}
+`;
+
 /* ------------------------------------------------------------ resolve --- */
 
-export const RESOLVE_WGSL = /* wgsl */`
+/* ------------------------------------------------ screen-space reflection */
+
+/**
+ * Screen-space reflections in a pass of their own, so the result can be
+ * denoised before the resolve uses it. Each pixel marches with one of sixteen
+ * step phases from a 4x4 tile; the depth-aware 4x4 blur that follows (the
+ * same one the occlusion uses) averages exactly one full set of phases, which
+ * turns the hit-or-miss stipple of thin, distant geometry into a smooth partial
+ * reflection. Output: colour x certainty in rgb, certainty in alpha.
+ */
+export const SSR_WGSL = /* wgsl */`
 ${COMMON}
 
 @group(0) @binding(0) var<uniform> camera : Camera;
 @group(0) @binding(1) var texSampler : sampler;
 @group(0) @binding(2) var sceneColor : texture_2d<f32>;
 @group(0) @binding(3) var surfaceTex : texture_2d<f32>;
-@group(0) @binding(4) var albedoTex : texture_2d<f32>;
-@group(0) @binding(5) var depthTex : texture_depth_2d;
-@group(0) @binding(6) var aoTex : texture_2d<f32>;
-@group(0) @binding(7) var volTex : texture_2d<f32>;
+@group(0) @binding(4) var depthTex : texture_depth_2d;
 
 fn loadDepth(uv : vec2<f32>) -> f32 {
   return textureLoad(depthTex, pixelOf(uv), 0);
@@ -1053,13 +1484,6 @@ fn loadDepth(uv : vec2<f32>) -> f32 {
 
 @vertex
 fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
-
-/** Volumetric fog over whatever is behind it: attenuate, then add the glow. */
-fn applyVolume(c : vec3<f32>, uv : vec2<f32>) -> vec3<f32> {
-  if (camera.volColor.a < 0.5) { return c; }
-  let v = textureSampleLevel(volTex, texSampler, uv, 0.0);
-  return c * v.a + v.rgb;
-}
 
 fn viewToUV(p : vec3<f32>) -> vec2<f32> {
   let dist = max(-p.z, 1e-5);
@@ -1195,7 +1619,13 @@ fn traceSSR(P : vec3<f32>, N : vec3<f32>, R : vec3<f32>, jitter : f32) -> Reflec
   // the very end of the ray.
   let edge = min(min(hitUV.x, 1.0 - hitUV.x), min(hitUV.y, 1.0 - hitUV.y));
   let edgeFade = smoothstep(0.0, 0.1, edge);
-  let endFade = 1.0 - smoothstep(0.8, 1.0, hi);
+  // The end is measured along the ray in the world, not across the screen:
+  // depth crowds into the last few screen steps of a long ray, so a far
+  // mountain hit sits at 0.97 of the screen line but halfway along the ray.
+  let dz = O.z - Q.z;
+  let hitZ = 1.0 / mix(invZStart, invZEnd, hi);
+  let along = select(hi, clamp((O.z - hitZ) / dz, 0.0, 1.0), abs(dz) > 1e-3);
+  let endFade = 1.0 - smoothstep(0.8, 1.0, along);
 
   // textureLoad, not a filtered sample: a bilinear fetch at a sub-pixel hit
   // blends in the neighbour behind the occluder, and at a contact line that
@@ -1208,6 +1638,106 @@ fn traceSSR(P : vec3<f32>, N : vec3<f32>, R : vec3<f32>, jitter : f32) -> Reflec
 @fragment
 fn fs(in : FSOut) -> @location(0) vec4<f32> {
   let d = loadDepth(in.uv);
+  if (d <= 1e-7) { return vec4<f32>(0.0); }
+  let surf = textureSampleLevel(surfaceTex, texSampler, in.uv, 0.0);
+  let roughness = surf.z;
+  let P = viewPosFromUV(in.uv, d, camera.proj);
+  // Same story as AO: a reflection ray from a distant, grazing pixel crosses
+  // most of the depth buffer per step. Fade to the environment instead.
+  let ssrFade = 1.0 - smoothstep(camera.fade.y * 0.4, camera.fade.y, -P.z);
+  let weight = clamp(1.0 - roughness * 1.35, 0.0, 1.0) * camera.ssr.x * ssrFade;
+  if (weight <= 0.001) { return vec4<f32>(0.0); }
+
+  let N = octDecode(surf.xy);
+  let V = normalize(-P);
+  let R = normalize(reflect(-V, N));
+  let jitter = f32(interleavedIndex(in.clip.xy)) / 16.0;
+  let r = traceSSR(P, N, R, jitter);
+  let k = r.hit * weight;
+  return vec4<f32>(sanitize(r.color) * k, k);
+}
+`;
+
+export const RESOLVE_WGSL = /* wgsl */`
+${COMMON}
+
+@group(0) @binding(0) var<uniform> camera : Camera;
+@group(0) @binding(1) var texSampler : sampler;
+@group(0) @binding(2) var sceneColor : texture_2d<f32>;
+@group(0) @binding(3) var surfaceTex : texture_2d<f32>;
+@group(0) @binding(4) var albedoTex : texture_2d<f32>;
+@group(0) @binding(5) var depthTex : texture_depth_2d;
+@group(0) @binding(6) var aoTex : texture_2d<f32>;
+@group(0) @binding(7) var volTex : texture_2d<f32>;
+@group(0) @binding(8) var skyLut : texture_2d<f32>;
+@group(0) @binding(9) var skySampler : sampler;
+@group(0) @binding(10) var ssrTex : texture_2d<f32>;
+
+${NOISE_WGSL}
+${SKY_LOOKUP_WGSL}
+
+fn loadDepth(uv : vec2<f32>) -> f32 {
+  return textureLoad(depthTex, pixelOf(uv), 0);
+}
+
+/** What a direction sees of the environment: the sky when it is on, the analytic bands otherwise. */
+fn environment(dir : vec3<f32>, roughness : f32) -> vec3<f32> {
+  if (camera.sky.x < 0.5) { return sampleEnvironment(dir, roughness, camera.ambient.rgb); }
+  var d = dir;
+  // Below the horizon the ground is lit by the same sky: a dim, sky-tinted floor.
+  if (d.y < 0.0) {
+    let ground = camera.ambient.rgb * camera.ambient.a * 1.2;
+    return mix(skyRadiance(normalize(vec3<f32>(d.x, 0.02, d.z))), ground, smoothstep(0.0, 0.25, -d.y));
+  }
+  let sharp = skyRadiance(d);
+  return mix(sharp, camera.ambient.rgb * 1.15, roughness * roughness);
+}
+
+/** Clouds in front of a sky pixel. */
+fn cloudLayer(dir : vec3<f32>, base : vec3<f32>) -> vec3<f32> {
+  if (camera.sky.z <= 0.0 || dir.y < 0.01) { return base; }
+  let t = (camera.sky2.y - camera.position.y) / dir.y;
+  let p = camera.position.xz + dir.xz * t;
+  let d = cloudDensity(p);
+  if (d <= 0.002) { return base; }
+  let L = camera.sunDir.xyz;
+  // Self-shadowing: how much cloud lies a little way toward the sun.
+  let d2 = cloudDensity(p + L.xz / max(L.y, 0.12) * 160.0);
+  let lit = exp(-d2 * 2.4);
+  let mu = dot(dir, L);
+  let silver = 1.0 + 2.2 * pow(max(mu, 0.0), 10.0);
+  let col = camera.sunColor.rgb * (0.2 + 0.8 * lit) * 0.36 * silver + camera.ambient.rgb * 1.5;
+  // Far away, clouds melt into the haze near the horizon.
+  let fade = exp(-t * 0.00003) * smoothstep(0.01, 0.1, dir.y);
+  return mix(base, col, clamp(d * 1.25, 0.0, 1.0) * fade);
+}
+
+/** Share of light lost to fog along a view ray, with optional exponential height falloff. */
+fn fogAmount(dir : vec3<f32>, dist : f32) -> f32 {
+  let density = camera.params.z;
+  if (density <= 0.0) { return 0.0; }
+  let fh = camera.extra.y;
+  if (fh <= 0.0) { return clamp(1.0 - exp(-dist * density), 0.0, 1.0); }
+  let a = density * exp(-fh * (camera.position.y - camera.extra.x));
+  let b = fh * dir.y * dist;
+  var k = 1.0;
+  if (abs(b) > 1e-4) { k = (1.0 - exp(-b)) / b; }
+  return clamp(1.0 - exp(-a * dist * k), 0.0, 1.0);
+}
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
+
+/** Volumetric fog over whatever is behind it: attenuate, then add the glow. */
+fn applyVolume(c : vec3<f32>, uv : vec2<f32>) -> vec3<f32> {
+  if (camera.volColor.a < 0.5) { return c; }
+  let v = textureSampleLevel(volTex, texSampler, uv, 0.0);
+  return c * v.a + v.rgb;
+}
+
+@fragment
+fn fs(in : FSOut) -> @location(0) vec4<f32> {
+  let d = loadDepth(in.uv);
   var hdr = textureSampleLevel(sceneColor, texSampler, in.uv, 0.0).rgb;
 
   let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
@@ -1215,7 +1745,15 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   let viewDirWorld = normalize((camera.invView * vec4<f32>(dirView, 0.0)).xyz);
 
   if (d <= 1e-7) {
-    let sky = sampleEnvironment(viewDirWorld, 0.0, camera.ambient.rgb) * 0.8;
+    var sky = sampleEnvironment(viewDirWorld, 0.0, camera.ambient.rgb) * 0.8;
+    if (camera.sky.x > 0.5) {
+      sky = environment(viewDirWorld, 0.0);
+      // The sun itself, darkened toward its rim like the real one.
+      let mu = dot(viewDirWorld, camera.sunDir.xyz);
+      let disc = smoothstep(0.99990, 0.99996, mu);
+      sky = sky + camera.sunColor.rgb * disc * camera.sky.y * 60.0 * (0.6 + 0.4 * smoothstep(0.99996, 0.99999, mu));
+      sky = cloudLayer(viewDirWorld, sky);
+    }
     return vec4<f32>(sanitize(applyVolume(sky, in.uv)), 1.0);
   }
 
@@ -1245,11 +1783,6 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   // Metals have no diffuse response to bounce light into.
   hdr = hdr + aoGi.rgb * albedo * (1.0 - metallic);
 
-  // Same 4x4 tile as the occlusion pass: sixteen fixed step phases rather than
-  // per-pixel white noise, so what undersampling remains is a faint regular
-  // pattern instead of stipple.
-  let jitter = f32(interleavedIndex(in.clip.xy)) / 16.0;
-
   let nDotV = max(dot(N, V), 1e-4);
   // Metals tint their reflection with their own albedo — f0 is the albedo, not
   // white. Getting this wrong is what makes every metal read as chrome.
@@ -1258,33 +1791,33 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
   // mirror, so the horizon does not blow out.
   let grazing = max(vec3<f32>(1.0 - roughness), f0);
   let fres = f0 + (grazing - f0) * pow(1.0 - nDotV, 5.0);
-  // Same story as AO: a reflection ray from a distant, grazing pixel crosses
-  // most of the depth buffer per step, so it hits or misses essentially at
-  // random. Fade to the analytic environment instead of stippling.
-  let viewDist = -P.z;
-  let ssrFade = 1.0 - smoothstep(camera.fade.y * 0.4, camera.fade.y, viewDist);
-  let weight = clamp(1.0 - roughness * 1.35, 0.0, 1.0) * camera.ssr.x * ssrFade;
-
+  // Screen-space reflections come from their own pass, already denoised:
+  // colour premultiplied by how sure the hit is, and that certainty in alpha.
   let Rworld = normalize((camera.invView * vec4<f32>(R, 0.0)).xyz);
-  var reflected = sampleEnvironment(Rworld, roughness, camera.ambient.rgb);
+  var reflected = environment(Rworld, roughness);
+  let ssr = textureLoad(ssrTex, pixelOf(in.uv), 0);
+  reflected = reflected * (1.0 - clamp(ssr.a, 0.0, 1.0)) + ssr.rgb;
 
-  if (weight > 0.001) {
-    let ssr = traceSSR(P, N, R, jitter);
-    reflected = mix(reflected, ssr.color, ssr.hit * weight);
-  }
-
-  let fogAmount = clamp(1.0 - exp(-(-P.z) * camera.params.z), 0.0, 1.0);
+  let fog = fogAmount(viewDirWorld, length(P));
   // Occlusion applies to the environment reflection too: a crevice sees little
   // sky, and unoccluded specular is what makes AO'd scenes look plastic.
-  hdr = hdr + reflected * fres * mix(0.35, 1.0, metallic) * (1.0 - fogAmount) * mix(1.0, ao, 0.7);
+  // Mirror-smooth surfaces (still water, glass, polish) reflect in full;
+  // everything else keeps a softer share so it doesn't read as plastic.
+  let mirror = max(metallic, 1.0 - smoothstep(0.04, 0.15, roughness));
+  hdr = hdr + reflected * fres * mix(0.35, 1.0, mirror) * (1.0 - fog) * mix(1.0, ao, 0.7);
 
   // Aerial perspective: distant surfaces fade toward the sky *in their own
   // view direction*, not toward one flat colour. Fog to a constant is what
   // draws a hard line along the horizon, because the ground is fading to one
   // colour while the sky right above it is another.
-  let aerial = sampleEnvironment(viewDirWorld, 0.85, camera.ambient.rgb) * 0.8;
+  var aerial = sampleEnvironment(viewDirWorld, 0.85, camera.ambient.rgb) * 0.8;
+  if (camera.sky.x > 0.5) {
+    // Haze takes the colour of the sky just above the horizon in the same
+    // direction, sun glow included — golden toward the sun, blue away from it.
+    aerial = skyRadiance(normalize(vec3<f32>(viewDirWorld.x, max(viewDirWorld.y, 0.0) * 0.5 + 0.03, viewDirWorld.z)));
+  }
   let fogTarget = mix(camera.fog.rgb, aerial, camera.fog.a);
-  hdr = mix(hdr, fogTarget, fogAmount);
+  hdr = mix(hdr, fogTarget, fog);
   hdr = applyVolume(hdr, in.uv);
 
   return vec4<f32>(sanitize(hdr), 1.0);

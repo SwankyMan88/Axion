@@ -169,14 +169,14 @@ function uvTransformOf(material) {
   return [c * sx, sn * sy, ox, -sn * sx, c * sy, oy];
 }
 
-export function parseGLTF(json, buffers) {
+export function parseGLTF(json, buffers, { nodes = null } = {}) {
   const primitives = [];
   const uvTransforms = (json.materials ?? []).map(uvTransformOf);
   const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
   let triangles = 0;
 
   const sceneIndex = json.scene ?? 0;
-  const roots = json.scenes?.[sceneIndex]?.nodes ?? json.nodes?.map((_, i) => i) ?? [];
+  const roots = nodes ?? json.scenes?.[sceneIndex]?.nodes ?? json.nodes?.map((_, i) => i) ?? [];
   const identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
 
   const visit = (nodeIndex, parent) => {
@@ -291,6 +291,7 @@ export function parseGLTF(json, buffers) {
       alphaMode: m.alphaMode ?? 'OPAQUE',
       alphaCutoff: m.alphaCutoff ?? 0.5,
       doubleSided: !!m.doubleSided,
+      extras: m.extras ?? {},
     };
   });
 
@@ -325,7 +326,8 @@ async function pool(items, limit, fn) {
  *
  * onProgress(stage, done, total) reports 'geometry' and 'textures'.
  */
-export async function loadGLTF(app, source, { onProgress = () => {} } = {}) {
+/** Bytes, JSON and binary buffers from a URL, raw bytes, or a packed asset. */
+async function readSource(source, onProgress) {
   // A URL, raw bytes, or a packed asset from a script tag (see packed.js).
   // Only a URL touches the network; the other two load entirely from memory,
   // which is what lets a model ride inside a .js file past a CSP that blocks
@@ -348,7 +350,8 @@ export async function loadGLTF(app, source, { onProgress = () => {} } = {}) {
   }
 
   let json, buffers;
-  if (isGLB(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength))) {
+  const head = raw.byteLength >= 4 && new DataView(raw.buffer, raw.byteOffset, 4).getUint32(0, true) === 0x46546c67;
+  if (head) {
     const glb = parseGLB(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));
     json = glb.json;
     buffers = await Promise.all((json.buffers ?? []).map((b, i) =>
@@ -357,20 +360,19 @@ export async function loadGLTF(app, source, { onProgress = () => {} } = {}) {
     json = JSON.parse(new TextDecoder().decode(raw));
     buffers = await Promise.all((json.buffers ?? []).map((b) => fetchBytes(resolve(b.uri, base))));
   }
-  onProgress('geometry', 0, 1);
+  return { json, buffers, base };
+}
 
-  const parsed = parseGLTF(json, buffers);
-  onProgress('geometry', 1, 1);
-
-  // Which images are colour (sRGB) and which are data (linear). A texture used
-  // as base colour must be decoded, everything else must not be.
-  const srgbTextures = new Set();
-  for (const m of parsed.materials) if (m.baseColorTexture !== undefined) srgbTextures.add(m.baseColorTexture);
-
+/**
+ * Decode and upload every texture. `srgb` holds the indices used as colour.
+ * Images wider than `maxSize` are scaled down while decoding, which is how a
+ * low quality setting saves GPU memory without separate assets.
+ */
+async function decodeTextures(app, json, buffers, base, srgb, { maxSize = 0, onProgress = () => {} } = {}) {
   const device = app.device;
   const textureCount = (json.textures ?? []).length;
   let done = 0;
-  const gpuTextures = await pool(json.textures ?? [], 6, async (tex, ti) => {
+  return pool(json.textures ?? [], 6, async (tex, ti) => {
     // EXT_texture_webp puts the WebP image in the extension; `source`, if
     // present at all, is only a fallback for viewers without WebP.
     const img = json.images[tex.extensions?.EXT_texture_webp?.source ?? tex.source];
@@ -380,16 +382,28 @@ export async function loadGLTF(app, source, { onProgress = () => {} } = {}) {
     } else {
       blob = await (await fetch(resolve(img.uri, base))).blob();
     }
-    const bitmap = await createImageBitmap(blob, { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+    let bitmap = await createImageBitmap(blob, { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+    if (maxSize > 0 && Math.max(bitmap.width, bitmap.height) > maxSize) {
+      const k = maxSize / Math.max(bitmap.width, bitmap.height);
+      const small = await createImageBitmap(bitmap, {
+        resizeWidth: Math.max(1, Math.round(bitmap.width * k)),
+        resizeHeight: Math.max(1, Math.round(bitmap.height * k)),
+        resizeQuality: 'high', colorSpaceConversion: 'none', premultiplyAlpha: 'none',
+      });
+      bitmap.close?.();
+      bitmap = small;
+    }
     const texture = textureFromImage(device, bitmap, {
-      srgb: srgbTextures.has(ti), label: img.name ?? img.uri ?? `texture${ti}`,
+      srgb: srgb.has(ti), label: img.name ?? img.uri ?? `texture${ti}`,
     });
     bitmap.close?.();
     onProgress('textures', ++done, textureCount);
     return texture;
   });
+}
 
-  const materialIds = parsed.materials.map((m) => app.material({
+function makeMaterials(app, materials, gpuTextures) {
+  return materials.map((m) => app.material({
     name: m.name,
     color: m.color, alpha: m.alpha,
     metallic: m.metallic, roughness: m.roughness,
@@ -399,7 +413,36 @@ export async function loadGLTF(app, source, { onProgress = () => {} } = {}) {
     normalScale: m.normalScale,
     alphaMode: m.alphaMode, alphaCutoff: m.alphaCutoff,
     doubleSided: m.doubleSided,
+    wind: m.extras.wind ?? 0,
+    flutter: m.extras.flutter ?? 0,
+    translucency: m.extras.translucency ?? 0,
+    castShadow: m.extras.castShadow ?? true,
   }));
+}
+
+function colourTextures(materials) {
+  // Which images are colour (sRGB) and which are data (linear). A texture used
+  // as base colour must be decoded, everything else must not be.
+  const srgb = new Set();
+  for (const m of materials) if (m.baseColorTexture !== undefined) srgb.add(m.baseColorTexture);
+  return srgb;
+}
+
+/**
+ * Load a .gltf or .glb into an app. Resolves to
+ *   { entities, bounds, triangles, primitives, materials, textures }.
+ *
+ * onProgress(stage, done, total) reports 'geometry' and 'textures'.
+ */
+export async function loadGLTF(app, source, { onProgress = () => {}, maxTextureSize = 0 } = {}) {
+  const { json, buffers, base } = await readSource(source, onProgress);
+  onProgress('geometry', 0, 1);
+  const parsed = parseGLTF(json, buffers);
+  onProgress('geometry', 1, 1);
+
+  const gpuTextures = await decodeTextures(app, json, buffers, base, colourTextures(parsed.materials),
+    { maxSize: maxTextureSize, onProgress });
+  const materialIds = makeMaterials(app, parsed.materials, gpuTextures);
   const fallback = materialIds.length ? null : app.material({ name: 'gltf-default' });
 
   const entities = parsed.primitives.map((p) => {
@@ -413,4 +456,118 @@ export async function loadGLTF(app, source, { onProgress = () => {} } = {}) {
     primitives: parsed.primitives.length, materials: materialIds.length,
     textures: gpuTextures.length,
   };
+}
+
+/** Join several primitives' geometry into one. */
+function mergeGeometry(list) {
+  if (list.length === 1) return list[0];
+  let vCount = 0, iCount = 0;
+  for (const g of list) { vCount += g.vertexCount; iCount += g.indices.length; }
+  const F = VERTEX_STRIDE_FLOATS;
+  const vertices = new Float32Array(vCount * F);
+  const indices = new Uint32Array(iCount);
+  let vo = 0, io = 0;
+  for (const g of list) {
+    vertices.set(g.vertices, vo * F);
+    for (let i = 0; i < g.indices.length; i++) indices[io + i] = g.indices[i] + vo;
+    vo += g.vertexCount; io += g.indices.length;
+  }
+  return { vertices, indices, vertexCount: vCount, bounds: sphereOf(vertices) };
+}
+
+function sphereOf(v) {
+  const F = VERTEX_STRIDE_FLOATS, n = v.length / F;
+  let cx = 0, cy = 0, cz = 0;
+  for (let i = 0; i < n; i++) { cx += v[i * F]; cy += v[i * F + 1]; cz += v[i * F + 2]; }
+  cx /= n; cy /= n; cz /= n;
+  let r2 = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = v[i * F] - cx, dy = v[i * F + 1] - cy, dz = v[i * F + 2] - cz;
+    r2 = Math.max(r2, dx * dx + dy * dy + dz * dz);
+  }
+  return new Float32Array([cx, cy, cz, Math.sqrt(r2)]);
+}
+
+/**
+ * Load a library of models to place many times, instead of a scene.
+ *
+ * Each model becomes a list of parts (one per material), each part a mesh id
+ * — an LOD group when the file has levels of detail. Nothing is added to the
+ * world; place copies with app.place(model, list) or app.add / app.addMany.
+ *
+ * Levels come from `extras.axion.models` in the file:
+ *   [{ name, levels: [{ node, distance }], drawDistance, collider: node }]
+ * Without it, every root node is a model with a single level. A collider
+ * node is not uploaded: its triangles come back on the CPU, for physics.
+ *
+ * Resolves to { models: { name: { parts, bounds, collider, extras } }, textures }.
+ */
+export async function loadModels(app, source, { onProgress = () => {}, maxTextureSize = 0 } = {}) {
+  const { json, buffers, base } = await readSource(source, onProgress);
+  onProgress('geometry', 0, 1);
+  const sceneIndex = json.scene ?? 0;
+  const roots = json.scenes?.[sceneIndex]?.nodes ?? json.nodes?.map((_, i) => i) ?? [];
+  const meta = json.extras?.axion?.models ?? roots.map((node) => ({
+    name: json.nodes[node].name ?? `model${node}`, levels: [{ node, distance: 0 }],
+  }));
+  const materials = parseGLTF({ ...json, nodes: [], scenes: [{ nodes: [] }] }, buffers).materials;
+
+  const gpuTextures = await decodeTextures(app, json, buffers, base, colourTextures(materials),
+    { maxSize: maxTextureSize, onProgress });
+  const materialIds = makeMaterials(app, materials, gpuTextures);
+  const fallback = materialIds.length ? -1 : app.material({ name: 'gltf-default' });
+  const matId = (i) => (i >= 0 ? materialIds[i] : fallback);
+
+  const models = {};
+  meta.forEach((m, mi) => {
+    // Geometry per level, grouped by material.
+    const levels = m.levels.map((l) => {
+      const parsed = parseGLTF(json, buffers, { nodes: [l.node] });
+      const byMat = new Map();
+      for (const p of parsed.primitives) {
+        if (!byMat.has(p.material)) byMat.set(p.material, []);
+        byMat.get(p.material).push(p.geometry);
+      }
+      return { distance: l.distance ?? 0, byMat };
+    });
+    const matKeys = new Set();
+    for (const l of levels) for (const k of l.byMat.keys()) matKeys.add(k);
+
+    const parts = [];
+    let bounds = null;
+    for (const k of matKeys) {
+      // A part may be absent at some levels (leaves dropped from a far LOD): it draws nothing there.
+      const lodLevels = levels.map((l) => {
+        const list = l.byMat.get(k);
+        if (!list) return { mesh: -1, distance: l.distance };
+        const geo = mergeGeometry(list);
+        return { mesh: app.renderer.createMesh(geo, `${m.name}/${k}`), distance: l.distance, geo };
+      });
+      const first = lodLevels.find((l) => l.mesh >= 0);
+      if (!bounds && first) bounds = first.geo.bounds;
+      const mesh = lodLevels.length > 1 || m.drawDistance
+        ? app.renderer.createLod(lodLevels.map((l) => ({ mesh: l.mesh, distance: l.distance })),
+          { drawDistance: m.drawDistance ?? 0, name: m.name })
+        : first.mesh;
+      parts.push({ mesh, material: matId(k) });
+    }
+
+    let collider = null;
+    if (m.collider !== undefined && m.collider !== null) {
+      const parsed = parseGLTF(json, buffers, { nodes: [m.collider] });
+      const geo = mergeGeometry(parsed.primitives.map((p) => p.geometry));
+      const n = geo.vertexCount, F = VERTEX_STRIDE_FLOATS;
+      const positions = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) {
+        positions[i * 3] = geo.vertices[i * F];
+        positions[i * 3 + 1] = geo.vertices[i * F + 1];
+        positions[i * 3 + 2] = geo.vertices[i * F + 2];
+      }
+      collider = { positions, indices: geo.indices };
+    }
+    models[m.name] = { name: m.name, parts, bounds, collider, extras: m.extras ?? {} };
+    onProgress('models', mi + 1, meta.length);
+  });
+  onProgress('geometry', 1, 1);
+  return { models, textures: gpuTextures.length, materials: materialIds };
 }

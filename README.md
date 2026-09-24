@@ -325,6 +325,61 @@ Object.assign(r.physical, { enabled: true, aperture: 2.8, shutter: 1 / 30, iso: 
 each one changes the frame, stays finite, and (for the physical camera) that
 matching settings reproduce the non-physical image.
 
+## Big outdoor worlds
+
+Version 0.9 adds what a large open map needs. `examples/khan-academy-valley.html`
+uses all of it: a 1.5 km valley with about 52,000 placed objects.
+
+```js
+const app = await AX.App.create(canvas, {
+  sun: { elevation: 20, azimuth: 150, intensity: 3.4, shadows: { size: 2048, distance: 230 } },
+  sky: { clouds: 0.4, haze: 0.9, cloudShadows: 0.3 },
+  wind: { direction: [0.8, 0.6], strength: 0.8 },
+  fogDensity: 0.0006, fogHeight: { base: 0, falloff: 0.009 },
+  lodBias: 1,                                    // below 1 faster, above 1 sharper
+});
+
+// Level of detail: one mesh id that draws the right level per object.
+const tree = app.lod([{ mesh: hi, distance: 0 }, { mesh: mid, distance: 40 }, { mesh: card, distance: 200 }],
+  { drawDistance: 2000 });
+
+// Heightmap terrain: CDLOD patches, splat layers, rock on slopes, snow, water, grass.
+const ground = app.terrain({
+  heights, size: 1536,                           // Float32Array, n * n with n = 2^k + 1
+  layers: [{ albedo, normal, scale: 3 }, /* up to 5 blended by the splat */],
+  splat: { data, size: 512 },
+  rock: { layer: 4, slope: [0.42, 0.62] },
+  snow: { height: [215, 280], slope: 0.5 },
+  water: { level: 0, clarity: 0.85, waves: 0.6 },
+  grass: { radius: 55, height: 0.42, bladesPerTile: 640 },
+});
+ground.heightAt(x, z);                           // the exact height the GPU draws
+
+// A model library (a GLB with LOD levels, colliders and extras per model)
+const { models } = await AX.loadModels(app, AxionAssets['valley-trees']);
+app.place(models.pine_a, placements);            // x, y, z, yaw, scale per copy
+```
+
+- **Sun and sky:** a directional sun with four cascaded shadow maps (texel
+  snapping, staggered redraws, dithered cascade blend) and a single-scattering
+  atmosphere, so the sky, the sunlight colour and the ambient all follow the sun
+  angle. Clouds move and cast shadows. `app.renderer.setSunAngles(elev, azim)`.
+- **Culling for many objects:** instances are grouped into 32 m cells; whole
+  cells are culled and LOD-picked before single objects are looked at. Shadow
+  casters use one LOD coarser than the camera.
+- **Terrain:** one draw for the ground, one for the water, one for the grass,
+  from a shared grid mesh; geomorphing so levels never pop; mipmapped normals and
+  distance-averaged layers so far slopes do not shimmer or show texture repeats.
+- **Foliage materials:** `wind`, `flutter` and `translucency` on `app.material`.
+- **Reflections** run in their own pass and go through the same 4x4 depth-aware
+  blur as AO, so water reflects far shores smoothly instead of in stipple. The
+  ray's end fade is measured along the ray, so far mountains reflect too.
+
+Collision is left to the page, like input. The valley example shows a cheap
+approach: terrain height from `heightAt`, trees as upright cylinders, and
+triangles built only for the objects within a few metres of the player, dropped
+again when they are left behind.
+
 ## Packed models (one script, no fetch)
 
 `assets/sponza.js` is the whole Sponza scene — quantized geometry
@@ -432,17 +487,16 @@ Real-time global illumination beyond SSIL (Godot's SDFGI or VoxelGI): both
 need a 3D distance-field or voxel representation of the scene rebuilt in
 compute as the camera moves — a subsystem on the scale of the whole renderer.
 SSIL covers the near-field bounce you can see; off-screen and multi-bounce
-light is what those add. A sky/atmosphere system and reflection probes are the other big gaps against Godot.
+light is what those add. Reflection probes are the other big gap against Godot.
 
-Honest list, in the order they'd matter: a directional sun with cascaded
-shadows (Sponza is lit here by a distant point light standing in for one); temporal anti-aliasing and reprojection
-— it would denoise SSR and AO together and replace FXAA, and it is now the
+Honest list, in the order they'd matter: temporal anti-aliasing and reprojection
+— it would denoise SSR and AO together and replace FXAA, and it is the
 single biggest quality win left; GPU-driven culling in a compute pass with
 `drawIndexedIndirect`; clustered light assignment (the fragment loop is still
-over all lights in range); cascaded shadow maps for a directional sun, since
-only point lights cast today; a mip chain on the scene color so rough
-reflections blur instead of staying sharp; skinned meshes; a transform hierarchy (transforms are
-flat today); transparency sorting; a worker-parallel system scheduler.
+over all lights in range); planar reflections for large still water; a mip
+chain on the scene color so rough reflections blur instead of staying sharp;
+skinned meshes; a transform hierarchy (transforms are flat today); transparency
+sorting; a worker-parallel system scheduler.
 
 **Known issue: specular highlights on very smooth surfaces are too dim.** The
 GGX distribution floors its denominator at `1e-5` to avoid dividing by zero,

@@ -1,44 +1,49 @@
 import { Arena, DynamicBuffer, retire, sweepRetired } from '../gpu/buffers.js';
 import { solidTexture } from '../gpu/textures.js';
 import {
-  STANDARD_WGSL, SHADOW_WGSL, AO_WGSL, AO_BLUR_WGSL, RESOLVE_WGSL, VOLUME_WGSL, EXPOSURE_WGSL, DOF_WGSL,
-  BLOOM_PREFILTER_WGSL, BLOOM_DOWN_WGSL, BLOOM_UP_WGSL, FINAL_WGSL, CUBE_FACES,
+  STANDARD_WGSL, SHADOW_WGSL, AO_WGSL, AO_BLUR_WGSL, SSR_WGSL, RESOLVE_WGSL, VOLUME_WGSL, EXPOSURE_WGSL, DOF_WGSL,
+  BLOOM_PREFILTER_WGSL, BLOOM_DOWN_WGSL, BLOOM_UP_WGSL, FINAL_WGSL, SKY_WGSL, CUBE_FACES,
 } from './shaders.js';
 import { VERTEX_STRIDE_BYTES } from '../geometry/primitives.js';
 import {
   Bounds, Dynamic, Hidden, InstanceColor, LocalToWorld, MeshRef, PointLight, Transform,
   M_MESH, M_MATERIAL, T_POS,
 } from '../core/components.js';
-import { frustumFromMatrix } from '../core/math.js';
+import { frustumFromMatrix, m4lookAt, m4mul, m4ortho } from '../core/math.js';
+import { skyAmbient, sunTransmittance, sunDirection } from './sky.js';
 
-const INSTANCE_FLOATS = 28;   // mat4(16) + color(4) + pbr(4) + surface(4)
+const INSTANCE_FLOATS = 32;   // mat4(16) + color(4) + pbr(4) + surface(4) + extra(4)
 const LIGHT_FLOATS = 12;      // posRange(4) + colorPower(4) + shadowInfo(4)
-const CAMERA_FLOATS = 132;
+const CAMERA_FLOATS = 256;
 const MAX_LIGHTS = 256;
 const FACE_SLOT_BYTES = 256;  // uniform dynamic offsets must be 256-aligned
+const CASCADES = 4;
 
 const HDR_FORMAT = 'rgba16float';
 // Albedo is a 0..1 colour, so 8 bits per channel hold it; half the bandwidth of a float target.
 const ALBEDO_FORMAT = 'rgba8unorm';
-const MAT_SNAP = 12;          // material fields compared each frame for the instance cache
+const MAT_SNAP = 15;          // material fields compared each frame for the instance cache
 const TONEMAP_MODES = { linear: 0, reinhard: 1, filmic: 2, aces: 3, agx: 4 };
 const AO_FORMAT = 'rgba16float';   // rgb = indirect light (SSIL), a = AO
+const SKY_W = 256, SKY_H = 128;
 
 /**
  * Deferred-ambient forward renderer.
  *
  * The frame is a pass stack:
  *
- *   1. Shadow   — six depth-only cube faces per shadowed point light, all into
- *                 one depth array texture.
- *   2. Geometry — one pass, three targets: HDR direct light + emissive, a
- *                 packed surface buffer (octahedral view normal, roughness,
- *                 metallic), and albedo. Ambient is left out on purpose.
- *   3. AO       — horizon-based occlusion at half resolution, then a
+ *   1. Shadow   — six depth-only cube faces per shadowed point light, and four
+ *                 cascades for the sun, each redrawn only when what it shows
+ *                 has changed.
+ *   2. Depth    — every opaque and alpha-tested surface, depth only.
+ *   3. Geometry — objects, terrain, water and grass, each pixel shaded once
+ *                 (equal depth test), into three targets: HDR direct light,
+ *                 a packed surface buffer and albedo. Ambient is left out.
+ *   4. AO       — horizon-based occlusion at half resolution, then a
  *                 depth-aware blur.
- *   4. Resolve  — screen-space reflections, ambient × AO, fog. HDR out.
- *   5. Bloom    — threshold, downsample pyramid, tent upsample.
- *   6. Final    — bloom composite, ACES, gamma, FXAA to the swapchain.
+ *   5. Resolve  — sky, clouds, screen-space reflections, ambient × AO, fog.
+ *   6. Bloom    — threshold, downsample pyramid, tent upsample.
+ *   7. Final    — bloom composite, tonemap, gamma, FXAA to the swapchain.
  *
  * Deferring ambient is the decision that makes occlusion look like contact
  * darkening rather than dirt: AO must multiply only the indirect term, and the
@@ -55,20 +60,29 @@ export class Renderer {
     this.exposure = options.exposure ?? 1.0;
     this.fogDensity = options.fogDensity ?? 0.0;
     this.fogColor = options.fogColor ?? [0.02, 0.025, 0.035];
+    /** Height fog: density thins out by `falloff` per metre above `base`. 0 = uniform fog. */
+    this.fogHeight = {
+      base: options.fogHeight?.base ?? 0,
+      falloff: options.fogHeight?.falloff ?? 0,
+    };
     /** How much of the fog colour comes from the sky in the view direction. */
     this.aerialPerspective = options.aerialPerspective ?? 0.85;
     this.ambient = options.ambient ?? [0.09, 0.11, 0.15];
     this.groundAmbient = options.groundAmbient ?? 0.35;
     this.frustumCulling = options.frustumCulling !== false;
+    this.fxaa = options.fxaa !== false;
     /**
      * Draw opaque depth first, then shade with an equal test, so each pixel is
      * lit once no matter how many objects overlap it. Costs one extra vertex
      * pass; pays for itself as soon as objects hide each other.
      */
     this.depthPrepass = options.depthPrepass !== false;
-    this.fxaa = options.fxaa !== false;
+    /** Multiplies every LOD switch and draw distance. Below 1 is faster, above 1 sharper. */
+    this.lodBias = options.lodBias ?? 1;
+    /** Side of the square cells objects are grouped into for culling, in metres. */
+    this.cellSize = options.cellSize ?? 32;
 
-    /** Screen-space reflections. `intensity` 0 falls back to the analytic sky. */
+    /** Screen-space reflections. `intensity` 0 falls back to the environment. */
     this.ssr = {
       intensity: options.ssr?.intensity ?? 1.0,
       steps: options.ssr?.steps ?? 48,
@@ -100,8 +114,9 @@ export class Renderer {
     };
 
     /**
-     * Volumetric fog: a height-falling medium lit by every point light, with
-     * shadowed light shafts. Half resolution. `density` is extinction per metre.
+     * Volumetric fog: a height-falling medium lit by the sun and every point
+     * light, with shadowed light shafts. Half resolution. `density` is
+     * extinction per metre.
      */
     this.volumetric = {
       enabled: options.volumetric?.enabled ?? false,
@@ -129,11 +144,6 @@ export class Renderer {
       saturation: options.tonemap?.saturation ?? 1,
     };
 
-    /**
-     * Auto exposure: the frame's average luminance is brought to middle grey,
-     * adapting at `speed`. `exposure` (or the physical camera) still applies on
-     * top as compensation. min/max are limits in stops.
-     */
     /**
      * Depth of field. Everything within `range` metres of `focus` is sharp;
      * blur ramps up over `transition` metres beyond that, to `amount` pixels.
@@ -199,12 +209,69 @@ export class Renderer {
       maxCasters: options.shadows?.maxCasters ?? 40000,
     };
 
+    /**
+     * The sun: a directional light with four shadow cascades. `direction`
+     * points toward the sun. With the sky on and no `color` given, sunlight is
+     * coloured by the air it crossed, so a low sun is gold and then red.
+     */
+    const so = options.sun ?? {};
+    this.sun = {
+      enabled: so.enabled ?? !!options.sun,
+      direction: so.direction ?? sunDirection(so.elevation ?? 40, so.azimuth ?? 35),
+      intensity: so.intensity ?? 3,
+      color: so.color ?? null,
+      shadows: {
+        enabled: so.shadows?.enabled !== false,
+        size: so.shadows?.size ?? 2048,
+        /** How far from the camera the cascades reach, in metres. */
+        distance: so.shadows?.distance ?? 220,
+        /** 0 = even cascades, 1 = logarithmic. */
+        split: so.shadows?.split ?? 0.82,
+        pcfRadius: so.shadows?.pcfRadius ?? 1.5,
+        normalBias: so.shadows?.normalBias ?? 1.6,
+        /** How far behind the view, toward the sun, casters are still drawn. */
+        reach: so.shadows?.reach ?? 260,
+        /** Casters smaller than this many texels are left out of a cascade. */
+        minCasterTexels: so.shadows?.minCasterTexels ?? 1.2,
+      },
+    };
+
+    /**
+     * Sky: an atmosphere that scatters the sun (blue overhead, pale at the
+     * horizon, gold and red at dusk), a sun disc and a moving cloud layer.
+     * With `autoAmbient` the ambient light is taken from the same sky.
+     */
+    const ko = options.sky ?? {};
+    this.sky = {
+      enabled: ko.enabled ?? !!options.sky,
+      brightness: ko.brightness ?? 1,
+      /** Mie scattering: 1 = clear air, higher = hazier, warmer horizon. */
+      haze: ko.haze ?? 1,
+      sunDisc: ko.sunDisc ?? 1,
+      clouds: ko.clouds ?? 0.45,
+      cloudHeight: ko.cloudHeight ?? 1800,
+      cloudScale: ko.cloudScale ?? 0.00045,
+      cloudSpeed: ko.cloudSpeed ?? 1,
+      /** How dark cloud shadows make the ground, 0..1. */
+      cloudShadows: ko.cloudShadows ?? 0.35,
+      autoAmbient: ko.autoAmbient ?? true,
+      ambientStrength: ko.ambientStrength ?? 1,
+    };
+
+    /** Wind for materials with `wind` set: direction (x, z), strength, gust speed. */
+    this.wind = {
+      direction: options.wind?.direction ?? [0.8, 0.6],
+      strength: options.wind?.strength ?? 1,
+      speed: options.wind?.speed ?? 1,
+    };
+
     this.vertexArena = new Arena(device, GPUBufferUsage.VERTEX, 4 << 20, 'axion-vertices');
     this.indexArena = new Arena(device, GPUBufferUsage.INDEX, 2 << 20, 'axion-indices');
     this.instances = new DynamicBuffer(device, GPUBufferUsage.STORAGE, 4096 * INSTANCE_FLOATS, 'axion-instances');
     // Slot lists: which instances this frame draws, and which each shadow map draws.
     this.visibleList = new DynamicBuffer(device, GPUBufferUsage.STORAGE, 4096, 'axion-visible');
     this.shadowModels = new DynamicBuffer(device, GPUBufferUsage.STORAGE, 4096, 'axion-shadow-casters');
+    this.sunCasters = new DynamicBuffer(device, GPUBufferUsage.STORAGE, 4096, 'axion-sun-casters');
 
     this.cameraBuffer = device.createBuffer({
       size: CAMERA_FLOATS * 4,
@@ -220,6 +287,14 @@ export class Renderer {
     });
     this.lightData = new Float32Array(MAX_LIGHTS * LIGHT_FLOATS);
 
+    // One 256-byte slot per cascade: view-projection, then the eye.
+    this.cascadeFaceBuffer = device.createBuffer({
+      size: CASCADES * FACE_SLOT_BYTES,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      label: 'axion-cascade-faces',
+    });
+    this.cascadeFaceData = new Float32Array(CASCADES * FACE_SLOT_BYTES / 4);
+
     this.meshes = [];
     this.materials = [];
     this._pipelines = new Map();
@@ -229,6 +304,7 @@ export class Renderer {
       shadow: device.createShaderModule({ code: SHADOW_WGSL, label: 'axion-shadow' }),
       ao: device.createShaderModule({ code: AO_WGSL, label: 'axion-ao' }),
       aoBlur: device.createShaderModule({ code: AO_BLUR_WGSL, label: 'axion-ao-blur' }),
+      ssr: device.createShaderModule({ code: SSR_WGSL, label: 'axion-ssr' }),
       resolve: device.createShaderModule({ code: RESOLVE_WGSL, label: 'axion-resolve' }),
       bloomPrefilter: device.createShaderModule({ code: BLOOM_PREFILTER_WGSL, label: 'axion-bloom-prefilter' }),
       bloomDown: device.createShaderModule({ code: BLOOM_DOWN_WGSL, label: 'axion-bloom-down' }),
@@ -237,11 +313,14 @@ export class Renderer {
       volume: device.createShaderModule({ code: VOLUME_WGSL, label: 'axion-volume' }),
       exposure: device.createShaderModule({ code: EXPOSURE_WGSL, label: 'axion-exposure' }),
       dof: device.createShaderModule({ code: DOF_WGSL, label: 'axion-dof' }),
+      sky: device.createShaderModule({ code: SKY_WGSL, label: 'axion-sky' }),
     };
 
     this._buildLayouts();
     this._buildStaticPipelines();
     this._buildShadowTarget();
+    this._buildSunShadowTarget();
+    this._buildSky();
     this._rebuildFrameBindGroup();
 
     // Instance cache state (see _rebuildInstances).
@@ -250,7 +329,10 @@ export class Renderer {
     this._dyn = [];
     this._moved = [];
     this._instTotal = 0;
+    this._instBuild = 0;
     this._draws = [];
+    this._tmpSlot = new Uint32Array(4096);
+    this._tmpLevel = new Uint8Array(4096);
     /** Per shadow slot: what its cube map was last drawn from, so an unchanged one is reused. */
     this._shadowState = [];
     this._frustum = new Float32Array(24);
@@ -258,12 +340,29 @@ export class Renderer {
     /** entity -> cube map slot, held across frames so shadows do not blink. */
     this._shadowSlots = new Map();
 
+    // Sun cascades: what each was last drawn with.
+    this._cascades = [];
+    for (let i = 0; i < CASCADES; i++) {
+      this._cascades.push({
+        viewProj: new Float32Array(16), view: new Float32Array(16),
+        right: [1, 0, 0], up: [0, 1, 0], fwd: [0, 0, -1], eye: [0, 0, 0],
+        radius: 1, depth: 1, world: 1, drawn: -1, key: '',
+      });
+    }
+    this._cascadeBatches = [];
+    this._frameIndex = 0;
+    this._sunState = { key: '', color: [0, 0, 0], ambient: null };
+
+    /** Set by app.terrain(); draws terrain, water and grass through the same passes. */
+    this.terrain = null;
+
     this._targets = null;
     this._targetSize = [0, 0];
 
     this.stats = {
       drawCalls: 0, instances: 0, culled: 0, triangles: 0, batches: 0,
       shadowDraws: 0, shadowCasters: 0, shadowLights: 0, cpuMs: 0,
+      sunCasters: 0, cascadesDrawn: 0, terrainPatches: 0, grassBlades: 0,
     };
     this.defaultMaterial = this.createMaterial({ color: [0.8, 0.8, 0.82] });
   }
@@ -284,6 +383,7 @@ export class Renderer {
         { binding: 3, visibility: FRAG, texture: { sampleType: 'depth', viewDimension: '2d-array' } },
         { binding: 4, visibility: FRAG, sampler: { type: 'comparison' } },
         { binding: 5, visibility: VERT, buffer: { type: 'read-only-storage' } },
+        { binding: 6, visibility: FRAG, texture: { sampleType: 'depth', viewDimension: '2d-array' } },
       ],
     });
     // Group 1: one bind group per material. Same layout in the geometry pass
@@ -319,7 +419,7 @@ export class Renderer {
     this._shadowLayout = d.createBindGroupLayout({
       label: 'axion-shadow',
       entries: [
-        { binding: 0, visibility: VERT, buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 64 } },
+        { binding: 0, visibility: VERT, buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 80 } },
         { binding: 1, visibility: VERT, buffer: { type: 'read-only-storage' } },
         { binding: 2, visibility: VERT, buffer: { type: 'read-only-storage' } },
       ],
@@ -340,6 +440,7 @@ export class Renderer {
         { binding: 3, visibility: FRAG, buffer: { type: 'read-only-storage' } },
         { binding: 4, visibility: FRAG, texture: { sampleType: 'depth', viewDimension: '2d-array' } },
         { binding: 5, visibility: FRAG, sampler: { type: 'comparison' } },
+        { binding: 6, visibility: FRAG, texture: { sampleType: 'depth', viewDimension: '2d-array' } },
       ],
     });
     this._exposureLayout = d.createBindGroupLayout({
@@ -354,7 +455,12 @@ export class Renderer {
       label: 'axion-ao-blur', entries: [cam, samp, tex(2), depthTex(3)],
     });
     this._resolveLayout = d.createBindGroupLayout({
-      label: 'axion-resolve', entries: [cam, samp, tex(2), tex(3), tex(4), depthTex(5), tex(6), tex(7)],
+      label: 'axion-resolve',
+      entries: [cam, samp, tex(2), tex(3), tex(4), depthTex(5), tex(6), tex(7), tex(8),
+        { binding: 9, visibility: FRAG, sampler: { type: 'filtering' } }, tex(10)],
+    });
+    this._ssrLayout = d.createBindGroupLayout({
+      label: 'axion-ssr', entries: [cam, samp, tex(2), tex(3), depthTex(4)],
     });
     this._bloomLayout = d.createBindGroupLayout({
       label: 'axion-bloom', entries: [cam, samp, tex(2)],
@@ -363,11 +469,18 @@ export class Renderer {
       label: 'axion-final',
       entries: [cam, samp, tex(2), tex(3), { binding: 4, visibility: FRAG, buffer: { type: 'read-only-storage' } }],
     });
+    this._skyLayout = d.createBindGroupLayout({ label: 'axion-sky', entries: [cam] });
 
     this._sampler = d.createSampler({
       magFilter: 'linear', minFilter: 'linear',
       addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge',
       label: 'axion-linear',
+    });
+    // The sky table wraps around in azimuth.
+    this._skySampler = d.createSampler({
+      magFilter: 'linear', minFilter: 'linear',
+      addressModeU: 'repeat', addressModeV: 'clamp-to-edge',
+      label: 'axion-sky-sampler',
     });
     // Comparison sampler with linear filtering gives hardware 2x2 PCF under
     // every Vogel tap, so twelve taps behave like forty-eight.
@@ -388,11 +501,15 @@ export class Renderer {
     });
   }
 
-  _buildStaticPipelines() {
+  /** Depth-only caster pipelines: opaque and alpha-tested, point-light or sun flavour. */
+  _shadowPipelines(label, depthBias, slopeBias) {
     const m = this._modules;
-
-    this._shadowPipeline = this.device.createRenderPipeline({
-      label: 'axion-shadow',
+    const depthStencil = {
+      format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less',
+      depthBias, depthBiasSlopeScale: slopeBias,
+    };
+    const opaque = this.device.createRenderPipeline({
+      label: `axion-${label}`,
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this._shadowLayout] }),
       vertex: {
         module: m.shadow, entryPoint: 'vs',
@@ -404,14 +521,13 @@ export class Renderer {
       // No fragment stage at all: a depth-only pass needs none, and leaving it
       // out lets the driver take its fast path.
       primitive: { topology: 'triangle-list', cullMode: 'front', frontFace: 'ccw' },
-      depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
+      depthStencil,
     });
-
     // Alpha-tested casters need their texture to know where they are solid.
     // Cards like leaves are usually single planes seen from both sides, so no
     // face is culled here.
-    this._shadowMaskPipeline = this.device.createRenderPipeline({
-      label: 'axion-shadow-mask',
+    const masked = this.device.createRenderPipeline({
+      label: `axion-${label}-mask`,
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this._shadowLayout, this._materialLayout] }),
       vertex: {
         module: m.shadow, entryPoint: 'vsMask',
@@ -425,12 +541,27 @@ export class Renderer {
       },
       fragment: { module: m.shadow, entryPoint: 'fsMask', targets: [] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
-      depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
+      depthStencil,
     });
+    return { opaque, masked };
+  }
+
+  _buildStaticPipelines() {
+    const m = this._modules;
+
+    const point = this._shadowPipelines('shadow', 0, 0);
+    this._shadowPipeline = point.opaque;
+    this._shadowMaskPipeline = point.masked;
+    // The sun's maps are orthographic and cover far more ground per texel, so
+    // they take a slope-scaled hardware bias on top of the normal offset.
+    const sun = this._shadowPipelines('sun-shadow', 1, 1.5);
+    this._sunShadowPipeline = sun.opaque;
+    this._sunShadowMaskPipeline = sun.masked;
 
     this._aoPipeline = this._fullscreenPipeline('axion-ao', this._aoLayout, m.ao, AO_FORMAT);
     this._aoBlurPipeline = this._fullscreenPipeline('axion-ao-blur', this._aoBlurLayout, m.aoBlur, AO_FORMAT);
     this._volumePipeline = this._fullscreenPipeline('axion-volume', this._volumeLayout, m.volume, AO_FORMAT);
+    this._skyPipeline = this._fullscreenPipeline('axion-sky', this._skyLayout, m.sky, 'rgba16float');
     this._exposurePipeline = this.device.createComputePipeline({
       label: 'axion-exposure',
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this._exposureLayout] }),
@@ -450,6 +581,7 @@ export class Renderer {
       ],
     });
     this._dofPipeline = this._fullscreenPipeline('axion-dof', this._dofLayout, m.dof, HDR_FORMAT);
+    this._ssrPipeline = this._fullscreenPipeline('axion-ssr', this._ssrLayout, m.ssr, HDR_FORMAT);
     this._resolvePipeline = this._fullscreenPipeline('axion-resolve', this._resolveLayout, m.resolve, HDR_FORMAT);
     this._bloomPrefilterPipeline = this._fullscreenPipeline('axion-bloom-prefilter', this._bloomLayout, m.bloomPrefilter, HDR_FORMAT);
     this._bloomDownPipeline = this._fullscreenPipeline('axion-bloom-down', this._bloomLayout, m.bloomDown, HDR_FORMAT);
@@ -499,6 +631,7 @@ export class Renderer {
       }));
     }
     this._boundInstanceBuffer = null;   // frame bind group references the array
+    this._volumeBindGroup = null;
     this._shadowState = [];             // new maps hold nothing yet
   }
 
@@ -508,6 +641,53 @@ export class Renderer {
     this._buildShadowTarget();
     this._rebuildFrameBindGroup();
     this._rebuildShadowBindGroup();
+  }
+
+  /** The sun's four cascades: one depth array, one layer each. A 16px stand-in while the sun is off. */
+  _buildSunShadowTarget() {
+    const on = this.sun.enabled && this.sun.shadows.enabled;
+    const size = on ? this.sun.shadows.size : 16;
+    this._sunShadowSize = size;
+    retire(this._sunShadowTexture);
+    this._sunShadowTexture = this.device.createTexture({
+      size: [size, size, CASCADES],
+      format: 'depth32float',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      label: 'axion-sun-shadow',
+    });
+    this._sunShadowView = this._sunShadowTexture.createView({ dimension: '2d-array' });
+    this._sunShadowLayers = [];
+    for (let i = 0; i < CASCADES; i++) {
+      this._sunShadowLayers.push(this._sunShadowTexture.createView({
+        dimension: '2d', baseArrayLayer: i, arrayLayerCount: 1,
+      }));
+    }
+    for (const c of this._cascades ?? []) c.drawn = -1;
+    this._boundInstanceBuffer = null;
+    this._volumeBindGroup = null;
+    this._sunNeedsClear = true;
+  }
+
+  _ensureSunShadow() {
+    const on = this.sun.enabled && this.sun.shadows.enabled;
+    const want = on ? this.sun.shadows.size : 16;
+    if (want === this._sunShadowSize) return;
+    this._buildSunShadowTarget();
+    this._rebuildFrameBindGroup();
+  }
+
+  _buildSky() {
+    this._skyTexture = this.device.createTexture({
+      size: [SKY_W, SKY_H], format: 'rgba16float',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      label: 'axion-sky-table',
+    });
+    this._skyView = this._skyTexture.createView();
+    this._skyBindGroup = this.device.createBindGroup({
+      layout: this._skyLayout, label: 'axion-sky',
+      entries: [{ binding: 0, resource: { buffer: this.cameraBuffer } }],
+    });
+    this._skyKey = '';
   }
 
   /* ------------------------------------------------------------ registry */
@@ -523,8 +703,47 @@ export class Renderer {
       firstIndex: iOffset / 4,
       indexCount: geometry.indices.length,
       bounds: geometry.bounds,
+      drawDistance: 0,
     });
     return id;
+  }
+
+  /**
+   * A level-of-detail group: a mesh id that stands for several meshes, the
+   * right one picked per object each frame by its distance from the camera.
+   *
+   *   renderer.createLod([{ mesh: a, distance: 0 }, { mesh: b, distance: 40 },
+   *                       { mesh: c, distance: 120 }], { drawDistance: 400 })
+   *
+   * `distance` is where each level starts. Past `drawDistance` the object is
+   * not drawn at all; it shrinks away over the last stretch instead of
+   * popping. Use the returned id anywhere a mesh id goes.
+   */
+  createLod(levels, { drawDistance = 0, fade = true, name = `lod${this.meshes.length}` } = {}) {
+    const sorted = [...levels].sort((a, b) => a.distance - b.distance);
+    const meshes = sorted.map((l) => l.mesh);
+    const dist = sorted.map((l) => l.distance);
+    // A level may be -1: nothing is drawn at that distance.
+    const base = this.meshes[meshes.find((m) => m >= 0)];
+    const id = this.meshes.length;
+    this.meshes.push({
+      id, name,
+      lod: { meshes, dist },
+      bounds: base.bounds,
+      indexCount: base.indexCount,
+      drawDistance, fade,
+    });
+    this.invalidate();
+    return id;
+  }
+
+  /** Stop drawing a mesh (or LOD group) beyond `distance` metres. 0 = always draw. */
+  setDrawDistance(mesh, distance, { fade = true } = {}) {
+    const m = this.meshes[mesh];
+    if (!m) return;
+    m.drawDistance = distance;
+    m.fade = fade;
+    this.invalidate();
   }
 
   /**
@@ -535,11 +754,16 @@ export class Renderer {
    * `noiseScale` above zero switches on procedural surface detail: fBm
    * weathering that modulates albedo, roughness, metallic and the normal,
    * evaluated per pixel in world space. No texture, no UV seams, no memory.
+   *
+   * `wind` makes the surface sway (0..1, trees ~0.3, grass-like plants ~1);
+   * `flutter` adds leaf shiver on top; `translucency` lets sunlight through
+   * thin surfaces such as leaves, lit from behind.
    */
   createMaterial({
     color = [1, 1, 1], alpha = 1, metallic = 0, roughness = 0.6, emissive = 0,
     transparent = false, doubleSided = false, castShadow = true,
     noiseScale = 0, noiseStrength = 0.6, bump = 0.5, oxide = 0,
+    wind = 0, flutter = 0, translucency = 0,
     // Textures, as GPUTextures. Base colour must be an sRGB format; the
     // metallic-roughness (G = roughness, B = metallic) and normal maps linear.
     baseColorTexture = null, metallicRoughnessTexture = null, normalTexture = null,
@@ -575,6 +799,7 @@ export class Renderer {
     this.materials.push({
       id, name, color, alpha, metallic, roughness, emissive, transparent,
       doubleSided, castShadow, noiseScale, noiseStrength, bump, oxide,
+      wind, flutter, translucency,
       masked, bindGroup, params,
     });
     return id;
@@ -592,12 +817,19 @@ export class Renderer {
     return Math.pow(2, p.compensation) / (1.2 * Math.pow(2, ev100));
   }
 
-  /** Recreated only when the instance buffer was reallocated by a grow. */
+  /** Point the sun by elevation and azimuth in degrees (azimuth 0 = +x, 90 = +z). */
+  setSunAngles(elevation, azimuth) {
+    this.sun.direction = sunDirection(elevation, azimuth);
+  }
+
+  /** Recreated only when a buffer or texture it references was replaced. */
   _rebuildFrameBindGroup() {
     if (this._boundInstanceBuffer === this.instances.buffer
-      && this._boundVisibleBuffer === this.visibleList.buffer) return;
+      && this._boundVisibleBuffer === this.visibleList.buffer
+      && this._boundSunView === this._sunShadowView) return;
     this._boundInstanceBuffer = this.instances.buffer;
     this._boundVisibleBuffer = this.visibleList.buffer;
+    this._boundSunView = this._sunShadowView;
     this.frameBindGroup = this.device.createBindGroup({
       layout: this._frameLayout,
       label: 'axion-frame',
@@ -608,6 +840,7 @@ export class Renderer {
         { binding: 3, resource: this._shadowArrayView },
         { binding: 4, resource: this._shadowSampler },
         { binding: 5, resource: { buffer: this.visibleList.buffer } },
+        { binding: 6, resource: this._sunShadowView },
       ],
     });
   }
@@ -621,35 +854,56 @@ export class Renderer {
       layout: this._shadowLayout,
       label: 'axion-shadow',
       entries: [
-        { binding: 0, resource: { buffer: this.faceBuffer, size: 64 } },
+        { binding: 0, resource: { buffer: this.faceBuffer, size: 80 } },
         { binding: 1, resource: { buffer: this.instances.buffer } },
         { binding: 2, resource: { buffer: this.shadowModels.buffer } },
       ],
     });
   }
 
-  /** Opaque, not alpha-tested: the materials the depth prepass can draw. */
+  _rebuildSunBindGroup() {
+    if (this._boundSunCasters === this.sunCasters.buffer
+      && this._boundSunInstances === this.instances.buffer) return;
+    this._boundSunCasters = this.sunCasters.buffer;
+    this._boundSunInstances = this.instances.buffer;
+    this.sunBindGroup = this.device.createBindGroup({
+      layout: this._shadowLayout,
+      label: 'axion-sun-shadow',
+      entries: [
+        { binding: 0, resource: { buffer: this.cascadeFaceBuffer, size: 80 } },
+        { binding: 1, resource: { buffer: this.instances.buffer } },
+        { binding: 2, resource: { buffer: this.sunCasters.buffer } },
+      ],
+    });
+  }
+
+  /** Opaque and alpha-tested: the materials the depth prepass can draw. */
   _inPrepass(material) {
-    return this.depthPrepass && !material.transparent && !material.masked;
+    return this.depthPrepass && !material.transparent;
   }
 
   _depthPipelineFor(material) {
-    const key = `depth|${material.doubleSided ? 1 : 0}`;
+    const key = `depth|${material.doubleSided ? 1 : 0}|${material.masked ? 1 : 0}`;
     let p = this._pipelines.get(key);
     if (p) return p;
     this._depthLayout ??= this.device.createPipelineLayout({
       bindGroupLayouts: [this._frameLayout], label: 'axion-depth-layout',
     });
+    const masked = material.masked;
     p = this.device.createRenderPipeline({
       label: `axion-pipeline-${key}`,
-      layout: this._depthLayout,
+      layout: masked ? this._geometryLayout : this._depthLayout,
       vertex: {
-        module: this._modules.standard, entryPoint: 'vsDepth',
+        module: this._modules.standard, entryPoint: masked ? 'vsDepthMask' : 'vsDepth',
         buffers: [{
           arrayStride: VERTEX_STRIDE_BYTES,
-          attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }],
+          attributes: masked ? [
+            { shaderLocation: 0, offset: 0, format: 'float32x3' },
+            { shaderLocation: 2, offset: 24, format: 'float32x2' },
+          ] : [{ shaderLocation: 0, offset: 0, format: 'float32x3' }],
         }],
       },
+      fragment: masked ? { module: this._modules.standard, entryPoint: 'fsDepthMask', targets: [] } : undefined,
       primitive: {
         topology: 'triangle-list',
         cullMode: material.doubleSided ? 'none' : 'back',
@@ -682,19 +936,7 @@ export class Renderer {
       },
       fragment: {
         module: this._modules.standard, entryPoint: 'fs',
-        targets: [
-          {
-            format: HDR_FORMAT,
-            blend: material.transparent ? {
-              color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
-              alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
-            } : undefined,
-          },
-          // Transparent surfaces must not overwrite the surface or albedo
-          // buffers, or the resolve would shade a reflection for a ghost.
-          { format: HDR_FORMAT, writeMask: material.transparent ? 0 : GPUColorWrite.ALL },
-          { format: ALBEDO_FORMAT, writeMask: material.transparent ? 0 : GPUColorWrite.ALL },
-        ],
+        targets: this.gbufferTargets(material.transparent),
       },
       primitive: {
         topology: 'triangle-list',
@@ -711,6 +953,23 @@ export class Renderer {
     });
     this._pipelines.set(key, p);
     return p;
+  }
+
+  /** The three G-buffer targets, for any pipeline that draws into the geometry pass. */
+  gbufferTargets(transparent = false) {
+    return [
+      {
+        format: HDR_FORMAT,
+        blend: transparent ? {
+          color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+          alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+        } : undefined,
+      },
+      // Transparent surfaces must not overwrite the surface or albedo
+      // buffers, or the resolve would shade a reflection for a ghost.
+      { format: HDR_FORMAT, writeMask: transparent ? 0 : GPUColorWrite.ALL },
+      { format: ALBEDO_FORMAT, writeMask: transparent ? 0 : GPUColorWrite.ALL },
+    ];
   }
 
   /* -------------------------------------------------------- attachments */
@@ -739,6 +998,8 @@ export class Renderer {
     const aoBlur = make(AO_FORMAT, aoW, aoH, 'axion-ao-blur');
     const vol = make(AO_FORMAT, aoW, aoH, 'axion-volume');
     const volBlur = make(AO_FORMAT, aoW, aoH, 'axion-volume-blur');
+    const ssr = make(HDR_FORMAT, width, height, 'axion-ssr');
+    const ssrBlur = make(HDR_FORMAT, width, height, 'axion-ssr-blur');
 
     const bloom = [];
     let bw = width >> 1, bh = height >> 1;
@@ -748,8 +1009,8 @@ export class Renderer {
     }
 
     this._targets = {
-      all: [color, surface, albedo, depth, hdr, ao, aoBlur, vol, volBlur, ...bloom.map((b) => b.tex)],
-      color, surface, albedo, depth, hdr, ao, aoBlur, vol, volBlur, bloom,
+      all: [color, surface, albedo, depth, hdr, ao, aoBlur, vol, volBlur, ssr, ssrBlur, ...bloom.map((b) => b.tex)],
+      color, surface, albedo, depth, hdr, ao, aoBlur, vol, volBlur, ssr, ssrBlur, bloom,
       colorView: color.createView(),
       surfaceView: surface.createView(),
       albedoView: albedo.createView(),
@@ -759,6 +1020,8 @@ export class Renderer {
       aoBlurView: aoBlur.createView(),
       volView: vol.createView(),
       volBlurView: volBlur.createView(),
+      ssrView: ssr.createView(),
+      ssrBlurView: ssrBlur.createView(),
       bloomViews: bloom.map((b) => b.tex.createView()),
     };
 
@@ -778,7 +1041,10 @@ export class Renderer {
     this._volumeBindGroup = null;
     this.aoBlurBindGroup = bg(this._aoBlurLayout, [camRes, this._sampler, t.aoView, t.depthView], 'axion-ao-blur');
     this.resolveBindGroup = bg(this._resolveLayout,
-      [camRes, this._sampler, t.colorView, t.surfaceView, t.albedoView, t.depthView, t.aoBlurView, t.volBlurView], 'axion-resolve');
+      [camRes, this._sampler, t.colorView, t.surfaceView, t.albedoView, t.depthView, t.aoBlurView, t.volBlurView,
+        this._skyView, this._skySampler, t.ssrBlurView], 'axion-resolve');
+    this.ssrBindGroup = bg(this._ssrLayout, [camRes, this._sampler, t.colorView, t.surfaceView, t.depthView], 'axion-ssr');
+    this.ssrBlurBindGroup = bg(this._aoBlurLayout, [camRes, this._sampler, t.ssrView, t.depthView], 'axion-ssr-blur');
     this.finalBindGroup = bg(this._finalLayout,
       [camRes, this._sampler, t.hdrView, t.bloomViews[0] ?? t.hdrView, { buffer: this.exposureBuffer }], 'axion-final');
 
@@ -790,80 +1056,44 @@ export class Renderer {
     this._targetSize = [width, height];
   }
 
-  /* --------------------------------------------------------- shadow prep */
-
-  /**
-   * Build the cube-face view-projection matrices for one light.
-   *
-   * The basis comes from the same CUBE_FACES table the shader reads, so the
-   * render and the lookup cannot disagree — which is how cube shadows usually
-   * end up subtly, maddeningly wrong.
-   */
-  _writeFaceMatrices(slot, lx, ly, lz, near, far) {
-    const stride = FACE_SLOT_BYTES / 4;
-    // Standard (not reverse) Z for shadows: the compare is 'less', and depth
-    // precision matters least where shadow acne is already handled by bias.
-    const p10 = far / (near - far);
-    const p14 = (near * far) / (near - far);
-
-    for (let i = 0; i < 6; i++) {
-      const F = CUBE_FACES[i].f, U = CUBE_FACES[i].u;
-      const R = [
-        F[1] * U[2] - F[2] * U[1],
-        F[2] * U[0] - F[0] * U[2],
-        F[0] * U[1] - F[1] * U[0],
-      ];
-      const base = (slot * 6 + i) * stride;
-      const m = this.faceData;
-
-      // view: x = dot(p-eye, R), y = dot(p-eye, U), z = -dot(p-eye, F)
-      // then projected by a 90° perspective with aspect 1, so P00 = P11 = 1.
-      const tx = -(R[0] * lx + R[1] * ly + R[2] * lz);
-      const ty = -(U[0] * lx + U[1] * ly + U[2] * lz);
-      const tz = F[0] * lx + F[1] * ly + F[2] * lz;
-
-      // Columns of P * V, written directly: P only scales rows 2 and 3.
-      m[base + 0] = R[0];   m[base + 1] = U[0];   m[base + 2] = -F[0] * p10;  m[base + 3] = F[0];
-      m[base + 4] = R[1];   m[base + 5] = U[1];   m[base + 6] = -F[1] * p10;  m[base + 7] = F[1];
-      m[base + 8] = R[2];   m[base + 9] = U[2];   m[base + 10] = -F[2] * p10; m[base + 11] = F[2];
-      m[base + 12] = tx;    m[base + 13] = ty;    m[base + 14] = tz * p10 + p14; m[base + 15] = -tz;
-    }
-  }
-
   /* ------------------------------------------------------ instance cache */
 
   /**
    * Instance data lives on the GPU between frames.
    *
-   * Every renderable is written once, sorted by (mesh, material), into one
-   * storage buffer, along with a world-space bounding sphere kept on the CPU.
-   * After that a frame only rewrites the entities tagged Dynamic, culls the
-   * spheres, and uploads a list of visible slot numbers — four bytes per
-   * object instead of a hundred and twelve. The cache is rebuilt when the set
-   * of entities or a material changes; `invalidate()` forces it after writing
-   * component data of static entities by hand.
+   * Every renderable is written once, sorted by (mesh, material) and then by
+   * the square cell of ground it stands on, into one storage buffer, along
+   * with a world-space bounding sphere kept on the CPU. After that a frame only
+   * rewrites the entities tagged Dynamic, culls whole cells and then the
+   * objects in the cells that are partly in view, picks a level of detail for
+   * each, and uploads a list of visible slot numbers — four bytes per object.
+   * The cache is rebuilt when the set of entities or a material changes;
+   * `invalidate()` forces it after writing component data of static entities
+   * by hand.
    */
   invalidate() { this._sig = null; }
 
   _cacheIsCurrent(world, archetypes) {
     const sig = this._sig;
-    const len = 4 + archetypes.length * 3;
+    const len = 6 + archetypes.length * 3;
     if (!sig || sig.length !== len) return false;
     if (sig[0] !== world._structureVersion || sig[1] !== this.materials.length
-      || sig[2] !== this.meshes.length || sig[3] !== archetypes.length) return false;
+      || sig[2] !== this.meshes.length || sig[3] !== archetypes.length
+      || sig[4] !== this.lodBias || sig[5] !== this.cellSize) return false;
     for (let i = 0; i < archetypes.length; i++) {
-      const a = archetypes[i], o = 4 + i * 3;
+      const a = archetypes[i], o = 6 + i * 3;
       if (sig[o] !== a.index || sig[o + 1] !== a.count || sig[o + 2] !== a.version) return false;
     }
     return !this._materialsChanged();
   }
 
   _storeSignature(world, archetypes) {
-    const sig = new Float64Array(4 + archetypes.length * 3);
+    const sig = new Float64Array(6 + archetypes.length * 3);
     sig[0] = world._structureVersion; sig[1] = this.materials.length;
     sig[2] = this.meshes.length; sig[3] = archetypes.length;
+    sig[4] = this.lodBias; sig[5] = this.cellSize;
     for (let i = 0; i < archetypes.length; i++) {
-      const a = archetypes[i], o = 4 + i * 3;
+      const a = archetypes[i], o = 6 + i * 3;
       sig[o] = a.index; sig[o + 1] = a.count; sig[o + 2] = a.version;
     }
     this._sig = sig;
@@ -881,16 +1111,14 @@ export class Renderer {
     }
     for (let i = 0; i < mats.length; i++) {
       const m = mats[i], o = i * MAT_SNAP;
-      const v0 = m.color[0], v1 = m.color[1], v2 = m.color[2];
-      if (snap[o] !== v0 || snap[o + 1] !== v1 || snap[o + 2] !== v2 || snap[o + 3] !== m.alpha
-        || snap[o + 4] !== m.emissive || snap[o + 5] !== m.metallic || snap[o + 6] !== m.roughness
-        || snap[o + 7] !== m.noiseScale || snap[o + 8] !== m.noiseStrength || snap[o + 9] !== m.bump
-        || snap[o + 10] !== m.oxide || snap[o + 11] !== (m.castShadow === false ? 0 : 1)) {
-        snap[o] = v0; snap[o + 1] = v1; snap[o + 2] = v2; snap[o + 3] = m.alpha;
-        snap[o + 4] = m.emissive; snap[o + 5] = m.metallic; snap[o + 6] = m.roughness;
-        snap[o + 7] = m.noiseScale; snap[o + 8] = m.noiseStrength; snap[o + 9] = m.bump;
-        snap[o + 10] = m.oxide; snap[o + 11] = m.castShadow === false ? 0 : 1;
-        changed = true;
+      const vals = this._matVals ??= new Float64Array(MAT_SNAP);
+      vals[0] = m.color[0]; vals[1] = m.color[1]; vals[2] = m.color[2]; vals[3] = m.alpha;
+      vals[4] = m.emissive; vals[5] = m.metallic; vals[6] = m.roughness;
+      vals[7] = m.noiseScale; vals[8] = m.noiseStrength; vals[9] = m.bump;
+      vals[10] = m.oxide; vals[11] = m.castShadow === false ? 0 : 1;
+      vals[12] = m.wind; vals[13] = m.flutter; vals[14] = m.translucency;
+      for (let k = 0; k < MAT_SNAP; k++) {
+        if (snap[o + k] !== vals[k]) { snap[o + k] = vals[k]; changed = true; }
       }
     }
     return changed;
@@ -907,6 +1135,7 @@ export class Renderer {
     for (let m = 0; m < 16; m++) inst[o + m] = W[w + m];
 
     const mat = this.materials[R[r * 2 + M_MATERIAL]] ?? this.materials[0];
+    const mesh = this.meshes[R[r * 2 + M_MESH]];
     const C = a.columns.get(InstanceColor.id);
     if (C) {
       inst[o + 16] = C[b]; inst[o + 17] = C[b + 1]; inst[o + 18] = C[b + 2];
@@ -918,11 +1147,15 @@ export class Renderer {
     inst[o + 19] = mat.alpha;
     inst[o + 20] = mat.metallic;
     inst[o + 21] = mat.roughness;
-    inst[o + 23] = 0;
+    inst[o + 23] = mat.wind;
     inst[o + 24] = mat.noiseScale;
     inst[o + 25] = mat.noiseStrength;
     inst[o + 26] = mat.bump;
     inst[o + 27] = mat.oxide;
+    inst[o + 28] = mat.translucency;
+    inst[o + 29] = mesh && mesh.drawDistance > 0 && mesh.fade !== false ? mesh.drawDistance * this.lodBias : 0;
+    inst[o + 30] = mat.flutter;
+    inst[o + 31] = 0;
 
     // World-space sphere: transform the center, scale the radius by the
     // largest axis scale. Three hypots, no matrix decomposition.
@@ -938,57 +1171,94 @@ export class Renderer {
 
   _rebuildInstances(world, archetypes) {
     const matCount = Math.max(1, this.materials.length);
-    const keyCount = Math.max(1, this.meshes.length) * matCount;
-    const counts = new Uint32Array(keyCount);
     let total = 0;
-    for (const a of archetypes) {
-      const R = a.columns.get(MeshRef.id);
-      for (let r = 0; r < a.count; r++) {
-        counts[R[r * 2 + M_MESH] * matCount + R[r * 2 + M_MATERIAL]]++;
-      }
-      total += a.count;
-    }
+    for (const a of archetypes) total += a.count;
 
-    // One entry per (mesh, material) that has anything in it, in key order.
-    const groups = [];
-    const cursor = new Uint32Array(keyCount);
-    let running = 0;
-    for (let k = 0; k < keyCount; k++) {
-      cursor[k] = running;
-      if (counts[k] > 0) {
-        const material = this.materials[k % matCount] ?? this.materials[0];
-        groups.push({
-          mesh: (k / matCount) | 0, material: k % matCount, matRef: material,
-          start: running, count: counts[k],
-          castShadow: material.castShadow !== false,
-        });
+    // Sort key per entity: (mesh, material) first, then the cell it stands in.
+    // Dynamic entities get their own cell, tested one by one every frame.
+    const eArch = new Uint16Array(total);
+    const eRow = new Uint32Array(total);
+    const eKey = new Float64Array(total);
+    const cs = this.cellSize;
+    let n = 0;
+    for (let ai = 0; ai < archetypes.length; ai++) {
+      const a = archetypes[ai];
+      const R = a.columns.get(MeshRef.id);
+      const W = a.columns.get(LocalToWorld.id);
+      const isDyn = a.has[Dynamic.id] === 1;
+      for (let r = 0; r < a.count; r++) {
+        const key = R[r * 2 + M_MESH] * matCount + R[r * 2 + M_MATERIAL];
+        let cell = 65535;
+        if (!isDyn) {
+          const ix = Math.floor(W[r * 16 + 12] / cs) & 255;
+          const iz = Math.floor(W[r * 16 + 14] / cs) & 255;
+          cell = (ix << 8) | iz;
+        }
+        eArch[n] = ai; eRow[n] = r; eKey[n] = key * 65536 + cell;
+        n++;
       }
-      running += counts[k];
     }
+    const order = new Uint32Array(total);
+    for (let i = 0; i < total; i++) order[i] = i;
+    order.sort((x, y) => eKey[x] - eKey[y]);
 
     this.instances.ensure(Math.max(1, total) * INSTANCE_FLOATS);
     if (!this._spheres || this._spheres.length < total * 4) {
       this._spheres = new Float32Array(Math.max(1024, total * 4));
     }
+    if (this._tmpSlot.length < total) {
+      this._tmpSlot = new Uint32Array(total);
+      this._tmpLevel = new Uint8Array(total);
+    }
 
-    const dyn = [];
-    for (const a of archetypes) {
-      const R = a.columns.get(MeshRef.id);
-      const isDyn = a.has[Dynamic.id] === 1;
-      const rowSlot = isDyn ? new Uint32Array(a.count) : null;
-      for (let r = 0; r < a.count; r++) {
-        const slot = cursor[R[r * 2 + M_MESH] * matCount + R[r * 2 + M_MATERIAL]]++;
-        this._writeInstance(slot, a, r);
-        if (rowSlot) rowSlot[r] = slot;
+    const rowSlots = archetypes.map((a) => (a.has[Dynamic.id] === 1 ? new Uint32Array(a.count) : null));
+    const groups = [];
+    let g = null, cell = null;
+    for (let slot = 0; slot < total; slot++) {
+      const e = order[slot];
+      const k = eKey[e];
+      const key = Math.floor(k / 65536);
+      const c = k - key * 65536;
+      if (!g || g.key !== key) {
+        const meshId = (key / matCount) | 0;
+        const material = this.materials[key % matCount] ?? this.materials[0];
+        g = {
+          key, mesh: meshId, material: key % matCount, matRef: material,
+          meshRef: this.meshes[meshId], start: slot, count: 0,
+          castShadow: material.castShadow !== false, cells: [],
+        };
+        groups.push(g);
+        cell = null;
       }
-      if (rowSlot && a.count > 0) dyn.push({ a, rowSlot });
+      if (!cell || cell.code !== c) {
+        cell = {
+          code: c, start: slot, count: 0, dynamic: c === 65535,
+          box: [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity],
+        };
+        g.cells.push(cell);
+      }
+      const a = archetypes[eArch[e]];
+      this._writeInstance(slot, a, eRow[e]);
+      const rs = rowSlots[eArch[e]];
+      if (rs) rs[eRow[e]] = slot;
+      g.count++;
+      cell.count++;
+      const so = slot * 4, sp = this._spheres, rad = sp[so + 3], bx = cell.box;
+      bx[0] = Math.min(bx[0], sp[so] - rad); bx[1] = Math.min(bx[1], sp[so + 1] - rad);
+      bx[2] = Math.min(bx[2], sp[so + 2] - rad); bx[3] = Math.max(bx[3], sp[so] + rad);
+      bx[4] = Math.max(bx[4], sp[so + 1] + rad); bx[5] = Math.max(bx[5], sp[so + 2] + rad);
     }
     this.instances.flush(total * INSTANCE_FLOATS);
+
+    const dyn = [];
+    for (let ai = 0; ai < archetypes.length; ai++) {
+      if (rowSlots[ai] && archetypes[ai].count > 0) dyn.push({ a: archetypes[ai], rowSlot: rowSlots[ai] });
+    }
 
     this._groups = groups;
     this._dyn = dyn;
     this._instTotal = total;
-    this._instBuild = (this._instBuild ?? 0) + 1;
+    this._instBuild++;
     this._storeSignature(world, archetypes);
   }
 
@@ -1041,47 +1311,423 @@ export class Renderer {
     return buf.u32;
   }
 
+  /** LOD level for a distance, and the real mesh drawn for it. */
+  _levelFor(mesh, dist) {
+    const lod = mesh.lod;
+    if (!lod) return 0;
+    const d = lod.dist, bias = this.lodBias;
+    let l = 0;
+    while (l + 1 < d.length && dist >= d[l + 1] * bias) l++;
+    return l;
+  }
+
+  _meshForLevel(g, level) {
+    const lod = g.meshRef?.lod;
+    if (!lod) return g.mesh;
+    return lod.meshes[Math.min(level, lod.meshes.length - 1)];
+  }
+
+  /** 0 = outside, 1 = fully inside, 2 = crossing. Planes point inward. */
+  _boxInFrustum(bx) {
+    const f = this._frustum;
+    let inside = true;
+    for (let i = 0; i < 6; i++) {
+      const o = i * 4, nx = f[o], ny = f[o + 1], nz = f[o + 2], d = f[o + 3];
+      const px = nx > 0 ? bx[3] : bx[0], py = ny > 0 ? bx[4] : bx[1], pz = nz > 0 ? bx[5] : bx[2];
+      if (nx * px + ny * py + nz * pz + d < 0) return 0;
+      const qx = nx > 0 ? bx[0] : bx[3], qy = ny > 0 ? bx[1] : bx[4], qz = nz > 0 ? bx[2] : bx[5];
+      if (nx * qx + ny * qy + nz * qz + d < 0) inside = false;
+    }
+    return inside ? 1 : 2;
+  }
+
+  /**
+   * Main-view culling and LOD. Fills the visible-slot list, grouped so each
+   * (mesh level, material) run is contiguous, and the draw list that walks it.
+   */
+  _cullInstances(camera) {
+    const sp = this._spheres, cull = this.frustumCulling, f = this._frustum;
+    const cx = camera.position[0], cy = camera.position[1], cz = camera.position[2];
+    const vis = this._u32List('visibleList', this._instTotal);
+    const tmp = this._tmpSlot, lvl = this._tmpLevel;
+    const draws = this._draws;
+    draws.length = 0;
+    const counts = [0, 0, 0, 0, 0, 0, 0, 0];
+    let visible = 0, tris = 0;
+
+    for (const g of this._groups) {
+      const mesh = g.meshRef;
+      if (!mesh) continue;
+      const maxD = mesh.drawDistance > 0 ? mesh.drawDistance * this.lodBias : Infinity;
+      const maxD2 = maxD * maxD;
+      const levels = mesh.lod ? mesh.lod.meshes.length : 1;
+      for (let l = 0; l < levels; l++) counts[l] = 0;
+      let k = 0;
+
+      for (const cell of g.cells) {
+        let test = 2;
+        if (!cell.dynamic) {
+          const bx = cell.box;
+          if (maxD < Infinity) {
+            const dx = Math.max(bx[0] - cx, 0, cx - bx[3]);
+            const dy = Math.max(bx[1] - cy, 0, cy - bx[4]);
+            const dz = Math.max(bx[2] - cz, 0, cz - bx[5]);
+            if (dx * dx + dy * dy + dz * dz > maxD2) continue;
+          }
+          test = cull ? this._boxInFrustum(bx) : 1;
+          if (test === 0) continue;
+        } else if (!cull) {
+          test = 1;
+        }
+        const end = cell.start + cell.count;
+        for (let s = cell.start; s < end; s++) {
+          const so = s * 4;
+          const x = sp[so], y = sp[so + 1], z = sp[so + 2];
+          if (test === 2) {
+            const r = -sp[so + 3];
+            if (f[0] * x + f[1] * y + f[2] * z + f[3] < r) continue;
+            if (f[4] * x + f[5] * y + f[6] * z + f[7] < r) continue;
+            if (f[8] * x + f[9] * y + f[10] * z + f[11] < r) continue;
+            if (f[12] * x + f[13] * y + f[14] * z + f[15] < r) continue;
+            if (f[16] * x + f[17] * y + f[18] * z + f[19] < r) continue;
+            if (f[20] * x + f[21] * y + f[22] * z + f[23] < r) continue;
+          }
+          const dx = x - cx, dy = y - cy, dz = z - cz;
+          const d2 = dx * dx + dy * dy + dz * dz;
+          if (d2 > maxD2) continue;
+          const l = levels > 1 ? this._levelFor(mesh, Math.sqrt(d2)) : 0;
+          tmp[k] = s; lvl[k] = l; k++;
+          counts[l]++;
+        }
+      }
+      if (k === 0) continue;
+
+      // Scatter into contiguous runs, one per level.
+      const starts = [0, 0, 0, 0, 0, 0, 0, 0];
+      let cursor = visible;
+      for (let l = 0; l < levels; l++) { starts[l] = cursor; cursor += counts[l]; }
+      for (let i = 0; i < k; i++) vis[starts[lvl[i]]++] = tmp[i];
+      let first = visible;
+      for (let l = 0; l < levels; l++) {
+        const meshId = this._meshForLevel(g, l);
+        if (counts[l] > 0 && meshId >= 0) {
+          draws.push(meshId, g, first, counts[l]);
+          tris += (this.meshes[meshId].indexCount / 3) * counts[l];
+        }
+        first += counts[l];
+      }
+      visible += k;
+    }
+
+    this.visibleList.flush(visible);
+    this._rebuildFrameBindGroup();
+    return { visible, tris };
+  }
+
+  /* --------------------------------------------------------- shadow prep */
+
+  /**
+   * Build the cube-face view-projection matrices for one light.
+   *
+   * The basis comes from the same CUBE_FACES table the shader reads, so the
+   * render and the lookup cannot disagree — which is how cube shadows usually
+   * end up subtly, maddeningly wrong.
+   */
+  _writeFaceMatrices(slot, lx, ly, lz, near, far) {
+    const stride = FACE_SLOT_BYTES / 4;
+    // Standard (not reverse) Z for shadows: the compare is 'less', and depth
+    // precision matters least where shadow acne is already handled by bias.
+    const p10 = far / (near - far);
+    const p14 = (near * far) / (near - far);
+
+    for (let i = 0; i < 6; i++) {
+      const F = CUBE_FACES[i].f, U = CUBE_FACES[i].u;
+      const R = [
+        F[1] * U[2] - F[2] * U[1],
+        F[2] * U[0] - F[0] * U[2],
+        F[0] * U[1] - F[1] * U[0],
+      ];
+      const base = (slot * 6 + i) * stride;
+      const m = this.faceData;
+
+      // view: x = dot(p-eye, R), y = dot(p-eye, U), z = -dot(p-eye, F)
+      // then projected by a 90° perspective with aspect 1, so P00 = P11 = 1.
+      const tx = -(R[0] * lx + R[1] * ly + R[2] * lz);
+      const ty = -(U[0] * lx + U[1] * ly + U[2] * lz);
+      const tz = F[0] * lx + F[1] * ly + F[2] * lz;
+
+      // Columns of P * V, written directly: P only scales rows 2 and 3.
+      m[base + 0] = R[0];   m[base + 1] = U[0];   m[base + 2] = -F[0] * p10;  m[base + 3] = F[0];
+      m[base + 4] = R[1];   m[base + 5] = U[1];   m[base + 6] = -F[1] * p10;  m[base + 7] = F[1];
+      m[base + 8] = R[2];   m[base + 9] = U[2];   m[base + 10] = -F[2] * p10; m[base + 11] = F[2];
+      m[base + 12] = tx;    m[base + 13] = ty;    m[base + 14] = tz * p10 + p14; m[base + 15] = -tz;
+    }
+  }
+
   /**
    * Gather shadow casters for the lights whose maps need redrawing, as slot
-   * numbers into the instance buffer, grouped by (mesh, material).
+   * numbers into the instance buffer, grouped by (mesh level, material). Casters
+   * use one level coarser than the camera sees: a shadow shows the outline,
+   * not the detail.
    */
-  _buildShadowBatches(lights) {
+  _buildShadowBatches(lights, camera) {
     const batches = this._shadowBatches;
     batches.length = 0;
     if (lights.length === 0) return 0;
     const sp = this._spheres;
     const cap = this.shadows.maxCasters;
     const list = this._u32List('shadowModels', Math.min(cap, this._instTotal * lights.length));
+    const cx = camera.position[0], cy = camera.position[1], cz = camera.position[2];
 
     let written = 0;
     for (let li = 0; li < lights.length; li++) {
       const L = lights[li];
       L.casters = 0;
       for (const g of this._groups) {
-        if (!g.castShadow || written >= cap) continue;
-        const first = written;
-        const end = g.start + g.count;
-        for (let s = g.start; s < end && written < cap; s++) {
-          const so = s * 4;
-          const radius = sp[so + 3];
-          const dx = sp[so] - L.x, dy = sp[so + 1] - L.y, dz = sp[so + 2] - L.z;
-          const distSq = dx * dx + dy * dy + dz * dz;
-          // Cull against the light's sphere of influence.
-          if (distSq > (L.range + radius) * (L.range + radius)) continue;
-          // A small caster that encloses the light is its bulb: drawn into the
-          // light's own cube map it would shadow the whole scene. Only small
-          // ones, though — a wall or a whole building also "encloses" a light
-          // inside its bounding sphere, and skipping those made shadows blink
-          // on and off as lights crossed the sphere boundary.
-          if (distSq < radius * radius && radius < Math.min(1, 0.1 * L.range)) continue;
-          list[written++] = s;
+        if (!g.castShadow || written >= cap || !g.meshRef) continue;
+        const mesh = g.meshRef;
+        const levels = mesh.lod ? mesh.lod.meshes.length : 1;
+        const maxD = mesh.drawDistance > 0 ? mesh.drawDistance * this.lodBias : Infinity;
+        // One level per group run keeps batches few: pick it per instance, bin by level.
+        const runStart = written;
+        const counts = [0, 0, 0, 0, 0, 0, 0, 0];
+        const tmp = this._tmpSlot, lvl = this._tmpLevel;
+        let k = 0;
+        for (const cell of g.cells) {
+          if (!cell.dynamic) {
+            const bx = cell.box;
+            const dx = Math.max(bx[0] - L.x, 0, L.x - bx[3]);
+            const dy = Math.max(bx[1] - L.y, 0, L.y - bx[4]);
+            const dz = Math.max(bx[2] - L.z, 0, L.z - bx[5]);
+            if (dx * dx + dy * dy + dz * dz > L.range * L.range) continue;
+          }
+          const end = cell.start + cell.count;
+          for (let s = cell.start; s < end && written + k < cap; s++) {
+            const so = s * 4;
+            const radius = sp[so + 3];
+            const dx = sp[so] - L.x, dy = sp[so + 1] - L.y, dz = sp[so + 2] - L.z;
+            const distSq = dx * dx + dy * dy + dz * dz;
+            // Cull against the light's sphere of influence.
+            if (distSq > (L.range + radius) * (L.range + radius)) continue;
+            // A small caster that encloses the light is its bulb: drawn into the
+            // light's own cube map it would shadow the whole scene. Only small
+            // ones, though — a wall or a whole building also "encloses" a light
+            // inside its bounding sphere, and skipping those made shadows blink
+            // on and off as lights crossed the sphere boundary.
+            if (distSq < radius * radius && radius < Math.min(1, 0.1 * L.range)) continue;
+            const ex = sp[so] - cx, ey = sp[so + 1] - cy, ez = sp[so + 2] - cz;
+            const camDist = Math.sqrt(ex * ex + ey * ey + ez * ez);
+            if (camDist > maxD) continue;
+            const l = levels > 1 ? Math.min(this._levelFor(mesh, camDist) + 1, levels - 1) : 0;
+            tmp[k] = s; lvl[k] = l; k++;
+            counts[l]++;
+          }
         }
-        if (written > first) {
-          batches.push({ light: L, mesh: g.mesh, material: g.material, first, count: written - first });
-          L.casters += written - first;
+        if (k === 0) continue;
+        const starts = [0, 0, 0, 0, 0, 0, 0, 0];
+        let cursor = runStart;
+        for (let l = 0; l < levels; l++) { starts[l] = cursor; cursor += counts[l]; }
+        for (let i = 0; i < k; i++) list[starts[lvl[i]]++] = tmp[i];
+        let first = runStart;
+        for (let l = 0; l < levels; l++) {
+          if (counts[l] > 0) {
+            batches.push({ light: L, mesh: this._meshForLevel(g, l), material: g.material, first, count: counts[l] });
+          }
+          first += counts[l];
         }
+        written += k;
+        L.casters += k;
       }
     }
+    return written;
+  }
+
+  /* ----------------------------------------------------------------- sun */
+
+  /**
+   * Sun colour, sky brightness and (with autoAmbient) the ambient light, from
+   * the atmosphere model. Only recomputed when the sun or the air changes.
+   */
+  _updateSun(camera) {
+    const sun = this.sun, sky = this.sky;
+    const L = sun.direction;
+    const len = Math.hypot(L[0], L[1], L[2]) || 1;
+    const dir = [L[0] / len, L[1] / len, L[2] / len];
+    this._sunDir = dir;
+    const alt = Math.round(Math.max(camera.position[1], 0) / 200) * 200;
+    const key = `${dir.map((v) => v.toFixed(4)).join()},${sky.haze},${alt},${sun.intensity},${sky.brightness},${sky.ambientStrength},${sun.color}`;
+    const st = this._sunState;
+    if (st.key === key) return;
+    st.key = key;
+    // Multiple scattering, which a single-scattering model leaves out, roughly
+    // triples the light the sky sends down; without it shade reads too dark.
+    const scatter = 3;
+    if (sun.color) {
+      st.color = sun.color.map((c) => c * sun.intensity);
+    } else if (sky.enabled) {
+      const T = sunTransmittance(dir, sky.haze, alt);
+      st.color = T.map((c) => c * sun.intensity);
+    } else {
+      st.color = [sun.intensity, sun.intensity, sun.intensity];
+    }
+    st.skyScale = sun.intensity * scatter * sky.brightness;
+    if (sky.enabled) {
+      const A = skyAmbient(dir, sky.haze, alt);
+      st.ambient = A.map((c) => c * st.skyScale * sky.ambientStrength);
+      // Light bounced off the ground below, relative to the sky above.
+      const T = st.color;
+      const skyLum = st.ambient[0] * 0.2126 + st.ambient[1] * 0.7152 + st.ambient[2] * 0.0722;
+      const sunLum = (T[0] * 0.2126 + T[1] * 0.7152 + T[2] * 0.0722) * Math.max(dir[1], 0);
+      const bounce = 0.18 * (sunLum / Math.PI + skyLum);
+      st.groundScale = Math.min(Math.max(bounce / Math.max(skyLum, 1e-5), 0.15), 1.2);
+    }
+  }
+
+  /**
+   * Fit the four cascades to the view.
+   *
+   * The near two hug slices of the view frustum and are refitted every frame.
+   * The far two are spheres around the camera itself, so turning the head
+   * does not move them at all; they are redrawn every second and fourth frame,
+   * and not at all while nothing changes. Every cascade is snapped to its own
+   * texel grid, which is what keeps shadow edges from crawling as you walk.
+   */
+  _updateCascades(camera) {
+    const sh = this.sun.shadows;
+    const size = this._sunShadowSize;
+    const near = camera.near, far = Math.max(sh.distance, near + 1);
+    const lambda = sh.split;
+    const splits = [];
+    for (let i = 1; i <= CASCADES; i++) {
+      const lg = near * Math.pow(far / near, i / CASCADES);
+      const un = near + (far - near) * (i / CASCADES);
+      splits.push(lambda * lg + (1 - lambda) * un);
+    }
+    this._csmSplits = splits;
+
+    const iv = camera.invView;
+    const fx = -iv[8], fy = -iv[9], fz = -iv[10];
+    const px = iv[12], py = iv[13], pz = iv[14];
+    const tanY = Math.tan(camera.fov / 2), tanX = tanY * camera.aspect;
+    const k = tanX * tanX + tanY * tanY;
+
+    const L = this._sunDir;
+    const f = [-L[0], -L[1], -L[2]];                 // direction light travels
+    const upRef = Math.abs(f[1]) > 0.99 ? [1, 0, 0] : [0, 1, 0];
+    let rx = f[1] * upRef[2] - f[2] * upRef[1];
+    let ry = f[2] * upRef[0] - f[0] * upRef[2];
+    let rz = f[0] * upRef[1] - f[1] * upRef[0];
+    const rl = Math.hypot(rx, ry, rz); rx /= rl; ry /= rl; rz /= rl;
+    const ux = ry * f[2] - rz * f[1], uy = rz * f[0] - rx * f[2], uz = rx * f[1] - ry * f[0];
+
+    const out = [];
+    for (let c = 0; c < CASCADES; c++) {
+      const d0 = c === 0 ? near : splits[c - 1], d1 = splits[c];
+      let cxw, cyw, czw, r;
+      if (c < 2) {
+        // Smallest sphere around the frustum slice, centred on the view axis.
+        const zc = Math.min(d1, 0.5 * (d0 + d1) * (1 + k));
+        const rFar = Math.sqrt((d1 - zc) * (d1 - zc) + d1 * d1 * k);
+        const rNear = Math.sqrt((zc - d0) * (zc - d0) + d0 * d0 * k);
+        r = Math.max(rFar, rNear);
+        cxw = px + fx * zc; cyw = py + fy * zc; czw = pz + fz * zc;
+      } else {
+        r = d1;
+        cxw = px; cyw = py; czw = pz;
+      }
+      // Quantise the radius, then snap the centre to whole texels in light space.
+      r = Math.ceil(r * 1.04 / 2) * 2;
+      const texel = 2 * r / size;
+      let lx = cxw * rx + cyw * ry + czw * rz;
+      let ly = cxw * ux + cyw * uy + czw * uz;
+      const lz = cxw * f[0] + cyw * f[1] + czw * f[2];
+      lx = Math.floor(lx / texel) * texel;
+      ly = Math.floor(ly / texel) * texel;
+      const sx = rx * lx + ux * ly + f[0] * lz;
+      const sy = ry * lx + uy * ly + f[1] * lz;
+      const sz = rz * lx + uz * ly + f[2] * lz;
+      const back = r + sh.reach;
+      const eye = [sx - f[0] * back, sy - f[1] * back, sz - f[2] * back];
+      out.push({ r, texel, eye, center: [sx, sy, sz], depth: back + r, right: [rx, ry, rz], up: [ux, uy, uz], fwd: f });
+    }
+    return out;
+  }
+
+  /**
+   * Casters for the cascades being redrawn this frame, grouped per cascade and
+   * (mesh level, material). Objects too small to show in a cascade are left
+   * out of it, which removes most small props from the far maps.
+   */
+  _buildCascadeBatches(fits, redraw, camera) {
+    const batches = this._cascadeBatches;
+    batches.length = 0;
+    if (redraw.length === 0) return 0;
+    const sp = this._spheres;
+    const list = this._u32List('sunCasters', this._instTotal * redraw.length + 1);
+    const cx = camera.position[0], cy = camera.position[1], cz = camera.position[2];
+    const tmp = this._tmpSlot, lvl = this._tmpLevel;
+    const minTexels = this.sun.shadows.minCasterTexels;
+    let written = 0;
+
+    for (const c of redraw) {
+      const fit = fits[c];
+      const R = fit.right, U = fit.up, F = fit.fwd, E = fit.eye;
+      const half = fit.r, depth = fit.depth;
+      const minR = c === 0 ? 0 : fit.texel * minTexels;
+      for (const g of this._groups) {
+        if (!g.castShadow || !g.meshRef) continue;
+        const mesh = g.meshRef;
+        const levels = mesh.lod ? mesh.lod.meshes.length : 1;
+        const maxD = mesh.drawDistance > 0 ? mesh.drawDistance * this.lodBias : Infinity;
+        const counts = [0, 0, 0, 0, 0, 0, 0, 0];
+        let k = 0;
+        for (const cell of g.cells) {
+          if (!cell.dynamic) {
+            const bx = cell.box;
+            const mx = (bx[0] + bx[3]) * 0.5 - E[0], my = (bx[1] + bx[4]) * 0.5 - E[1], mz = (bx[2] + bx[5]) * 0.5 - E[2];
+            const cr = 0.5 * Math.hypot(bx[3] - bx[0], bx[4] - bx[1], bx[5] - bx[2]);
+            const x = mx * R[0] + my * R[1] + mz * R[2];
+            const y = mx * U[0] + my * U[1] + mz * U[2];
+            const z = mx * F[0] + my * F[1] + mz * F[2];
+            if (Math.abs(x) > half + cr || Math.abs(y) > half + cr || z < -cr || z > depth + cr) continue;
+          }
+          const end = cell.start + cell.count;
+          for (let s = cell.start; s < end; s++) {
+            const so = s * 4;
+            const q = sp[so + 3];
+            if (q < minR) continue;
+            const mx = sp[so] - E[0], my = sp[so + 1] - E[1], mz = sp[so + 2] - E[2];
+            const x = mx * R[0] + my * R[1] + mz * R[2];
+            if (Math.abs(x) > half + q) continue;
+            const y = mx * U[0] + my * U[1] + mz * U[2];
+            if (Math.abs(y) > half + q) continue;
+            const z = mx * F[0] + my * F[1] + mz * F[2];
+            if (z < -q || z > depth + q) continue;
+            const ex = sp[so] - cx, ey = sp[so + 1] - cy, ez = sp[so + 2] - cz;
+            const camDist = Math.sqrt(ex * ex + ey * ey + ez * ez);
+            if (camDist > maxD) continue;
+            const l = levels > 1 ? Math.min(this._levelFor(mesh, camDist) + (c > 0 ? 1 : 0), levels - 1) : 0;
+            tmp[k] = s; lvl[k] = l; k++;
+            counts[l]++;
+          }
+        }
+        if (k === 0) continue;
+        const starts = [0, 0, 0, 0, 0, 0, 0, 0];
+        let cursor = written;
+        for (let l = 0; l < levels; l++) { starts[l] = cursor; cursor += counts[l]; }
+        for (let i = 0; i < k; i++) list[starts[lvl[i]]++] = tmp[i];
+        let first = written;
+        for (let l = 0; l < levels; l++) {
+          if (counts[l] > 0) {
+            batches.push({ cascade: c, mesh: this._meshForLevel(g, l), matRef: g.matRef, first, count: counts[l] });
+          }
+          first += counts[l];
+        }
+        written += k;
+      }
+    }
+    if (written > 0) this.sunCasters.flush(written);
+    this._rebuildSunBindGroup();
     return written;
   }
 
@@ -1092,8 +1738,10 @@ export class Renderer {
     sweepRetired();
     this._ensureTargets();
     this._ensureShadowCapacity();
+    this._ensureSunShadow();
     const { width, height } = this.canvas;
     const t = this._targets;
+    this._frameIndex++;
 
     /* ---- lights, and which of them get a shadow map ---- */
     const lightList = [];
@@ -1173,7 +1821,7 @@ export class Renderer {
       this._moved.length = 0;
     }
 
-    /* ---- shadow maps: a map is only redrawn when its light or its casters changed ---- */
+    /* ---- point shadow maps: a map is only redrawn when its light or its casters changed ---- */
     const near = this.shadows.near;
     const redraw = [];
     for (const l of shadowLights) {
@@ -1186,7 +1834,7 @@ export class Renderer {
         redraw.push(l);
       }
     }
-    const shadowCasters = this._buildShadowBatches(redraw);
+    const shadowCasters = this._buildShadowBatches(redraw, camera);
     for (const l of redraw) {
       this._shadowState[l.slot] = {
         entity: l.entity, x: l.x, y: l.y, z: l.z, range: l.range, near,
@@ -1220,6 +1868,50 @@ export class Renderer {
         this.lightBuffer, 0, this.lightData.buffer, 0, lightList.length * LIGHT_FLOATS * 4);
     }
 
+    /* ---- sun, sky and cascades ---- */
+    const sunOn = this.sun.enabled;
+    const skyOn = this.sky.enabled;
+    if (sunOn || skyOn) this._updateSun(camera);
+    const sunShadowsOn = sunOn && this.sun.shadows.enabled;
+    const cascadeRedraw = [];
+    let fits = null;
+    if (sunShadowsOn) {
+      fits = this._updateCascades(camera);
+      const terrainVersion = this.terrain ? this.terrain.version : 0;
+      const f = this._frameIndex;
+      for (let c = 0; c < CASCADES; c++) {
+        const fit = fits[c], st = this._cascades[c];
+        const key = `${fit.center[0].toFixed(3)},${fit.center[1].toFixed(3)},${fit.center[2].toFixed(3)},${fit.r},` +
+          `${this._sunState.key},${this._instBuild},${terrainVersion},${this._moved.length > 0 ? f : 0}`;
+        const scheduled = c < 2 || (c === 2 ? (f & 1) === 0 : (f & 3) === 1);
+        const forced = st.drawn < 0 || st.sunKey !== this._sunState.key || st.build !== this._instBuild
+          || st.terrain !== terrainVersion;
+        if ((scheduled && key !== st.key) || forced) {
+          cascadeRedraw.push(c);
+          st.key = key;
+          st.sunKey = this._sunState.key;
+          st.build = this._instBuild;
+          st.terrain = terrainVersion;
+          st.drawn = f;
+          st.world = 2 * fit.r;
+          const view = st.view;
+          const up = fit.up;
+          m4lookAt(view, 0, fit.eye, 0, fit.center, 0, up, 0);
+          const proj = this._orthoTmp ??= new Float32Array(16);
+          m4ortho(proj, 0, -fit.r, fit.r, -fit.r, fit.r, 0, fit.depth);
+          m4mul(st.viewProj, 0, proj, 0, view, 0);
+          this.cascadeFaceData.set(st.viewProj, c * FACE_SLOT_BYTES / 4);
+          this.cascadeFaceData[c * FACE_SLOT_BYTES / 4 + 16] = camera.position[0];
+          this.cascadeFaceData[c * FACE_SLOT_BYTES / 4 + 17] = camera.position[1];
+          this.cascadeFaceData[c * FACE_SLOT_BYTES / 4 + 18] = camera.position[2];
+        }
+      }
+      if (cascadeRedraw.length > 0) {
+        this.device.queue.writeBuffer(this.cascadeFaceBuffer, 0, this.cascadeFaceData);
+      }
+    }
+    const sunCasters = sunShadowsOn ? this._buildCascadeBatches(fits, cascadeRedraw, camera) : 0;
+
     /* ---- camera uniform ---- */
     const cd = this.cameraData;
     cd.set(camera.viewProj, 0);
@@ -1231,7 +1923,11 @@ export class Renderer {
     cd[53] = this.effectiveExposure();
     cd[54] = this.fogDensity;
     cd[55] = this.fxaa ? 1 : 0;
-    cd.set(this.ambient, 56); cd[59] = this.groundAmbient;
+    if (skyOn && this.sky.autoAmbient && this._sunState.ambient) {
+      cd.set(this._sunState.ambient, 56); cd[59] = this._sunState.groundScale;
+    } else {
+      cd.set(this.ambient, 56); cd[59] = this.groundAmbient;
+    }
     cd.set(this.fogColor, 60); cd[63] = this.aerialPerspective;
     cd[64] = camera.projection[0];
     cd[65] = camera.projection[5];
@@ -1266,44 +1962,52 @@ export class Renderer {
     const df = this.dof;
     cd[120] = df.focus; cd[121] = df.range; cd[122] = df.transition; cd[123] = df.amount;
     cd[124] = df.near ? 1 : 0; cd[125] = df.far ? 1 : 0; cd[126] = df.autoFocus ? 1 : 0; cd[127] = df.enabled ? 1 : 0;
+
+    const sky = this.sky;
+    cd[128] = skyOn ? 1 : 0; cd[129] = sky.sunDisc; cd[130] = skyOn ? sky.clouds : 0;
+    cd[131] = time * 0.004 * sky.cloudSpeed;
+    const sd = this._sunDir ?? [0, 1, 0];
+    cd[132] = sd[0]; cd[133] = sd[1]; cd[134] = sd[2]; cd[135] = sunOn ? 1 : 0;
+    const sc = this._sunState.color;
+    cd[136] = sc[0]; cd[137] = sc[1]; cd[138] = sc[2]; cd[139] = sunShadowsOn ? 1 : 0;
+    const splits = this._csmSplits ?? [1, 2, 3, 4];
+    cd[140] = splits[0]; cd[141] = splits[1]; cd[142] = splits[2]; cd[143] = splits[3];
+    cd[144] = this._sunShadowSize; cd[145] = this.sun.shadows.pcfRadius;
+    cd[146] = this.sun.shadows.normalBias; cd[147] = 0;
+    for (let c = 0; c < CASCADES; c++) {
+      cd.set(this._cascades[c].viewProj, 148 + c * 16);
+      cd[236 + c] = this._cascades[c].world;
+    }
+    const wd = this.wind.direction, wl = Math.hypot(wd[0], wd[1]) || 1;
+    cd[212] = wd[0] / wl; cd[213] = wd[1] / wl; cd[214] = this.wind.strength; cd[215] = time * this.wind.speed;
+    cd[216] = this._sunState.skyScale ?? 1; cd[217] = sky.cloudHeight; cd[218] = sky.cloudScale; cd[219] = sky.haze;
+    const tu = this.terrain ? this.terrain.uniforms() : null;
+    for (let i = 0; i < 12; i++) cd[220 + i] = tu ? tu[i] : 0;
+    cd[232] = this.fogHeight.base; cd[233] = this.fogHeight.falloff;
+    cd[234] = skyOn ? sky.cloudShadows : 0; cd[235] = 0;
+    if (this._prevViewProj) cd.set(this._prevViewProj, 240); else cd.set(camera.viewProj, 240);
+    (this._prevViewProj ??= new Float32Array(16)).set(camera.viewProj);
     this.device.queue.writeBuffer(this.cameraBuffer, 0, cd);
 
     if (this.frustumCulling) frustumFromMatrix(this._frustum, 0, camera.viewProj, 0);
 
     /* ---- cull the cached spheres; the GPU gets a list of visible slots ---- */
-    const sp = this._spheres, fr = this._frustum, cull = this.frustumCulling;
-    const vis = this._u32List('visibleList', this._instTotal);
-    const drawList = this._draws;
-    drawList.length = 0;
-    let visible = 0;
-    for (const g of this._groups) {
-      const first = visible, end = g.start + g.count;
-      if (!cull) {
-        for (let s = g.start; s < end; s++) vis[visible++] = s;
-      } else {
-        for (let s = g.start; s < end; s++) {
-          const so = s * 4;
-          const x = sp[so], y = sp[so + 1], z = sp[so + 2], r = -sp[so + 3];
-          if (fr[0] * x + fr[1] * y + fr[2] * z + fr[3] < r) continue;
-          if (fr[4] * x + fr[5] * y + fr[6] * z + fr[7] < r) continue;
-          if (fr[8] * x + fr[9] * y + fr[10] * z + fr[11] < r) continue;
-          if (fr[12] * x + fr[13] * y + fr[14] * z + fr[15] < r) continue;
-          if (fr[16] * x + fr[17] * y + fr[18] * z + fr[19] < r) continue;
-          if (fr[20] * x + fr[21] * y + fr[22] * z + fr[23] < r) continue;
-          vis[visible++] = s;
-        }
-      }
-      if (visible > first) drawList.push(g, first, visible - first);
-    }
+    const { visible, tris: objectTris } = this._cullInstances(camera);
     const culled = this._instTotal - visible;
-    this.visibleList.flush(visible);
-    this._rebuildFrameBindGroup();
+    const drawList = this._draws;
+
+    if (this.terrain) {
+      this.terrain.frame({
+        camera, frustum: this.frustumCulling ? this._frustum : null,
+        cascades: sunShadowsOn ? fits : null, cascadeRedraw,
+      });
+    }
 
     /* ================================ encode ============================= */
     const enc = this.device.createCommandEncoder({ label: 'axion-frame' });
     let shadowDraws = 0;
 
-    /* ---- 1. shadow cube faces ---- */
+    /* ---- 1a. point-light cube faces ---- */
     if (shadowCasters > 0) {
       const maxSlot = (this._shadowFaceViews.length / 6) | 0;
       for (const light of redraw) {
@@ -1339,6 +2043,48 @@ export class Renderer {
       }
     }
 
+    /* ---- 1b. sun cascades ---- */
+    for (const c of cascadeRedraw) {
+      const pass = enc.beginRenderPass({
+        label: `axion-sun-shadow-${c}`,
+        colorAttachments: [],
+        depthStencilAttachment: {
+          view: this._sunShadowLayers[c],
+          depthClearValue: 1.0,
+          depthLoadOp: 'clear', depthStoreOp: 'store',
+        },
+      });
+      pass.setBindGroup(0, this.sunBindGroup, [c * FACE_SLOT_BYTES]);
+      pass.setVertexBuffer(0, this.vertexArena.buffer);
+      pass.setIndexBuffer(this.indexArena.buffer, 'uint32');
+      let bound = null;
+      for (const b of this._cascadeBatches) {
+        if (b.cascade !== c) continue;
+        const m = this.meshes[b.mesh];
+        if (!m) continue;
+        const pipeline = b.matRef.masked ? this._sunShadowMaskPipeline : this._sunShadowPipeline;
+        if (pipeline !== bound) { pass.setPipeline(pipeline); bound = pipeline; }
+        if (b.matRef.masked) pass.setBindGroup(1, b.matRef.bindGroup);
+        pass.drawIndexed(m.indexCount, b.count, m.firstIndex, m.baseVertex, b.first);
+        shadowDraws++;
+      }
+      if (this.terrain) shadowDraws += this.terrain.drawShadow(pass, c);
+      pass.end();
+    }
+
+    /* ---- 1c. sky table, when the sun or the air changed ---- */
+    if (skyOn && this._skyKey !== this._sunState.key) {
+      this._skyKey = this._sunState.key;
+      const pass = enc.beginRenderPass({
+        label: 'axion-sky',
+        colorAttachments: [{ view: this._skyView, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
+      });
+      pass.setPipeline(this._skyPipeline);
+      pass.setBindGroup(0, this._skyBindGroup);
+      pass.draw(3);
+      pass.end();
+    }
+
     /* ---- 2a. depth prepass ---- */
     let prepassDraws = 0;
     if (this.depthPrepass) {
@@ -1354,16 +2100,18 @@ export class Renderer {
       dp.setVertexBuffer(0, this.vertexArena.buffer);
       dp.setIndexBuffer(this.indexArena.buffer, 'uint32');
       let bound = null;
-      for (let i = 0; i < drawList.length; i += 3) {
-        const g = drawList[i];
+      for (let i = 0; i < drawList.length; i += 4) {
+        const g = drawList[i + 1];
         if (!this._inPrepass(g.matRef)) continue;
-        const m = this.meshes[g.mesh];
+        const m = this.meshes[drawList[i]];
         if (!m) continue;
         const p = this._depthPipelineFor(g.matRef);
         if (p !== bound) { dp.setPipeline(p); bound = p; }
-        dp.drawIndexed(m.indexCount, drawList[i + 2], m.firstIndex, m.baseVertex, drawList[i + 1]);
+        if (g.matRef.masked) dp.setBindGroup(1, g.matRef.bindGroup);
+        dp.drawIndexed(m.indexCount, drawList[i + 3], m.firstIndex, m.baseVertex, drawList[i + 2]);
         prepassDraws++;
       }
+      if (this.terrain) prepassDraws += this.terrain.drawDepth(dp);
       dp.end();
     }
 
@@ -1390,21 +2138,30 @@ export class Renderer {
     geo.setVertexBuffer(0, this.vertexArena.buffer);
     geo.setIndexBuffer(this.indexArena.buffer, 'uint32');
 
-    let draws = 0, tris = 0, batches = 0, currentPipeline = null, currentMaterial = null;
+    let draws = 0, batches = 0, currentPipeline = null, currentMaterial = null;
+    let extraTris = 0;
     for (let phase = 0; phase < 2; phase++) {
-      for (let i = 0; i < drawList.length; i += 3) {
-        const g = drawList[i], start = drawList[i + 1], count = drawList[i + 2];
+      if (phase === 1 && this.terrain) {
+        // Terrain, water and grass sit between the opaque objects and the transparent ones.
+        const td = this.terrain.drawSurface(geo);
+        draws += td.draws; extraTris += td.tris;
+        geo.setVertexBuffer(0, this.vertexArena.buffer);
+        geo.setIndexBuffer(this.indexArena.buffer, 'uint32');
+        geo.setBindGroup(0, this.frameBindGroup);
+        currentPipeline = null; currentMaterial = null;
+      }
+      for (let i = 0; i < drawList.length; i += 4) {
+        const g = drawList[i + 1];
         const material = g.matRef;
         if ((material.transparent ? 1 : 0) !== phase) continue;
-        const m = this.meshes[g.mesh];
+        const m = this.meshes[drawList[i]];
         if (!m) continue;
 
         const pipeline = this._pipelineFor(material);
         if (pipeline !== currentPipeline) { geo.setPipeline(pipeline); currentPipeline = pipeline; }
         if (material !== currentMaterial) { geo.setBindGroup(1, material.bindGroup); currentMaterial = material; }
-        geo.drawIndexed(m.indexCount, count, m.firstIndex, m.baseVertex, start);
+        geo.drawIndexed(m.indexCount, drawList[i + 3], m.firstIndex, m.baseVertex, drawList[i + 2]);
         draws++; batches++;
-        tris += (m.indexCount / 3) * count;
       }
     }
     geo.end();
@@ -1443,8 +2200,10 @@ export class Renderer {
     /* ---- 3b. volumetric fog ---- */
     let volumePasses = 0;
     if (this.volumetric.enabled && this.volumetric.density > 0) {
-      if (!this._volumeBindGroup || this._volumeShadowView !== this._shadowArrayView) {
+      if (!this._volumeBindGroup || this._volumeShadowView !== this._shadowArrayView
+        || this._volumeSunView !== this._sunShadowView) {
         this._volumeShadowView = this._shadowArrayView;
+        this._volumeSunView = this._sunShadowView;
         this._volumeBindGroup = this.device.createBindGroup({
           layout: this._volumeLayout, label: 'axion-volume',
           entries: [
@@ -1454,12 +2213,28 @@ export class Renderer {
             { binding: 3, resource: { buffer: this.lightBuffer } },
             { binding: 4, resource: this._shadowArrayView },
             { binding: 5, resource: this._shadowSampler },
+            { binding: 6, resource: this._sunShadowView },
           ],
         });
       }
       fullscreen('axion-volume', t.volView, this._volumePipeline, this._volumeBindGroup);
       fullscreen('axion-volume-blur', t.volBlurView, this._aoBlurPipeline, this.volBlurBindGroup);
       volumePasses = 2;
+    }
+
+    /* ---- 3c. screen-space reflections, then the same 4x4 blur as AO ---- */
+    let ssrPasses = 0;
+    if (this.ssr.intensity > 0) {
+      fullscreen('axion-ssr', t.ssrView, this._ssrPipeline, this.ssrBindGroup);
+      fullscreen('axion-ssr-blur', t.ssrBlurView, this._aoBlurPipeline, this.ssrBlurBindGroup);
+      t.ssrIdle = false;
+      ssrPasses = 2;
+    } else if (!t.ssrIdle) {
+      enc.beginRenderPass({
+        label: 'axion-ssr-off',
+        colorAttachments: [{ view: t.ssrBlurView, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 0 } }],
+      }).end();
+      t.ssrIdle = true;
     }
 
     /* ---- 4. resolve ---- */
@@ -1516,15 +2291,19 @@ export class Renderer {
 
     const bloomPasses = t.bloom.length > 0 && this.bloom.strength > 0
       ? t.bloom.length * 2 - 1 : 0;
-    this.stats.drawCalls = draws + prepassDraws + shadowDraws + 1 + aoPasses + volumePasses + dofPasses + bloomPasses + 1;
+    this.stats.drawCalls = draws + prepassDraws + shadowDraws + 1 + aoPasses + volumePasses + ssrPasses + dofPasses + bloomPasses + 1;
     this.stats.batches = batches;
     this.stats.instances = visible;
     this.stats.culled = culled;
-    this.stats.triangles = tris;
+    this.stats.triangles = objectTris + extraTris;
     this.stats.shadowDraws = shadowDraws;
     this.stats.shadowCasters = shadowCasters;
     this.stats.shadowLights = shadowLights.filter((l) => l.casters > 0).length;
     this.stats.shadowRedraws = redraw.length;
+    this.stats.sunCasters = sunCasters;
+    this.stats.cascadesDrawn = cascadeRedraw.length;
+    this.stats.terrainPatches = this.terrain ? this.terrain.stats.patches : 0;
+    this.stats.grassBlades = this.terrain ? this.terrain.stats.blades : 0;
     this.stats.cpuMs = performance.now() - t0;
   }
 
@@ -1534,11 +2313,16 @@ export class Renderer {
     this.instances.destroy();
     this.shadowModels.destroy();
     this.visibleList.destroy();
+    this.sunCasters.destroy();
     this.cameraBuffer.destroy();
     this.lightBuffer.destroy();
     this.faceBuffer.destroy();
+    this.cascadeFaceBuffer.destroy();
     this.exposureBuffer.destroy();
     this._shadowTexture?.destroy();
+    this._sunShadowTexture?.destroy();
+    this._skyTexture?.destroy();
+    this.terrain?.destroy();
     for (const tex of this._targets?.all ?? []) tex.destroy();
   }
 }

@@ -1,0 +1,2145 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8">
+        <title>Pine Valley</title>
+        <style>
+            html, body {
+                margin: 0;
+                height: 100%;
+                overflow: hidden;
+                background: rgb(7, 10, 16);
+                font: 12px sans-serif;
+            }
+
+            canvas {
+                display: block;
+                width: 100%;
+                height: 100%;
+            }
+
+            #msg {
+                position: fixed;
+                left: 50px;
+                top: 12px;
+                right: 10px;
+                color: rgb(206, 216, 228);
+                font-size: 13px;
+                text-shadow: 0 1px 2px rgb(0, 0, 0);
+                pointer-events: none;
+            }
+
+            #status {
+                position: fixed;
+                left: 10px;
+                bottom: 8px;
+                color: rgb(151, 166, 187);
+                font-size: 11px;
+                text-shadow: 0 1px 2px rgb(0, 0, 0);
+                pointer-events: none;
+            }
+
+            #tab {
+                position: fixed;
+                left: 10px;
+                top: 8px;
+                width: 30px;
+                height: 26px;
+                z-index: 3;
+                padding: 0;
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 6px;
+                background: rgba(14, 18, 27, 0.86);
+                color: rgb(206, 216, 228);
+                font-size: 16px;
+                line-height: 24px;
+                cursor: pointer;
+            }
+
+            #tab:hover {
+                background: rgba(41, 51, 69, 0.95);
+            }
+
+            /* Sliding menu */
+            #panel {
+                position: fixed;
+                left: 0;
+                top: 0;
+                bottom: 0;
+                width: 250px;
+                z-index: 2;
+                background: rgba(10, 13, 20, 0.93);
+                color: rgb(206, 216, 228);
+                border-right: 1px solid rgba(255, 255, 255, 0.11);
+                transform: translateX(-100%);
+                transition: transform 0.25s ease;
+            }
+
+            #panel.open {
+                transform: translateX(0);
+            }
+
+            #list {
+                position: absolute;
+                inset: 0;
+                padding: 44px 20px 14px 14px;
+                overflow-y: auto;
+                scrollbar-width: none;
+            }
+
+            #list::-webkit-scrollbar {
+                display: none;
+            }
+
+            #list h3 {
+                margin: 14px 0 6px;
+                font-size: 11px;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+                color: rgb(127, 143, 164);
+            }
+
+            .row {
+                margin: 7px 0;
+            }
+
+            .row label {
+                display: flex;
+                justify-content: space-between;
+                margin-bottom: 2px;
+            }
+
+            .row label span {
+                color: rgb(143, 178, 254);
+            }
+
+            .row input[type=range] {
+                width: 100%;
+                margin: 0;
+            }
+
+            .check {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                margin: 7px 0;
+                cursor: pointer;
+            }
+
+            .btn {
+                width: 100%;
+                margin-top: 8px;
+                padding: 6px;
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 5px;
+                background: rgb(27, 34, 49);
+                color: rgb(206, 216, 228);
+                cursor: pointer;
+            }
+
+            .btn:hover {
+                background: rgb(38, 48, 67);
+            }
+
+            /* Custom scroll bar: thin pixel strip, wider while scrolling or hovered */
+            #bar {
+                position: absolute;
+                right: 2px;
+                top: 40px;
+                bottom: 6px;
+                width: 14px;
+            }
+
+            #thumb {
+                position: absolute;
+                right: 0;
+                width: 3px;
+                min-height: 24px;
+                border-radius: 1px;
+                background-color: rgb(96, 113, 139);
+                background-image:
+                    linear-gradient(90deg, rgba(0, 0, 0, 0.27) 50%, transparent 50%),
+                    linear-gradient(rgba(255, 255, 255, 0.13) 50%, transparent 50%);
+                background-size: 2px 2px, 4px 4px;
+                image-rendering: pixelated;
+                transition: width 0.18s ease, background-color 0.18s ease;
+                cursor: pointer;
+            }
+
+            #bar:hover #thumb,
+            #bar.active #thumb {
+                width: 9px;
+                background-color: rgb(131, 152, 187);
+            }
+
+            #bar.hide {
+                display: none;
+            }
+
+            /* Collapsible sections */
+            .sec {
+                border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+            }
+
+            .sec-head {
+                display: block;
+                width: 100%;
+                padding: 9px 2px;
+                border: 0;
+                background: none;
+                color: rgb(171, 186, 207);
+                font: 11px sans-serif;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+                text-align: left;
+                cursor: pointer;
+            }
+
+            .sec-head:hover {
+                color: rgb(222, 231, 243);
+            }
+
+            .arrow {
+                display: inline-block;
+                width: 14px;
+                transition: transform 0.15s ease;
+            }
+
+            .sec.open .arrow {
+                transform: rotate(90deg);
+            }
+
+            .sec-body {
+                display: none;
+                padding: 0 2px 10px;
+            }
+
+            .sec.open .sec-body {
+                display: block;
+            }
+
+            select {
+                width: 100%;
+                padding: 3px;
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 4px;
+                background: rgb(21, 27, 39);
+                color: rgb(206, 216, 228);
+            }
+
+            .reset {
+                margin-top: 14px;
+            }
+
+            /* Controls that don't apply in the current mode */
+            .off {
+                opacity: 0.38;
+                pointer-events: none;
+            }
+
+            .info {
+                margin: 4px 0 8px;
+                color: rgb(127, 143, 164);
+                font-size: 11px;
+            }
+
+            /* Loading screen */
+            #load {
+                position: fixed;
+                inset: 0;
+                z-index: 4;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                gap: 12px;
+                background: rgb(9, 13, 19);
+                color: rgb(206, 216, 228);
+                font-size: 14px;
+                transition: opacity 0.6s ease;
+            }
+
+            #load.done {
+                opacity: 0;
+                pointer-events: none;
+            }
+
+            #loadTitle {
+                font-size: 22px;
+                letter-spacing: 0.06em;
+                color: rgb(226, 232, 240);
+            }
+
+            #loadBar {
+                width: 260px;
+                height: 6px;
+                border-radius: 3px;
+                background: rgb(30, 38, 52);
+                overflow: hidden;
+            }
+
+            #loadFill {
+                width: 0;
+                height: 100%;
+                background: rgb(120, 170, 110);
+                transition: width 0.2s ease;
+            }
+
+            #stats {
+                position: fixed;
+                right: 10px;
+                bottom: 8px;
+                color: rgb(151, 166, 187);
+                font-size: 11px;
+                text-align: right;
+                text-shadow: 0 1px 2px rgb(0, 0, 0);
+                pointer-events: none;
+                white-space: pre;
+            }
+        </style>
+    </head>
+    <body>
+        <canvas id="c"></canvas>
+        <div id="load">
+            <div id="loadTitle">Pine Valley</div>
+            <div id="loadBar"><div id="loadFill"></div></div>
+            <div id="loadText">starting…</div>
+        </div>
+        <div id="msg"></div>
+        <div id="status">collision: waiting</div>
+        <div id="stats"></div>
+        <button id="tab" title="Settings">&#9776;</button>
+        <div id="panel">
+            <div id="list"></div>
+            <div id="bar"><div id="thumb"></div></div>
+        </div>
+
+        <script src="https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.9.0/dist/axion.min.js"></script><!-- My 3D engine Axion -->
+
+        <!-- Shared state -->
+        <script>
+            (function () {
+                var vl = window.vl = {};
+
+                // Where the world's asset packs live
+                vl.base = "https://cdn.jsdelivr.net/gh/SwankyMan88/Axion@v0.9.0/assets/";
+                vl.packs = ["valley-map", "valley-trees", "valley-nature", "valley-props"];
+
+                vl.canvas = document.getElementById("c");
+                vl.msg = document.getElementById("msg");
+                vl.panel = document.getElementById("panel");
+                vl.list = document.getElementById("list");
+                vl.statsEl = document.getElementById("stats");
+
+                vl.app = null;
+                vl.ready = false;
+                vl.showStats = true;
+
+                vl.statusEl = document.getElementById("status");
+                vl.status = function (text) {
+                    vl.statusEl.textContent = "collision: " + text;
+                };
+
+                // Loading screen
+                vl.loadText = document.getElementById("loadText");
+                vl.loadFill = document.getElementById("loadFill");
+                vl.progress = function (text, share) {
+                    vl.loadText.textContent = text;
+                    if (share !== undefined) {
+                        vl.loadFill.style.width = Math.round(share * 100) + "%";
+                    }
+                };
+
+                // Any uncaught error shows up on screen instead of vanishing
+                window.addEventListener("error", function (e) {
+                    vl.statusEl.textContent = "error: " + e.message + " (line " + e.lineno + ")";
+                    vl.loadText.textContent = "error: " + e.message;
+                });
+                window.addEventListener("unhandledrejection", function (e) {
+                    var r = e.reason;
+                    vl.statusEl.textContent = "error: " + (r && r.message ? r.message : r);
+                    vl.loadText.textContent = "error: " + (r && r.message ? r.message : r);
+                });
+
+                // Camera / player. x, y, z is the eye in fly mode and the feet in walk mode.
+                vl.cam = {
+                    mode: "walk",
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    yaw: 0,
+                    pitch: 0,
+                    vx: 0,
+                    vy: 0,
+                    vz: 0,
+                    eye: 1.65,
+                    swimEye: 1.55,
+                    eyeY: 0,
+                    ground: false,
+                    swim: false,
+                    flySpeed: 12,
+                    walkSpeed: 3.4,
+                    sens: 1,
+                    keys: {},
+                    jumpHeld: false,
+                    locked: false,
+                    drag: false,
+                    bob: 0
+                };
+
+                vl.hint = function () {
+                    if (!vl.ready) {
+                        return;
+                    }
+                    var how = vl.cam.mode === "walk"
+                        ? "WASD walk · Shift run · Space jump · F fly"
+                        : "WASD fly · Space / Shift up and down · Ctrl fast · F walk";
+                    if (vl.cam.locked) {
+                        vl.msg.textContent = how + " · Esc to release the mouse";
+                    } else {
+                        vl.msg.textContent = "Click to look around · " + how;
+                    }
+                };
+            })();
+        </script>
+
+        <!-- Input -->
+        <script>
+            (function () {
+                var vl = window.vl;
+                var cam = vl.cam;
+
+                window.addEventListener("keydown", function (e) {
+                    cam.keys[e.code] = true;
+                    if (e.code === "Space") {
+                        e.preventDefault();
+                    }
+                    if (e.code === "KeyF" && !e.repeat && vl.setMode) {
+                        vl.setMode(cam.mode === "walk" ? "fly" : "walk");
+                        if (vl.showMode) {
+                            vl.showMode();
+                        }
+                    }
+                });
+
+                window.addEventListener("keyup", function (e) {
+                    cam.keys[e.code] = false;
+                });
+
+                window.addEventListener("blur", function () {
+                    cam.keys = {};
+                });
+
+                vl.canvas.addEventListener("mousedown", function (e) {
+                    if (e.button !== 0) {
+                        return;
+                    }
+                    vl.panel.classList.remove("open");
+
+                    // Drag-to-look stays on in case the page won't allow a lock
+                    cam.drag = true;
+
+                    var canvas = vl.canvas;
+                    var req = canvas.requestPointerLock ? canvas.requestPointerLock() : null;
+                    if (req && req.catch) {
+                        req.catch(function () {});
+                    }
+                });
+
+                window.addEventListener("mouseup", function () {
+                    cam.drag = false;
+                });
+
+                document.addEventListener("pointerlockchange", function () {
+                    cam.locked = document.pointerLockElement === vl.canvas;
+                    vl.hint();
+                });
+
+                window.addEventListener("mousemove", function (e) {
+                    if (!cam.locked && !cam.drag) {
+                        return;
+                    }
+                    var k = 0.0024 * cam.sens;
+                    cam.yaw -= e.movementX * k;
+                    cam.pitch -= e.movementY * k;
+                    cam.pitch = Math.max(-1.55, Math.min(1.55, cam.pitch));
+                });
+            })();
+        </script>
+
+        <!-- Loading the world's packs, one after another -->
+        <script>
+            (function () {
+                var vl = window.vl;
+
+                // Adds a script tag and waits for it. The tag name is split so
+                // nothing that processes this page can mistake it for a real tag.
+                vl.loadScript = function (url) {
+                    return new Promise(function (ok, fail) {
+                        var s = document.createElement("scr" + "ipt");
+                        s.src = url;
+                        s.onload = ok;
+                        s.onerror = function () {
+                            fail(new Error("couldn't load " + url));
+                        };
+                        document.head.appendChild(s);
+                    });
+                };
+
+                // Downloads every pack at once, then hands them over in order;
+                // `each(name, i)` runs once a pack is in, one at a time
+                vl.loadPacks = function (each) {
+                    var waits = [];
+                    for (var j = 0; j < vl.packs.length; j++) {
+                        var have = window.AxionAssets && window.AxionAssets[vl.packs[j]];
+                        waits.push(have ? Promise.resolve() : vl.loadScript(vl.base + vl.packs[j] + ".js"));
+                    }
+                    var i = 0;
+                    function next() {
+                        if (i >= vl.packs.length) {
+                            return Promise.resolve();
+                        }
+                        var name = vl.packs[i];
+                        return waits[i].then(function () {
+                            return each(name, i);
+                        }).then(function () {
+                            // The packed text is several megabytes; drop it once decoded
+                            if (window.AxionAssets) {
+                                delete window.AxionAssets[name];
+                            }
+                            i++;
+                            return next();
+                        });
+                    }
+                    return next();
+                };
+            })();
+        </script>
+
+        <!-- Collision and physics: ground from the terrain, and only nearby objects -->
+        <script>
+            (function () {
+                var vl = window.vl;
+
+                var phys = vl.phys = {
+                    ready: false,
+                    terrain: null,
+                    water: 0,
+                    swimDepth: 1.3,      // how deep the feet hang in deep water
+                    cell: 16,
+                    grid: {},
+                    objs: [],
+                    near: [],
+                    built: {},           // object id -> its triangles, only while close by
+                    builtCount: 0,
+                    lastX: 1e9,
+                    lastZ: 1e9,
+                    lastTime: 0,
+                    reach: 7,            // objects closer than this (plus their size) get triangles
+                    gravity: 20,
+                    jump: 5.4,
+                    step: 0.5,
+                    radius: 0.32,
+                    maxSlope: 0.62,      // steepest walkable ground, as the up component of its normal
+                    spheres: [0.6, 1.05, 1.45],
+                    found: []
+                };
+
+                function key(ix, iz) {
+                    return ix * 4096 + iz;
+                }
+
+                // One placed object that can be walked into. `model` carries the
+                // collider triangles (local space) or, for trees, the trunk radius.
+                phys.add = function (x, y, z, yaw, s, model) {
+                    var ex = model.extras || {};
+                    var o = {
+                        x: x, y: y, z: z, yaw: yaw, s: s,
+                        trunk: 0, height: 0, col: null, r: 1
+                    };
+                    if (ex.kind === "tree") {
+                        o.trunk = Math.max(ex.trunk || 0.15, 0.08) * s;
+                        o.height = (ex.height || 10) * s;
+                        o.r = o.trunk;
+                    } else if (model.collider) {
+                        o.col = model.collider;
+                        var size = ex.size || [2, 2, 2];
+                        o.r = 0.5 * Math.sqrt(size[0] * size[0] + size[1] * size[1] + size[2] * size[2]) * s;
+                    } else {
+                        return;
+                    }
+                    phys.objs.push(o);
+                };
+
+                // Spatial index of every object: just positions, built once and cheap
+                phys.index = function () {
+                    var grid = {};
+                    for (var i = 0; i < phys.objs.length; i++) {
+                        var o = phys.objs[i];
+                        var k = key(Math.floor(o.x / phys.cell), Math.floor(o.z / phys.cell));
+                        if (!grid[k]) {
+                            grid[k] = [];
+                        }
+                        grid[k].push(i);
+                    }
+                    phys.grid = grid;
+                    phys.ready = true;
+                };
+
+                // World-space triangles for one object, from its collider mesh
+                function build(o) {
+                    var pos = o.col.positions;
+                    var idx = o.col.indices;
+                    var n = idx.length / 3;
+                    var tris = new Float32Array(n * 9);
+                    var box = new Float32Array(n * 6);
+                    var up = new Float32Array(n);
+                    var c = Math.cos(o.yaw), sn = Math.sin(o.yaw), s = o.s;
+                    var all = [1e9, 1e9, 1e9, -1e9, -1e9, -1e9];
+                    var count = 0;
+
+                    for (var t = 0; t < n; t++) {
+                        var q = count * 9;
+                        for (var k = 0; k < 3; k++) {
+                            var v = idx[t * 3 + k] * 3;
+                            var lx = pos[v] * s, ly = pos[v + 1] * s, lz = pos[v + 2] * s;
+                            // The same rotation the engine applies for a yaw
+                            tris[q + k * 3] = o.x + lx * c + lz * sn;
+                            tris[q + k * 3 + 1] = o.y + ly;
+                            tris[q + k * 3 + 2] = o.z - lx * sn + lz * c;
+                        }
+                        var ax = tris[q], ay = tris[q + 1], az = tris[q + 2];
+                        var bx = tris[q + 3], by = tris[q + 4], bz = tris[q + 5];
+                        var cx = tris[q + 6], cy = tris[q + 7], cz = tris[q + 8];
+                        var ux = bx - ax, uy = by - ay, uz = bz - az;
+                        var wx = cx - ax, wy = cy - ay, wz = cz - az;
+                        var nx = uy * wz - uz * wy;
+                        var ny = uz * wx - ux * wz;
+                        var nz = ux * wy - uy * wx;
+                        var len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+                        if (len < 1e-9) {
+                            continue;
+                        }
+                        up[count] = ny / len;
+                        var b = count * 6;
+                        box[b] = Math.min(ax, bx, cx);
+                        box[b + 1] = Math.min(ay, by, cy);
+                        box[b + 2] = Math.min(az, bz, cz);
+                        box[b + 3] = Math.max(ax, bx, cx);
+                        box[b + 4] = Math.max(ay, by, cy);
+                        box[b + 5] = Math.max(az, bz, cz);
+                        for (k = 0; k < 3; k++) {
+                            all[k] = Math.min(all[k], box[b + k]);
+                            all[k + 3] = Math.max(all[k + 3], box[b + 3 + k]);
+                        }
+                        count++;
+                    }
+                    return { tris: tris, box: box, up: up, n: count, all: all };
+                }
+
+                /*
+                 * Keep a short list of what is near the player, and triangles only
+                 * for those. Refreshed after moving a couple of metres or every so
+                 * often; objects left behind drop their triangles again.
+                 */
+                phys.refresh = function (p, force) {
+                    var now = performance.now();
+                    var moved = Math.abs(p.x - phys.lastX) + Math.abs(p.z - phys.lastZ);
+                    if (!force && moved < 1.5 && now - phys.lastTime < 400) {
+                        return;
+                    }
+                    phys.lastX = p.x;
+                    phys.lastZ = p.z;
+                    phys.lastTime = now;
+
+                    var near = [];
+                    var keep = {};
+                    var reach = phys.reach;
+                    var span = Math.ceil((reach + 30) / phys.cell);
+                    var cx = Math.floor(p.x / phys.cell), cz = Math.floor(p.z / phys.cell);
+                    for (var ix = cx - span; ix <= cx + span; ix++) {
+                        for (var iz = cz - span; iz <= cz + span; iz++) {
+                            var list = phys.grid[key(ix, iz)];
+                            if (!list) {
+                                continue;
+                            }
+                            for (var i = 0; i < list.length; i++) {
+                                var id = list[i];
+                                var o = phys.objs[id];
+                                var dx = o.x - p.x, dz = o.z - p.z;
+                                var d = Math.sqrt(dx * dx + dz * dz);
+                                if (d > o.r + reach) {
+                                    continue;
+                                }
+                                near.push(id);
+                                if (o.col) {
+                                    keep[id] = true;
+                                    if (!phys.built[id]) {
+                                        phys.built[id] = build(o);
+                                        phys.builtCount++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for (var b in phys.built) {
+                        if (!keep[b]) {
+                            delete phys.built[b];
+                            phys.builtCount--;
+                        }
+                    }
+                    phys.near = near;
+
+                    var tris = 0;
+                    for (b in phys.built) {
+                        tris += phys.built[b].n;
+                    }
+                    vl.status("ready · " + near.length + " objects near, " + tris + " triangles");
+                };
+
+                // Highest walkable surface under x, z at or below `top`
+                phys.floor = function (x, top, z) {
+                    var best = phys.terrain.heightAt(x, z);
+                    var swim = phys.water - phys.swimDepth;
+                    if (best < swim) {
+                        best = swim;
+                    }
+                    for (var id in phys.built) {
+                        var c = phys.built[id];
+                        var A = c.all;
+                        if (x < A[0] || x > A[3] || z < A[2] || z > A[5] || A[1] > top) {
+                            continue;
+                        }
+                        var T = c.tris, B = c.box;
+                        for (var t = 0; t < c.n; t++) {
+                            if (c.up[t] < 0.5) {
+                                continue;
+                            }
+                            var b = t * 6;
+                            if (x < B[b] || x > B[b + 3] || z < B[b + 2] || z > B[b + 5] || B[b + 1] > top) {
+                                continue;
+                            }
+                            var o = t * 9;
+                            var ax = T[o], ay = T[o + 1], az = T[o + 2];
+                            var bx = T[o + 3], by = T[o + 4], bz = T[o + 5];
+                            var cx = T[o + 6], cy = T[o + 7], cz = T[o + 8];
+                            var d = (bz - cz) * (ax - cx) + (cx - bx) * (az - cz);
+                            if (Math.abs(d) < 1e-12) {
+                                continue;
+                            }
+                            var w1 = ((bz - cz) * (x - cx) + (cx - bx) * (z - cz)) / d;
+                            var w2 = ((cz - az) * (x - cx) + (ax - cx) * (z - cz)) / d;
+                            var w3 = 1 - w1 - w2;
+                            if (w1 < 0 || w2 < 0 || w3 < 0) {
+                                continue;
+                            }
+                            var y = w1 * ay + w2 * by + w3 * cy;
+                            if (y <= top && y > best) {
+                                best = y;
+                            }
+                        }
+                    }
+                    return best;
+                };
+
+                // Closest point on a triangle to p (Ericson, Real-Time Collision Detection)
+                var hit = [0, 0, 0];
+                function closest(px, py, pz, T, o) {
+                    var ax = T[o], ay = T[o + 1], az = T[o + 2];
+                    var bx = T[o + 3], by = T[o + 4], bz = T[o + 5];
+                    var cx = T[o + 6], cy = T[o + 7], cz = T[o + 8];
+
+                    var abx = bx - ax, aby = by - ay, abz = bz - az;
+                    var acx = cx - ax, acy = cy - ay, acz = cz - az;
+                    var apx = px - ax, apy = py - ay, apz = pz - az;
+
+                    var d1 = abx * apx + aby * apy + abz * apz;
+                    var d2 = acx * apx + acy * apy + acz * apz;
+                    if (d1 <= 0 && d2 <= 0) {
+                        hit[0] = ax; hit[1] = ay; hit[2] = az;
+                        return;
+                    }
+
+                    var bpx = px - bx, bpy = py - by, bpz = pz - bz;
+                    var d3 = abx * bpx + aby * bpy + abz * bpz;
+                    var d4 = acx * bpx + acy * bpy + acz * bpz;
+                    if (d3 >= 0 && d4 <= d3) {
+                        hit[0] = bx; hit[1] = by; hit[2] = bz;
+                        return;
+                    }
+
+                    var vc = d1 * d4 - d3 * d2;
+                    if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+                        var v = d1 / (d1 - d3);
+                        hit[0] = ax + abx * v; hit[1] = ay + aby * v; hit[2] = az + abz * v;
+                        return;
+                    }
+
+                    var cpx = px - cx, cpy = py - cy, cpz = pz - cz;
+                    var d5 = abx * cpx + aby * cpy + abz * cpz;
+                    var d6 = acx * cpx + acy * cpy + acz * cpz;
+                    if (d6 >= 0 && d5 <= d6) {
+                        hit[0] = cx; hit[1] = cy; hit[2] = cz;
+                        return;
+                    }
+
+                    var vb = d5 * d2 - d1 * d6;
+                    if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+                        var w = d2 / (d2 - d6);
+                        hit[0] = ax + acx * w; hit[1] = ay + acy * w; hit[2] = az + acz * w;
+                        return;
+                    }
+
+                    var va = d3 * d6 - d5 * d4;
+                    if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) {
+                        var e = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+                        hit[0] = bx + (cx - bx) * e; hit[1] = by + (cy - by) * e; hit[2] = bz + (cz - bz) * e;
+                        return;
+                    }
+
+                    var inv = 1 / (va + vb + vc);
+                    var sv = vb * inv;
+                    var sw = vc * inv;
+                    hit[0] = ax + abx * sv + acx * sw;
+                    hit[1] = ay + aby * sv + acy * sw;
+                    hit[2] = az + abz * sv + acz * sw;
+                }
+
+                // Slide along a wall instead of into it
+                function slide(p, nx, nz) {
+                    var into = p.vx * nx + p.vz * nz;
+                    if (into < 0) {
+                        p.vx -= nx * into;
+                        p.vz -= nz * into;
+                    }
+                }
+
+                // Push the body out of tree trunks and nearby triangles
+                function pushOut(p) {
+                    var r = phys.radius;
+
+                    // Trunks: upright cylinders
+                    for (var i = 0; i < phys.near.length; i++) {
+                        var o = phys.objs[phys.near[i]];
+                        if (!o.trunk || p.y > o.y + o.height || p.y + 1.7 < o.y) {
+                            continue;
+                        }
+                        var dx = p.x - o.x, dz = p.z - o.z;
+                        var min = o.trunk + r;
+                        var d2 = dx * dx + dz * dz;
+                        if (d2 >= min * min || d2 < 1e-10) {
+                            continue;
+                        }
+                        var d = Math.sqrt(d2);
+                        p.x = o.x + dx / d * min;
+                        p.z = o.z + dz / d * min;
+                        slide(p, dx / d, dz / d);
+                    }
+
+                    // Rocks, logs, props and buildings: spheres against triangles
+                    for (var pass = 0; pass < 2; pass++) {
+                        for (var id in phys.built) {
+                            var c = phys.built[id];
+                            var A = c.all;
+                            if (p.x + r < A[0] || p.x - r > A[3] || p.z + r < A[2] || p.z - r > A[5]) {
+                                continue;
+                            }
+                            if (p.y + 1.8 < A[1] || p.y > A[4]) {
+                                continue;
+                            }
+                            var T = c.tris, B = c.box;
+                            for (var s = 0; s < phys.spheres.length; s++) {
+                                var cy = p.y + phys.spheres[s];
+                                for (var t = 0; t < c.n; t++) {
+                                    var b = t * 6;
+                                    if (p.x + r < B[b] || p.x - r > B[b + 3]) { continue; }
+                                    if (cy + r < B[b + 1] || cy - r > B[b + 4]) { continue; }
+                                    if (p.z + r < B[b + 2] || p.z - r > B[b + 5]) { continue; }
+
+                                    closest(p.x, cy, p.z, T, t * 9);
+                                    var hx = p.x - hit[0], hy = cy - hit[1], hz = p.z - hit[2];
+                                    var h2 = hx * hx + hy * hy + hz * hz;
+                                    if (h2 >= r * r || h2 < 1e-12) {
+                                        continue;
+                                    }
+                                    // Floors under the body are the ground check's job
+                                    if (c.up[t] > 0.7 && hit[1] < cy) {
+                                        continue;
+                                    }
+                                    var hd = Math.sqrt(h2);
+                                    var push = r - hd;
+                                    var nx = hx / hd, ny = hy / hd, nz = hz / hd;
+                                    p.x += nx * push;
+                                    p.z += nz * push;
+                                    if (ny < -0.5) {
+                                        p.y += ny * push;
+                                        if (p.vy > 0) {
+                                            p.vy = 0;
+                                        }
+                                    }
+                                    slide(p, nx, nz);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // One physics step for a walking body p (feet position)
+                phys.walk = function (p, wishX, wishZ, jump, dt) {
+                    var grip = p.ground ? 12 : (p.swim ? 4 : 2);
+                    var ease = 1 - Math.exp(-grip * dt);
+                    p.vx += (wishX - p.vx) * ease;
+                    p.vz += (wishZ - p.vz) * ease;
+
+                    if (jump && p.ground && !p.swim) {
+                        p.vy = phys.jump;
+                        p.ground = false;
+                    }
+
+                    var ox = p.x, oz = p.z;
+                    p.x += p.vx * dt;
+                    p.z += p.vz * dt;
+
+                    // Too steep to climb: the move is undone, going down is fine
+                    var t = phys.terrain;
+                    var hNew = t.heightAt(p.x, p.z);
+                    if (p.ground && hNew > p.y + 0.02) {
+                        var n = t.normalAt(p.x, p.z);
+                        if (n[1] < phys.maxSlope) {
+                            p.x = ox;
+                            p.z = oz;
+                            slide(p, n[0], n[2]);
+                        }
+                    }
+
+                    pushOut(p);
+
+                    var wasGround = p.ground;
+                    p.vy -= phys.gravity * dt;
+                    var floor = phys.floor(p.x, p.y + phys.step, p.z);
+                    p.y += p.vy * dt;
+                    p.swim = floor <= phys.water - phys.swimDepth + 0.01 && t.heightAt(p.x, p.z) < floor;
+
+                    if (p.y <= floor) {
+                        p.y = floor;
+                        p.vy = 0;
+                        p.ground = true;
+                    } else if (wasGround && p.vy <= 0 && p.y - floor < phys.step) {
+                        // Stick to the ground going down slopes and steps
+                        p.y = floor;
+                        p.vy = 0;
+                        p.ground = true;
+                    } else {
+                        p.ground = false;
+                    }
+                };
+            })();
+        </script>
+
+        <!-- Camera -->
+        <script>
+            (function () {
+                var vl = window.vl;
+                var cam = vl.cam;
+
+                vl.setMode = function (mode) {
+                    if (mode === cam.mode) {
+                        return;
+                    }
+                    if (mode === "walk") {
+                        cam.y -= cam.eye;      // eye to feet
+                        cam.eyeY = cam.y + cam.eye;
+                    } else {
+                        cam.y = cam.eyeY;      // feet to eye
+                    }
+                    cam.vx = 0;
+                    cam.vy = 0;
+                    cam.vz = 0;
+                    cam.ground = false;
+                    cam.mode = mode;
+                    vl.hint();
+                };
+
+                function fly(dt, fx, fy, fz, rx, rz) {
+                    var k = cam.keys;
+                    var mx = 0;
+                    var my = 0;
+                    var mz = 0;
+
+                    if (k.KeyW) { mx += fx; my += fy; mz += fz; }
+                    if (k.KeyS) { mx -= fx; my -= fy; mz -= fz; }
+                    if (k.KeyD) { mx += rx; mz += rz; }
+                    if (k.KeyA) { mx -= rx; mz -= rz; }
+                    if (k.Space) { my += 1; }
+                    if (k.ShiftLeft || k.ShiftRight) { my -= 1; }
+
+                    var len = Math.sqrt(mx * mx + my * my + mz * mz);
+                    var speed = cam.flySpeed;
+                    if (k.ControlLeft) {
+                        speed *= 4;
+                    }
+                    if (len > 0) {
+                        mx = mx / len * speed;
+                        my = my / len * speed;
+                        mz = mz / len * speed;
+                    }
+
+                    // Ease the velocity so starts and stops are smooth
+                    var ease = 1 - Math.exp(-8 * dt);
+                    cam.vx += (mx - cam.vx) * ease;
+                    cam.vy += (my - cam.vy) * ease;
+                    cam.vz += (mz - cam.vz) * ease;
+
+                    cam.x += cam.vx * dt;
+                    cam.y += cam.vy * dt;
+                    cam.z += cam.vz * dt;
+
+                    // Stay above the ground and the water
+                    var t = vl.phys.terrain;
+                    if (t) {
+                        var low = Math.max(t.heightAt(cam.x, cam.z), vl.phys.water) + 0.6;
+                        if (cam.y < low) {
+                            cam.y = low;
+                            if (cam.vy < 0) {
+                                cam.vy = 0;
+                            }
+                        }
+                    }
+                    cam.eyeY = cam.y;
+                }
+
+                function walk(dt, rx, rz) {
+                    var k = cam.keys;
+
+                    // Flat forward, so looking up or down doesn't change walking speed
+                    var fx = -Math.sin(cam.yaw);
+                    var fz = -Math.cos(cam.yaw);
+                    var mx = 0;
+                    var mz = 0;
+
+                    if (k.KeyW) { mx += fx; mz += fz; }
+                    if (k.KeyS) { mx -= fx; mz -= fz; }
+                    if (k.KeyD) { mx += rx; mz += rz; }
+                    if (k.KeyA) { mx -= rx; mz -= rz; }
+
+                    var len = Math.sqrt(mx * mx + mz * mz);
+                    var speed = cam.walkSpeed;
+                    if (k.ShiftLeft || k.ShiftRight || k.ControlLeft) {
+                        speed *= 2;
+                    }
+                    if (cam.swim) {
+                        speed *= 0.45;
+                    }
+                    if (len > 0) {
+                        mx = mx / len * speed;
+                        mz = mz / len * speed;
+                    }
+
+                    // Jump once per press
+                    var jump = k.Space && !cam.jumpHeld;
+                    cam.jumpHeld = !!k.Space;
+
+                    vl.phys.refresh(cam);
+
+                    // Small fixed steps so fast falls can't pass through floors
+                    var steps = Math.min(12, Math.ceil(dt / (1 / 120)));
+                    var h = dt / steps;
+                    for (var i = 0; i < steps; i++) {
+                        vl.phys.walk(cam, mx, mz, jump && i === 0, h);
+                    }
+
+                    // Somehow under the ground: back on top of it
+                    var t = vl.phys.terrain;
+                    var ground = t.heightAt(cam.x, cam.z);
+                    if (cam.y < ground - 3) {
+                        cam.y = ground;
+                        cam.vy = 0;
+                    }
+
+                    // Head bob while walking on land
+                    var moving = Math.sqrt(cam.vx * cam.vx + cam.vz * cam.vz);
+                    if (cam.ground && !cam.swim && moving > 0.5) {
+                        cam.bob += dt * moving * 2.1;
+                    } else {
+                        cam.bob *= Math.exp(-6 * dt);
+                    }
+                    var bob = Math.sin(cam.bob) * 0.035 * Math.min(1, moving / 3);
+
+                    // Smooth the eye over steps; follow jumps and falls directly.
+                    // Swimming keeps the eye just above the surface.
+                    var target = cam.y + (cam.swim ? cam.swimEye : cam.eye) + bob;
+                    if (cam.ground || cam.swim) {
+                        cam.eyeY += (target - cam.eyeY) * (1 - Math.exp(-14 * dt));
+                    } else {
+                        cam.eyeY = target;
+                    }
+                }
+
+                // Keep the player on the map
+                function clampToMap() {
+                    var lim = vl.mapHalf - 12;
+                    if (cam.x < -lim) { cam.x = -lim; cam.vx = 0; }
+                    if (cam.x > lim) { cam.x = lim; cam.vx = 0; }
+                    if (cam.z < -lim) { cam.z = -lim; cam.vz = 0; }
+                    if (cam.z > lim) { cam.z = lim; cam.vz = 0; }
+                }
+
+                vl.moveCam = function (app, dt) {
+                    var cp = Math.cos(cam.pitch);
+                    var sp = Math.sin(cam.pitch);
+                    var cy = Math.cos(cam.yaw);
+                    var sy = Math.sin(cam.yaw);
+
+                    // Look direction and right direction
+                    var fx = -sy * cp;
+                    var fy = sp;
+                    var fz = -cy * cp;
+                    var rx = cy;
+                    var rz = -sy;
+
+                    if (cam.mode === "walk") {
+                        walk(dt, rx, rz);
+                    } else {
+                        fly(dt, fx, fy, fz, rx, rz);
+                    }
+                    clampToMap();
+
+                    var ex = cam.x;
+                    var ey = cam.eyeY;
+                    var ez = cam.z;
+                    app.camera.position.set([ex, ey, ez]);
+                    app.camera.target.set([ex + fx, ey + fy, ez + fz]);
+                    app.camera.update();
+                };
+            })();
+        </script>
+
+        <!-- Fullscreen -->
+        <script>
+            (function () {
+                var vl = window.vl;
+                var full = vl.full = {
+                    // True in the copy of the page opened in its own tab
+                    popped: !!window.vlPopped,
+                    tab: null
+                };
+
+                function isFull() {
+                    return !!(document.fullscreenElement || document.webkitFullscreenElement);
+                }
+
+                function enter(onFail) {
+                    var el = document.documentElement;
+                    var req = el.requestFullscreen || el.webkitRequestFullscreen;
+                    var allowed = document.fullscreenEnabled || document.webkitFullscreenEnabled;
+                    if (!req || !allowed) {
+                        onFail();
+                        return;
+                    }
+                    try {
+                        var p = req.call(el);
+                        if (p && p.catch) {
+                            p.catch(onFail);
+                        }
+                    } catch (e) {
+                        onFail();
+                    }
+                }
+
+                function leave() {
+                    var exit = document.exitFullscreen || document.webkitExitFullscreen;
+                    if (exit) {
+                        exit.call(document);
+                    }
+                }
+
+                // Khan Academy's frame doesn't allow fullscreen, so open this page
+                // in its own tab, where it can go fullscreen for real.
+                function popOut() {
+                    if (window.top === window) {
+                        vl.msg.textContent = "The browser blocked fullscreen here. Press F11 instead.";
+                        return;
+                    }
+
+                    var w = null;
+                    try {
+                        w = window.open("", "_blank");
+                    } catch (e) {
+                        w = null;
+                    }
+                    if (!w) {
+                        vl.msg.textContent = "Couldn't open a new tab (popups blocked). Allow popups, or press F11.";
+                        return;
+                    }
+
+                    var html = vl.pageHtml;
+                    // The tag is split in two so no page tool can mistake it for the end of this script
+                    var tag = "scr" + "ipt";
+                    html = html.replace("<head>", "<head><" + tag + ">window.vlPopped = true;</" + tag + ">");
+                    try {
+                        w.document.open();
+                        w.document.write(html);
+                        w.document.close();
+                    } catch (e) {
+                        w.close();
+                        vl.msg.textContent = "Couldn't open the fullscreen tab here. Press F11 instead.";
+                        return;
+                    }
+
+                    // Two copies rendering at once is too much: pause this one until the tab closes
+                    full.tab = w;
+                    if (vl.app) {
+                        vl.app.stop();
+                    }
+                    vl.msg.textContent = "Running in the new tab. Close it to come back here.";
+                    var watch = setInterval(function () {
+                        if (!w.closed) {
+                            return;
+                        }
+                        clearInterval(watch);
+                        full.tab = null;
+                        if (vl.app) {
+                            vl.app.start();
+                        }
+                        vl.hint();
+                    }, 500);
+                }
+
+                full.toggle = function () {
+                    if (isFull()) {
+                        leave();
+                        return;
+                    }
+                    enter(popOut);
+                };
+
+                // In the popped-out tab: one click to go fullscreen
+                // (browsers only allow it right after a click)
+                full.prompt = function () {
+                    var b = document.createElement("button");
+                    b.className = "btn";
+                    b.textContent = "Click for fullscreen";
+                    b.style.position = "fixed";
+                    b.style.left = "50%";
+                    b.style.top = "50%";
+                    b.style.width = "220px";
+                    b.style.marginLeft = "-110px";
+                    b.style.zIndex = "5";
+                    b.style.fontSize = "15px";
+                    b.onclick = function () {
+                        b.parentNode.removeChild(b);
+                        enter(function () {
+                            vl.msg.textContent = "The browser blocked fullscreen. Press F11 instead.";
+                        });
+                    };
+                    document.body.appendChild(b);
+                };
+
+                full.isFull = isFull;
+            })();
+        </script>
+
+        <!-- Menu -->
+        <script>
+            (function () {
+                var vl = window.vl;
+                var cam = vl.cam;
+                var list = vl.list;
+                var panel = vl.panel;
+
+                var scroll = vl.scroll = {
+                    bar: document.getElementById("bar"),
+                    thumb: document.getElementById("thumb"),
+                    timer: 0,
+                    grab: null
+                };
+
+                scroll.update = function () {
+                    var view = list.clientHeight;
+                    var full = list.scrollHeight;
+                    var track = scroll.bar.clientHeight;
+
+                    if (full <= view + 1) {
+                        scroll.bar.classList.add("hide");
+                        return;
+                    }
+                    scroll.bar.classList.remove("hide");
+
+                    var size = Math.max(24, track * view / full);
+                    var room = track - size;
+                    var pos = room * list.scrollTop / (full - view);
+
+                    scroll.thumb.style.height = size + "px";
+                    scroll.thumb.style.top = pos + "px";
+                };
+
+                list.addEventListener("scroll", function () {
+                    scroll.update();
+                    scroll.bar.classList.add("active");
+                    clearTimeout(scroll.timer);
+                    scroll.timer = setTimeout(function () {
+                        scroll.bar.classList.remove("active");
+                    }, 1000);
+                });
+
+                window.addEventListener("resize", scroll.update);
+
+                scroll.thumb.addEventListener("mousedown", function (e) {
+                    scroll.grab = { y: e.clientY, top: list.scrollTop };
+                    e.preventDefault();
+                });
+
+                window.addEventListener("mousemove", function (e) {
+                    if (!scroll.grab) {
+                        return;
+                    }
+                    var view = list.clientHeight;
+                    var full = list.scrollHeight;
+                    var room = scroll.bar.clientHeight - scroll.thumb.offsetHeight;
+                    var dy = e.clientY - scroll.grab.y;
+                    list.scrollTop = scroll.grab.top + dy * (full - view) / room;
+                });
+
+                window.addEventListener("mouseup", function () {
+                    scroll.grab = null;
+                });
+
+                // Clicking the empty track jumps a page
+                scroll.bar.addEventListener("mousedown", function (e) {
+                    if (e.target !== scroll.bar) {
+                        return;
+                    }
+                    var thumbTop = scroll.thumb.getBoundingClientRect().top;
+                    var page = list.clientHeight * 0.9;
+                    list.scrollTop += e.clientY < thumbTop ? -page : page;
+                });
+
+                document.getElementById("tab").onclick = function () {
+                    panel.classList.toggle("open");
+                    scroll.update();
+                };
+
+                // Don't let menu buttons and checkboxes keep keyboard focus: a focused
+                // button swallows Space and its keys never reach the camera
+                panel.addEventListener("click", function (e) {
+                    var t = e.target;
+                    if (t.tagName === "BUTTON" || (t.tagName === "INPUT" && t.type === "checkbox")) {
+                        t.blur();
+                    }
+                });
+
+                // Quality levels: what each one sets
+                vl.presets = {
+                    low: {
+                        dpr: 0.75, lodBias: 0.55, grass: 24, blades: 256, grassDensity: 1,
+                        shadowSize: 1024, shadowDistance: 110, ssr: 0, ssrSteps: 16, ao: 0,
+                        volumetric: false, cloudShadows: true
+                    },
+                    medium: {
+                        dpr: 1, lodBias: 0.8, grass: 38, blades: 448, grassDensity: 1,
+                        shadowSize: 2048, shadowDistance: 170, ssr: 1, ssrSteps: 24, ao: 0.8,
+                        volumetric: false, cloudShadows: true
+                    },
+                    high: {
+                        dpr: 1, lodBias: 1, grass: 55, blades: 640, grassDensity: 1,
+                        shadowSize: 2048, shadowDistance: 230, ssr: 1, ssrSteps: 48, ao: 1,
+                        volumetric: true, cloudShadows: true
+                    },
+                    ultra: {
+                        dpr: 1.5, lodBias: 1.45, grass: 80, blades: 1024, grassDensity: 1,
+                        shadowSize: 4096, shadowDistance: 320, ssr: 1, ssrSteps: 64, ao: 1,
+                        volumetric: true, cloudShadows: true
+                    }
+                };
+
+                vl.applyPreset = function (app, name) {
+                    var p = vl.presets[name];
+                    var r = app.renderer;
+                    var t = r.terrain;
+                    app.maxDpr = p.dpr;
+                    r.lodBias = p.lodBias;
+                    r.sun.shadows.size = p.shadowSize;
+                    r.sun.shadows.distance = p.shadowDistance;
+                    r.ssr.intensity = p.ssr;
+                    r.ssr.steps = p.ssrSteps;
+                    r.ao.intensity = p.ao;
+                    r.volumetric.enabled = p.volumetric;
+                    if (t) {
+                        t.grass.radius = p.grass;
+                        t.grass.density = p.grassDensity;
+                        t.grass.bladesPerTile = p.blades;
+                    }
+                    vl.quality = name;
+                };
+
+                vl.buildMenu = function (app, world) {
+                    var r = app.renderer;
+                    var t = r.terrain;
+                    var defaults = [];
+                    var syncs = [];
+                    var body = list;
+
+                    // Collapsible section: a header button and a body that starts closed
+                    function section(title, open) {
+                        var box = document.createElement("div");
+                        box.className = open ? "sec open" : "sec";
+
+                        var head = document.createElement("button");
+                        head.className = "sec-head";
+                        head.innerHTML = "<span class=\"arrow\">&#9656;</span>" + title;
+
+                        var inner = document.createElement("div");
+                        inner.className = "sec-body";
+
+                        head.onclick = function () {
+                            box.classList.toggle("open");
+                            scroll.update();
+                        };
+
+                        box.appendChild(head);
+                        box.appendChild(inner);
+                        list.appendChild(box);
+                        body = inner;
+                    }
+
+                    function slider(label, min, max, step, get, set) {
+                        var row = document.createElement("div");
+                        row.className = "row";
+
+                        var lab = document.createElement("label");
+                        var val = document.createElement("span");
+                        lab.textContent = label;
+                        lab.appendChild(val);
+
+                        var input = document.createElement("input");
+                        input.type = "range";
+                        input.min = min;
+                        input.max = max;
+                        input.step = step;
+                        input.value = get();
+
+                        function show() {
+                            var digits = step < 0.01 ? 3 : (step < 1 ? 2 : 0);
+                            val.textContent = Number(input.value).toFixed(digits);
+                        }
+
+                        input.oninput = function () {
+                            set(Number(input.value));
+                            show();
+                        };
+                        show();
+
+                        row.appendChild(lab);
+                        row.appendChild(input);
+                        body.appendChild(row);
+
+                        var start = get();
+                        defaults.push(function () {
+                            input.value = start;
+                            set(start);
+                            show();
+                        });
+                        syncs.push(function () {
+                            input.value = get();
+                            show();
+                        });
+                        return row;
+                    }
+
+                    function toggle(label, get, set) {
+                        var lab = document.createElement("label");
+                        lab.className = "check";
+
+                        var box = document.createElement("input");
+                        box.type = "checkbox";
+                        box.checked = get();
+                        box.onchange = function () {
+                            set(box.checked);
+                        };
+
+                        lab.appendChild(box);
+                        lab.appendChild(document.createTextNode(label));
+                        body.appendChild(lab);
+
+                        var start = get();
+                        defaults.push(function () {
+                            box.checked = start;
+                            set(start);
+                        });
+                        syncs.push(function () {
+                            box.checked = get();
+                        });
+                        return lab;
+                    }
+
+                    // Drop-down. options is a list of [value, label] pairs
+                    function choice(label, options, get, set) {
+                        var row = document.createElement("div");
+                        row.className = "row";
+
+                        var lab = document.createElement("label");
+                        lab.textContent = label;
+
+                        var sel = document.createElement("select");
+                        for (var i = 0; i < options.length; i++) {
+                            var opt = document.createElement("option");
+                            opt.value = String(options[i][0]);
+                            opt.textContent = options[i][1];
+                            sel.appendChild(opt);
+                        }
+                        sel.value = String(get());
+                        sel.onchange = function () {
+                            set(sel.value);
+                        };
+
+                        row.appendChild(lab);
+                        row.appendChild(sel);
+                        body.appendChild(row);
+
+                        var start = String(get());
+                        defaults.push(function () {
+                            sel.value = start;
+                            set(start);
+                        });
+                        syncs.push(function () {
+                            sel.value = String(get());
+                        });
+                        return row;
+                    }
+
+                    function button(label, onClick, parent) {
+                        var b = document.createElement("button");
+                        b.className = "btn";
+                        b.textContent = label;
+                        b.onclick = onClick;
+                        (parent || body).appendChild(b);
+                        return b;
+                    }
+
+                    function syncAll() {
+                        for (var i = 0; i < syncs.length; i++) {
+                            syncs[i]();
+                        }
+                    }
+
+                    section("Quality", true);
+                    choice("Preset", [
+                        ["low", "Low"], ["medium", "Medium"], ["high", "High"], ["ultra", "Ultra"]
+                    ],
+                        function () { return vl.quality; },
+                        function (v) { vl.applyPreset(app, v); syncAll(); });
+                    slider("Resolution scale", 0.5, 2, 0.25,
+                        function () { return app.maxDpr; },
+                        function (v) { app.maxDpr = v; });
+                    slider("Detail distance", 0.3, 2.5, 0.05,
+                        function () { return r.lodBias; },
+                        function (v) { r.lodBias = v; });
+                    slider("Grass distance (m)", 0, 120, 1,
+                        function () { return t.grass.radius; },
+                        function (v) { t.grass.radius = v; });
+                    slider("Grass blades (per 4 m tile)", 64, 1536, 32,
+                        function () { return t.grass.bladesPerTile; },
+                        function (v) { t.grass.bladesPerTile = v; });
+                    choice("Sun shadow resolution", [
+                        [1024, "1024"], [2048, "2048"], [4096, "4096"]
+                    ],
+                        function () { return r.sun.shadows.size; },
+                        function (v) { r.sun.shadows.size = Number(v); });
+                    slider("Sun shadow distance (m)", 60, 500, 10,
+                        function () { return r.sun.shadows.distance; },
+                        function (v) { r.sun.shadows.distance = v; });
+                    toggle("Anti-aliasing (FXAA)",
+                        function () { return r.fxaa; },
+                        function (v) { r.fxaa = v; });
+                    toggle("Show stats",
+                        function () { return vl.showStats; },
+                        function (v) {
+                            vl.showStats = v;
+                            vl.statsEl.style.display = v ? "block" : "none";
+                        });
+
+                    section("Window");
+                    var fsBtn = button("Fullscreen", function () {
+                        vl.full.toggle();
+                    });
+                    function showFull() {
+                        fsBtn.textContent = vl.full.isFull() ? "Exit fullscreen" : "Fullscreen";
+                    }
+                    document.addEventListener("fullscreenchange", showFull);
+                    document.addEventListener("webkitfullscreenchange", showFull);
+                    slider("Field of view", 45, 100, 1,
+                        function () { return Math.round(app.camera.fov * 180 / Math.PI); },
+                        function (v) { app.camera.fov = v * Math.PI / 180; app.camera.update(); });
+
+                    section("Movement");
+                    var modeBtn = button("", function () {
+                        vl.setMode(cam.mode === "walk" ? "fly" : "walk");
+                        showMode();
+                    });
+                    function showMode() {
+                        modeBtn.textContent = cam.mode === "walk" ? "Mode: First person (walk)" : "Mode: Fly";
+                    }
+                    vl.showMode = showMode;
+                    showMode();
+                    button("Back to the start", function () {
+                        world.toSpawn();
+                    });
+                    button("Go to the fort", function () {
+                        world.toFort();
+                    });
+                    slider("Walk speed", 1, 10, 0.1,
+                        function () { return cam.walkSpeed; },
+                        function (v) { cam.walkSpeed = v; });
+                    slider("Fly speed", 2, 60, 1,
+                        function () { return cam.flySpeed; },
+                        function (v) { cam.flySpeed = v; });
+                    slider("Jump power", 2, 10, 0.1,
+                        function () { return vl.phys.jump; },
+                        function (v) { vl.phys.jump = v; });
+                    slider("Mouse sensitivity", 0.3, 3, 0.1,
+                        function () { return cam.sens; },
+                        function (v) { cam.sens = v; });
+
+                    section("Time of day and sky");
+                    slider("Sun height (degrees)", -4, 80, 0.5,
+                        function () { return world.sun.elevation; },
+                        function (v) { world.sun.elevation = v; world.setSun(); });
+                    slider("Sun direction (degrees)", 0, 360, 1,
+                        function () { return world.sun.azimuth; },
+                        function (v) { world.sun.azimuth = v; world.setSun(); });
+                    toggle("Time passes",
+                        function () { return world.sun.moving; },
+                        function (v) { world.sun.moving = v; });
+                    slider("Day speed (minutes per day)", 1, 60, 1,
+                        function () { return world.sun.dayMinutes; },
+                        function (v) { world.sun.dayMinutes = v; });
+                    slider("Sunlight", 0, 8, 0.1,
+                        function () { return r.sun.intensity; },
+                        function (v) { r.sun.intensity = v; });
+                    slider("Sky brightness", 0.2, 3, 0.05,
+                        function () { return r.sky.brightness; },
+                        function (v) { r.sky.brightness = v; });
+                    slider("Sky light on the ground", 0, 3, 0.05,
+                        function () { return r.sky.ambientStrength; },
+                        function (v) { r.sky.ambientStrength = v; });
+                    slider("Haze", 0.2, 6, 0.1,
+                        function () { return r.sky.haze; },
+                        function (v) { r.sky.haze = v; });
+                    slider("Clouds", 0, 1, 0.01,
+                        function () { return r.sky.clouds; },
+                        function (v) { r.sky.clouds = v; });
+                    slider("Cloud speed", 0, 8, 0.1,
+                        function () { return r.sky.cloudSpeed; },
+                        function (v) { r.sky.cloudSpeed = v; });
+                    slider("Cloud shadows", 0, 1, 0.01,
+                        function () { return r.sky.cloudShadows; },
+                        function (v) { r.sky.cloudShadows = v; });
+                    slider("Sun disc", 0, 3, 0.05,
+                        function () { return r.sky.sunDisc; },
+                        function (v) { r.sky.sunDisc = v; });
+
+                    section("Wind");
+                    slider("Strength", 0, 3, 0.05,
+                        function () { return r.wind.strength; },
+                        function (v) { r.wind.strength = v; });
+                    slider("Gust speed", 0, 3, 0.05,
+                        function () { return r.wind.speed; },
+                        function (v) { r.wind.speed = v; });
+                    slider("Grass sway", 0, 3, 0.05,
+                        function () { return t.grass.sway; },
+                        function (v) { t.grass.sway = v; });
+
+                    section("Water");
+                    slider("Waves", 0, 3, 0.05,
+                        function () { return t.water.waves; },
+                        function (v) { t.water.waves = v; });
+                    slider("Clarity", 0, 1, 0.01,
+                        function () { return t.water.clarity; },
+                        function (v) { t.water.clarity = v; });
+
+                    section("Fog and light shafts");
+                    slider("Distance fog", 0, 0.01, 0.0001,
+                        function () { return r.fogDensity; },
+                        function (v) { r.fogDensity = v; });
+                    slider("Fog thins with height", 0, 0.1, 0.001,
+                        function () { return r.fogHeight.falloff; },
+                        function (v) { r.fogHeight.falloff = v; });
+                    slider("Sky colour in the fog", 0, 1, 0.05,
+                        function () { return r.aerialPerspective; },
+                        function (v) { r.aerialPerspective = v; });
+                    toggle("Light shafts (volumetric)",
+                        function () { return r.volumetric.enabled; },
+                        function (v) { r.volumetric.enabled = v; });
+                    slider("Shaft density", 0, 0.03, 0.0005,
+                        function () { return r.volumetric.density; },
+                        function (v) { r.volumetric.density = v; });
+                    slider("Shaft brightness", 0, 4, 0.05,
+                        function () { return r.volumetric.lightScatter; },
+                        function (v) { r.volumetric.lightScatter = v; });
+                    slider("Shaft reach (m)", 20, 200, 5,
+                        function () { return r.volumetric.maxDistance; },
+                        function (v) { r.volumetric.maxDistance = v; });
+
+                    section("Camera and exposure");
+                    slider("Exposure", 0.1, 3, 0.05,
+                        function () { return r.exposure; },
+                        function (v) { r.exposure = v; });
+                    toggle("Auto exposure",
+                        function () { return r.autoExposure.enabled; },
+                        function (v) { r.autoExposure.enabled = v; });
+                    slider("Exposure compensation", -3, 3, 0.1,
+                        function () { return r.exposureCompensation; },
+                        function (v) { r.exposureCompensation = v; });
+                    toggle("Depth of field",
+                        function () { return r.dof.enabled; },
+                        function (v) { r.dof.enabled = v; });
+                    slider("Blur amount (px)", 1, 20, 1,
+                        function () { return r.dof.amount; },
+                        function (v) { r.dof.amount = v; });
+
+                    section("Effects");
+                    slider("Reflections (SSR)", 0, 1, 0.05,
+                        function () { return r.ssr.intensity; },
+                        function (v) { r.ssr.intensity = v; });
+                    slider("Ambient occlusion", 0, 2, 0.05,
+                        function () { return r.ao.intensity; },
+                        function (v) { r.ao.intensity = v; });
+                    slider("Occlusion radius", 0.2, 4, 0.05,
+                        function () { return r.ao.radius; },
+                        function (v) { r.ao.radius = v; });
+                    slider("Bounce light (SSIL)", 0, 3, 0.05,
+                        function () { return r.ssil.intensity; },
+                        function (v) { r.ssil.intensity = v; });
+                    slider("Bloom", 0, 1.5, 0.05,
+                        function () { return r.bloom.strength; },
+                        function (v) { r.bloom.strength = v; });
+                    slider("Bloom threshold", 0, 6, 0.05,
+                        function () { return r.bloom.threshold; },
+                        function (v) { r.bloom.threshold = v; });
+                    slider("Firelight", 0, 3, 0.05,
+                        function () { return world.fire; },
+                        function (v) { world.fire = v; });
+
+                    section("Tonemap and colour");
+                    choice("Tonemapper", [
+                        ["linear", "Linear"], ["reinhard", "Reinhard"], ["filmic", "Filmic"],
+                        ["aces", "ACES"], ["agx", "AgX"]
+                    ],
+                        function () { return r.tonemap.mode; },
+                        function (v) { r.tonemap.mode = v; });
+                    slider("Brightness", 0.2, 2, 0.05,
+                        function () { return r.tonemap.brightness; },
+                        function (v) { r.tonemap.brightness = v; });
+                    slider("Contrast", 0.5, 1.8, 0.05,
+                        function () { return r.tonemap.contrast; },
+                        function (v) { r.tonemap.contrast = v; });
+                    slider("Saturation", 0, 2, 0.05,
+                        function () { return r.tonemap.saturation; },
+                        function (v) { r.tonemap.saturation = v; });
+
+                    // One reset for everything, outside the sections
+                    button("Reset everything to defaults", function () {
+                        for (var i = 0; i < defaults.length; i++) {
+                            defaults[i]();
+                        }
+                        syncAll();
+                    }, list).classList.add("reset");
+
+                    scroll.update();
+                };
+            })();
+        </script>
+
+        <!-- The world: terrain, forest, rocks, camp and fort -->
+        <script>
+            (function () {
+                var vl = window.vl;
+                var cam = vl.cam;
+                var msg = vl.msg;
+
+                // A clean copy of the page (nothing loaded yet) for the fullscreen tab
+                vl.pageHtml = "<!DOCTYPE html>" + document.documentElement.outerHTML;
+
+                var world = vl.world = {
+                    map: null,
+                    fire: 1,
+                    lights: [],
+                    placed: 0,
+                    sun: {
+                        elevation: 20,
+                        azimuth: 150,
+                        moving: false,
+                        dayMinutes: 20,
+                        phase: 0,
+                        last: 0
+                    }
+                };
+
+                if (!navigator.gpu) {
+                    vl.progress("This browser doesn't support WebGPU.");
+                    return;
+                }
+                if (!window.Axion) {
+                    vl.progress("Couldn't load the engine from jsDelivr.");
+                    return;
+                }
+
+                // Reads the map container: a small header, JSON, then binary sections
+                function readMap(buf) {
+                    var dv = new DataView(buf);
+                    if (dv.getUint32(0, true) !== 0x504d5841) {
+                        throw new Error("the map pack is damaged");
+                    }
+                    var len = dv.getUint32(4, true);
+                    var meta = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, len)));
+                    var start = 8 + len;
+                    start += (4 - start % 4) % 4;
+
+                    meta.bytes = function (r) {
+                        return new Uint8Array(buf, start + r[0], r[1]);
+                    };
+                    meta.floats = function (r) {
+                        return new Float32Array(buf, start + r[0], r[1] / 4);
+                    };
+
+                    // Heights are stored as 16-bit steps between the lowest and highest point
+                    var q = new Uint16Array(buf, start + meta.heights[0], meta.heights[1] / 2);
+                    var h = new Float32Array(q.length);
+                    var lo = meta.heightMin;
+                    var k = (meta.heightMax - meta.heightMin) / 65535;
+                    for (var i = 0; i < q.length; i++) {
+                        h[i] = lo + q[i] * k;
+                    }
+                    meta.heightData = h;
+                    return meta;
+                }
+
+                function image(bytes) {
+                    return createImageBitmap(new Blob([bytes], { type: "image/webp" }));
+                }
+
+                function buildTerrain(app, map) {
+                    var jobs = [];
+                    for (var i = 0; i < map.layers.length; i++) {
+                        jobs.push(image(map.bytes(map.layers[i].albedo)));
+                        jobs.push(image(map.bytes(map.layers[i].normal)));
+                    }
+                    // Small colour corrections so the layers sit together
+                    var tints = [
+                        [0.92, 0.97, 0.86],
+                        [0.7, 0.66, 0.6],
+                        [1, 0.96, 0.92],
+                        [0.95, 0.95, 0.95],
+                        [0.92, 0.94, 0.96]
+                    ];
+                    return Promise.all(jobs).then(function (imgs) {
+                        var layers = [];
+                        for (var i = 0; i < map.layers.length; i++) {
+                            var l = map.layers[i];
+                            layers.push({
+                                albedo: imgs[i * 2],
+                                normal: imgs[i * 2 + 1],
+                                scale: l.scale,
+                                roughness: l.roughness,
+                                // Rock wraps around cliffs instead of stretching down them
+                                triplanar: i === 4,
+                                tint: tints[i]
+                            });
+                        }
+
+                        // Layers: 0 forest floor, 1 fallen needles, 2 trail, 3 shore sand, 4 rock
+                        var terrain = app.terrain({
+                            heights: map.heightData,
+                            size: map.size,
+                            grid: 32,
+                            layers: layers,
+                            layerSize: 1024,
+                            splat: { data: map.bytes(map.splat), size: map.splatSize },
+                            rock: { layer: 4, slope: [0.42, 0.62], strength: 1 },
+                            snow: { height: [215, 280], slope: 0.5 },
+                            shore: { layer: 3, height: 1.4, darken: 0.4 },
+                            macro: { variation: 0.4, scale: 0.01 },
+                            water: {
+                                level: map.water,
+                                deep: [0.012, 0.04, 0.05],
+                                shallow: [0.09, 0.14, 0.1],
+                                clarity: 0.85,
+                                waves: 0.6
+                            },
+                            grass: {
+                                radius: 55,
+                                height: 0.42,
+                                width: 0.05,
+                                density: 1,
+                                bladesPerTile: 640,
+                                forest: 0.03,
+                                maxSlope: 0.5,
+                                base: [0.11, 0.19, 0.045],
+                                tip: [0.4, 0.52, 0.17],
+                                flowers: 0.02,
+                                dry: 0.55
+                            }
+                        });
+
+                        for (i = 0; i < imgs.length; i++) {
+                            imgs[i].close();
+                        }
+                        return terrain;
+                    });
+                }
+
+                // Puts every copy of each model from the map into the world
+                function placeModels(app, models) {
+                    var map = world.map;
+                    for (var name in models) {
+                        var range = map.placements[name];
+                        if (!range) {
+                            continue;
+                        }
+                        var model = models[name];
+                        var list = map.floats(range);
+                        world.placed += app.place(model, list);
+
+                        // Anything with a trunk or a collider can be bumped into
+                        for (var i = 0; i + 4 < list.length; i += 5) {
+                            vl.phys.add(list[i], list[i + 1], list[i + 2], list[i + 3], list[i + 4], model);
+                        }
+                    }
+                }
+
+                // Firelight: a warm point light that flickers, and glowing embers
+                function addLights(app) {
+                    var r = app.renderer;
+                    var ember = app.material({
+                        name: "embers", color: [1, 0.42, 0.12], emissive: 7,
+                        roughness: 1, castShadow: false
+                    });
+                    var flame = app.material({
+                        name: "flame", color: [1, 0.62, 0.22], emissive: 12,
+                        roughness: 1, castShadow: false
+                    });
+                    var ball = app.mesh(Axion.icosphere(0.5, 2));
+
+                    var list = world.map.lights;
+                    for (var i = 0; i < list.length; i++) {
+                        var l = list[i];
+                        var e = app.light(l.pos, { color: l.color, intensity: l.intensity, range: l.range });
+                        world.lights.push({ e: e, base: l.intensity, fire: !!l.fire, seed: i * 17.3 });
+                        if (!l.fire) {
+                            continue;
+                        }
+                        var x = l.pos[0], y = l.pos[1] - 0.8, z = l.pos[2];
+                        app.add({ mesh: ball, material: ember, position: [x, y + 0.12, z], scale: [0.75, 0.16, 0.75] });
+                        app.add({ mesh: ball, material: flame, position: [x, y + 0.34, z], scale: [0.34, 0.5, 0.34] });
+                        app.add({ mesh: ball, material: flame, position: [x + 0.12, y + 0.3, z - 0.08], scale: [0.2, 0.38, 0.2] });
+                    }
+                    r.shadows.maxLights = 2;
+                }
+
+                function flicker(app) {
+                    var t = app.time;
+                    for (var i = 0; i < world.lights.length; i++) {
+                        var l = world.lights[i];
+                        var c = app.world.get(l.e, Axion.PointLight);
+                        var k = 1;
+                        if (l.fire) {
+                            var s = l.seed;
+                            k = 0.82 + 0.1 * Math.sin(t * 9.1 + s) + 0.06 * Math.sin(t * 23.7 + s * 2)
+                                + 0.05 * Math.sin(t * 4.3 + s * 3) + 0.04 * (Math.random() - 0.5);
+                        }
+                        // PointLight data is [r, g, b, intensity, range]
+                        c.array[c.offset + 3] = l.base * k * world.fire;
+                    }
+                }
+
+                // Time of day
+                world.setSun = function () {
+                    vl.app.renderer.setSunAngles(world.sun.elevation, world.sun.azimuth);
+                };
+
+                function moveSun(dt) {
+                    var s = world.sun;
+                    if (!s.moving) {
+                        return;
+                    }
+                    // Moved by hand since the last step: pick the day up from there, rising
+                    if (s.elevation !== s.last) {
+                        s.phase = Math.asin(Math.max(-1, Math.min(1, (s.elevation - 29) / 33)));
+                    }
+                    // Around the sky once per day; low at dawn and dusk, high at noon
+                    var turn = dt / (s.dayMinutes * 60);
+                    s.phase += turn * Math.PI * 2;
+                    s.elevation = 29 + 33 * Math.sin(s.phase);
+                    s.azimuth = (s.azimuth + turn * 360) % 360;
+                    s.last = s.elevation;
+                    world.setSun();
+                }
+
+                function place(x, z, yaw) {
+                    cam.x = x;
+                    cam.z = z;
+                    cam.yaw = yaw;
+                    cam.pitch = 0.02;
+                    cam.vx = 0;
+                    cam.vy = 0;
+                    cam.vz = 0;
+                    vl.phys.refresh(cam, true);
+                    var ground = vl.phys.floor(x, 1e6, z);
+                    if (cam.mode === "walk") {
+                        cam.y = ground + 0.05;
+                        cam.eyeY = cam.y + cam.eye;
+                    } else {
+                        cam.y = ground + 3;
+                        cam.eyeY = cam.y;
+                    }
+                }
+
+                // Looking from x, z toward tx, tz
+                function yawTo(x, z, tx, tz) {
+                    return Math.atan2(-(tx - x), -(tz - z));
+                }
+
+                world.toSpawn = function () {
+                    var s = world.map.spawn;
+                    var look = s.look || [s.x, s.z - 100];
+                    place(s.x, s.z, yawTo(s.x, s.z, look[0], look[1]));
+                };
+
+                world.toFort = function () {
+                    var f = world.map.fort;
+                    // On the path outside the gate, looking in
+                    var x = f.x + 5, z = f.z + 52;
+                    place(x, z, yawTo(x, z, f.x, f.z));
+                };
+
+                // Numbers in the corner
+                var fps = { frames: 0, time: 0, value: 0, ms: 0 };
+                function showStats(app, dt) {
+                    fps.frames++;
+                    fps.time += dt;
+                    if (fps.time < 0.5) {
+                        return;
+                    }
+                    fps.value = fps.frames / fps.time;
+                    fps.ms = fps.time / fps.frames * 1000;
+                    fps.frames = 0;
+                    fps.time = 0;
+                    if (!vl.showStats) {
+                        return;
+                    }
+                    var s = app.stats;
+                    vl.statsEl.textContent =
+                        fps.value.toFixed(0) + " fps · " + fps.ms.toFixed(1) + " ms (cpu " + (s.cpuMs || 0).toFixed(1) + ")\n" +
+                        (s.instances || 0) + " of " + world.placed + " objects drawn · " + (s.drawCalls || 0) + " draws\n" +
+                        ((s.triangles || 0) / 1e6).toFixed(2) + " M triangles · " + (s.grassBlades || 0) + " grass blades\n" +
+                        "x " + cam.x.toFixed(0) + "  z " + cam.z.toFixed(0) + "  height " + cam.eyeY.toFixed(1) + " m";
+                }
+
+                var names = {
+                    "valley-map": "the valley",
+                    "valley-trees": "the forest",
+                    "valley-nature": "rocks and plants",
+                    "valley-props": "the camp and the fort"
+                };
+                var shares = [0.06, 0.4, 0.72, 0.9];
+
+                vl.progress("downloading (about 27 MB)…", 0.02);
+
+                Axion.App.create(vl.canvas, {
+                    maxDpr: 1,
+                    fov: 70,
+                    near: 0.1,
+                    cameraPosition: [0, 60, 300],
+                    cameraTarget: [0, 20, 0],
+                    clearColor: [0.5, 0.6, 0.75, 1],
+                    exposure: 1,
+                    sun: {
+                        elevation: world.sun.elevation,
+                        azimuth: world.sun.azimuth,
+                        intensity: 3.4,
+                        shadows: { size: 2048, distance: 230, split: 0.8, reach: 300 }
+                    },
+                    sky: {
+                        clouds: 0.42,
+                        haze: 0.9,
+                        cloudShadows: 0.3,
+                        cloudSpeed: 1,
+                        ambientStrength: 1
+                    },
+                    wind: { direction: [0.8, 0.6], strength: 0.8, speed: 1 },
+                    fogDensity: 0.0006,
+                    fogHeight: { base: 0, falloff: 0.009 },
+                    aerialPerspective: 1,
+                    ambient: [0.1, 0.12, 0.15],
+                    groundAmbient: 0.4,
+                    lodBias: 1,
+                    ao: { intensity: 1, radius: 1.3, fadeDistance: 45 },
+                    ssr: { intensity: 1, steps: 48, maxDistance: 1500, fadeDistance: 700, thickness: 1 },
+                    ssil: { intensity: 0 },
+                    bloom: { strength: 0.16, threshold: 1.8 },
+                    shadows: { maxLights: 2, size: 512 },
+                    volumetric: {
+                        enabled: true, density: 0.0016, maxDistance: 90, heightFalloff: 0.02,
+                        anisotropy: 0.55, lightScatter: 0.8, ambient: 0.4, steps: 24
+                    },
+                    tonemap: { mode: "aces", contrast: 1.05, saturation: 1.05 },
+                    autoExposure: { enabled: false }
+                }).then(function (app) {
+                    vl.app = app;
+                    return vl.loadPacks(function (name, i) {
+                        vl.progress("building " + names[name] + "…", shares[i]);
+                        var entry = window.AxionAssets[name];
+
+                        if (name === "valley-map") {
+                            return Axion.unpackAsset(entry).then(function (buf) {
+                                var map = world.map = readMap(buf);
+                                vl.mapHalf = map.size / 2;
+                                return buildTerrain(app, map);
+                            }).then(function (terrain) {
+                                vl.phys.terrain = terrain;
+                                vl.phys.water = world.map.water;
+                                vl.progress("downloading the forest…", shares[1] - 0.04);
+                            });
+                        }
+
+                        return Axion.loadModels(app, entry, { maxTextureSize: 1024 }).then(function (res) {
+                            placeModels(app, res.models);
+                            if (i + 1 < vl.packs.length) {
+                                vl.progress("downloading " + names[vl.packs[i + 1]] + "…", shares[i] + 0.02);
+                            }
+                        });
+                    });
+                }).then(function () {
+                    var app = vl.app;
+                    vl.progress("finishing…", 0.96);
+
+                    addLights(app);
+                    vl.phys.index();
+                    vl.applyPreset(app, "high");
+
+                    // Start at the camp by the lake, standing on the ground
+                    world.toSpawn();
+
+                    app.onFrame(function (dt) {
+                        moveSun(dt);
+                        flicker(app);
+                        vl.moveCam(app, dt);
+                        showStats(app, dt);
+                    });
+
+                    vl.buildMenu(app, world);
+                    vl.ready = true;
+                    vl.hint();
+                    app.start();
+
+                    document.getElementById("load").className = "done";
+                    if (vl.full.popped) {
+                        vl.full.prompt();
+                    }
+                }).catch(function (e) {
+                    vl.progress("Error: " + (e && e.message ? e.message : e));
+                });
+            })();
+        </script>
+    </body>
+</html>

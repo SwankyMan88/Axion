@@ -390,78 +390,91 @@
         <!-- Collision builder, run in a background worker.
              Not a regular script, so the page never runs it or rewrites it. -->
         <script type="text/js-worker" id="physWorker">
-            // Receives [{ v: vertices (8 floats each), idx: indices }], sends back the triangle grid
+            // Receives the triangles (9 floats each) and sends back per-triangle data
+            // plus a flat grid: cell c holds items[start[c]] to items[start[c + 1]]
             onmessage = function (e) {
-                var prims = e.data.prims;
+                var tris = e.data.tris;
                 var cell = e.data.cell;
+                var n = tris.length / 9;
+                var up = new Float32Array(n);
+                var box = new Float32Array(n * 6);
+                var minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
+                var t, o, b;
 
-                var total = 0;
-                for (var i = 0; i < prims.length; i++) {
-                    total += prims[i].idx.length / 3;
+                for (t = 0; t < n; t++) {
+                    o = t * 9;
+                    var ax = tris[o], ay = tris[o + 1], az = tris[o + 2];
+                    var bx = tris[o + 3], by = tris[o + 4], bz = tris[o + 5];
+                    var cx = tris[o + 6], cy = tris[o + 7], cz = tris[o + 8];
+
+                    var ux = bx - ax, uy = by - ay, uz = bz - az;
+                    var wx = cx - ax, wy = cy - ay, wz = cz - az;
+                    var nx = uy * wz - uz * wy;
+                    var ny = uz * wx - ux * wz;
+                    var nz = ux * wy - uy * wx;
+                    var len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+
+                    // Degenerate triangles are marked and left out of the grid
+                    up[t] = len < 1e-9 ? -1 : Math.abs(ny) / len;
+
+                    b = t * 6;
+                    box[b] = Math.min(ax, bx, cx);
+                    box[b + 1] = Math.min(ay, by, cy);
+                    box[b + 2] = Math.min(az, bz, cz);
+                    box[b + 3] = Math.max(ax, bx, cx);
+                    box[b + 4] = Math.max(ay, by, cy);
+                    box[b + 5] = Math.max(az, bz, cz);
+
+                    if (box[b] < minX) { minX = box[b]; }
+                    if (box[b + 3] > maxX) { maxX = box[b + 3]; }
+                    if (box[b + 2] < minZ) { minZ = box[b + 2]; }
+                    if (box[b + 5] > maxZ) { maxZ = box[b + 5]; }
                 }
-                var tris = new Float32Array(total * 9);
-                var box = new Float32Array(total * 6);
-                var up = new Float32Array(total);
-                var grid = {};
-                var n = 0;
 
-                for (var p = 0; p < prims.length; p++) {
-                    var v = prims[p].v;
-                    var idx = prims[p].idx;
+                var gx = Math.floor(minX / cell);
+                var gz = Math.floor(minZ / cell);
+                var sx = Math.floor(maxX / cell) - gx + 1;
+                var sz = Math.floor(maxZ / cell) - gz + 1;
+                var start = new Uint32Array(sx * sz + 1);
+                var pass, ix, iz;
 
-                    for (var t = 0; t < idx.length; t += 3) {
-                        var o = n * 9;
-                        for (var c = 0; c < 3; c++) {
-                            var src = idx[t + c] * 8;
-                            tris[o + c * 3] = v[src];
-                            tris[o + c * 3 + 1] = v[src + 1];
-                            tris[o + c * 3 + 2] = v[src + 2];
-                        }
-
-                        var ax = tris[o], ay = tris[o + 1], az = tris[o + 2];
-                        var bx = tris[o + 3], by = tris[o + 4], bz = tris[o + 5];
-                        var cx = tris[o + 6], cy = tris[o + 7], cz = tris[o + 8];
-
-                        var ux = bx - ax, uy = by - ay, uz = bz - az;
-                        var wx = cx - ax, wy = cy - ay, wz = cz - az;
-                        var nx = uy * wz - uz * wy;
-                        var ny = uz * wx - ux * wz;
-                        var nz = ux * wy - uy * wx;
-                        var len = Math.sqrt(nx * nx + ny * ny + nz * nz);
-                        if (len < 1e-9) {
+                // First pass counts the triangles per cell, the second fills them in
+                var fill = null;
+                var cursor = null;
+                for (pass = 0; pass < 2; pass++) {
+                    for (t = 0; t < n; t++) {
+                        if (up[t] < 0) {
                             continue;
                         }
-                        up[n] = Math.abs(ny) / len;
-
-                        var b = n * 6;
-                        box[b] = Math.min(ax, bx, cx);
-                        box[b + 1] = Math.min(ay, by, cy);
-                        box[b + 2] = Math.min(az, bz, cz);
-                        box[b + 3] = Math.max(ax, bx, cx);
-                        box[b + 4] = Math.max(ay, by, cy);
-                        box[b + 5] = Math.max(az, bz, cz);
-
-                        var x0 = Math.floor(box[b] / cell);
-                        var x1 = Math.floor(box[b + 3] / cell);
-                        var z0 = Math.floor(box[b + 2] / cell);
-                        var z1 = Math.floor(box[b + 5] / cell);
-                        for (var ix = x0; ix <= x1; ix++) {
-                            for (var iz = z0; iz <= z1; iz++) {
-                                var k = (ix + 2048) * 4096 + (iz + 2048);
-                                var list = grid[k];
-                                if (!list) {
-                                    list = [];
-                                    grid[k] = list;
+                        b = t * 6;
+                        var x0 = Math.floor(box[b] / cell) - gx;
+                        var x1 = Math.floor(box[b + 3] / cell) - gx;
+                        var z0 = Math.floor(box[b + 2] / cell) - gz;
+                        var z1 = Math.floor(box[b + 5] / cell) - gz;
+                        for (ix = x0; ix <= x1; ix++) {
+                            for (iz = z0; iz <= z1; iz++) {
+                                var c = ix * sz + iz;
+                                if (pass === 0) {
+                                    start[c + 1]++;
+                                } else {
+                                    fill[cursor[c]++] = t;
                                 }
-                                list.push(n);
                             }
                         }
-                        n++;
+                    }
+                    if (pass === 0) {
+                        for (c = 0; c < sx * sz; c++) {
+                            start[c + 1] += start[c];
+                        }
+                        fill = new Uint32Array(start[sx * sz]);
+                        cursor = start.slice(0, sx * sz);
                     }
                 }
 
-                postMessage({ tris: tris, box: box, up: up, grid: grid, count: n },
-                    [tris.buffer, box.buffer, up.buffer]);
+                postMessage({
+                    tris: tris, box: box, up: up, start: start, items: fill,
+                    gx: gx, gz: gz, sx: sx, sz: sz, count: n
+                }, [tris.buffer, box.buffer, up.buffer, start.buffer, fill.buffer]);
             };
         </script>
 
@@ -475,8 +488,9 @@
                     cell: 1,
                     tris: null,      // 9 floats per triangle
                     box: null,       // min xyz, max xyz per triangle
-                    up: null,        // normal y (absolute) per triangle
-                    grid: {},
+                    up: null,        // normal y (absolute) per triangle, -1 if degenerate
+                    start: null,     // grid: cell c holds items[start[c]] to items[start[c + 1]]
+                    items: null,
                     stamp: null,
                     mark: 0,
                     found: [],
@@ -487,115 +501,156 @@
                     spheres: [0.65, 1.05, 1.45]
                 };
 
-                function key(ix, iz) {
-                    return (ix + 2048) * 4096 + (iz + 2048);
-                }
-
-                // Add one triangle (vertex indices i0, i1, i2 into v) to the grid
-                function addTri(v, i0, i1, i2) {
-                    var n = phys.count;
-                    var o = n * 9;
-                    var tris = phys.tris;
-                    var ids = [i0, i1, i2];
-                    for (var c = 0; c < 3; c++) {
-                        var src = ids[c] * 8;
-                        tris[o + c * 3] = v[src];
-                        tris[o + c * 3 + 1] = v[src + 1];
-                        tris[o + c * 3 + 2] = v[src + 2];
+                // Pack the model's triangles into one array (9 floats each).
+                // Alpha-tested parts (leaves, chains) are left out: you walk through those.
+                phys.pack = function (model) {
+                    var prims = [];
+                    var total = 0;
+                    var i;
+                    for (i = 0; i < model.primitives.length; i++) {
+                        var p = model.primitives[i];
+                        var mat = model.materials[p.material];
+                        if (mat && mat.alphaMode === "MASK") {
+                            continue;
+                        }
+                        prims.push(p.geometry);
+                        total += p.geometry.indices.length / 3;
                     }
 
-                    var ax = tris[o], ay = tris[o + 1], az = tris[o + 2];
-                    var bx = tris[o + 3], by = tris[o + 4], bz = tris[o + 5];
-                    var cx = tris[o + 6], cy = tris[o + 7], cz = tris[o + 8];
-
-                    // Normal, to tell floors from walls
-                    var ux = bx - ax, uy = by - ay, uz = bz - az;
-                    var wx = cx - ax, wy = cy - ay, wz = cz - az;
-                    var nx = uy * wz - uz * wy;
-                    var ny = uz * wx - ux * wz;
-                    var nz = ux * wy - uy * wx;
-                    var len = Math.sqrt(nx * nx + ny * ny + nz * nz);
-                    if (len < 1e-9) {
-                        return;
-                    }
-                    phys.up[n] = Math.abs(ny) / len;
-
-                    var box = phys.box;
-                    var b = n * 6;
-                    box[b] = Math.min(ax, bx, cx);
-                    box[b + 1] = Math.min(ay, by, cy);
-                    box[b + 2] = Math.min(az, bz, cz);
-                    box[b + 3] = Math.max(ax, bx, cx);
-                    box[b + 4] = Math.max(ay, by, cy);
-                    box[b + 5] = Math.max(az, bz, cz);
-
-                    var x0 = Math.floor(box[b] / phys.cell);
-                    var x1 = Math.floor(box[b + 3] / phys.cell);
-                    var z0 = Math.floor(box[b + 2] / phys.cell);
-                    var z1 = Math.floor(box[b + 5] / phys.cell);
-                    for (var ix = x0; ix <= x1; ix++) {
-                        for (var iz = z0; iz <= z1; iz++) {
-                            var k = key(ix, iz);
-                            var list = phys.grid[k];
-                            if (!list) {
-                                list = [];
-                                phys.grid[k] = list;
-                            }
-                            list.push(n);
+                    var tris = new Float32Array(total * 9);
+                    var o = 0;
+                    for (i = 0; i < prims.length; i++) {
+                        var v = prims[i].vertices;
+                        var idx = prims[i].indices;
+                        for (var k = 0; k < idx.length; k++) {
+                            var src = idx[k] * 8;
+                            tris[o] = v[src];
+                            tris[o + 1] = v[src + 1];
+                            tris[o + 2] = v[src + 2];
+                            o += 3;
                         }
                     }
-                    phys.count = n + 1;
-                }
+                    return tris;
+                };
 
-                function finish(done) {
-                    phys.stamp = new Uint32Array(phys.count);
+                function finish(d, done) {
+                    phys.tris = d.tris;
+                    phys.box = d.box;
+                    phys.up = d.up;
+                    phys.start = d.start;
+                    phys.items = d.items;
+                    phys.gx = d.gx;
+                    phys.gz = d.gz;
+                    phys.sx = d.sx;
+                    phys.sz = d.sz;
+                    phys.count = d.count;
+                    phys.stamp = new Uint32Array(d.count);
                     phys.ready = true;
-                    sz.status("ready, " + phys.count + " triangles");
+                    sz.status("ready, " + d.count + " triangles");
                     if (done) {
                         done();
                     }
                 }
 
-                // Fallback: build on the page in small slices between frames
-                function buildHere(prims, done, fail) {
-                    var total = 0;
-                    for (var i = 0; i < prims.length; i++) {
-                        total += prims[i].geometry.indices.length / 3;
-                    }
-                    phys.tris = new Float32Array(total * 9);
-                    phys.box = new Float32Array(total * 6);
-                    phys.up = new Float32Array(total);
-                    phys.grid = {};
-                    phys.count = 0;
-
-                    var p = 0;
+                // Fallback: the same build as the worker, on the page in small slices
+                function buildHere(tris, done, fail) {
+                    var cell = phys.cell;
+                    var n = tris.length / 9;
+                    var d = {
+                        tris: tris,
+                        box: new Float32Array(n * 6),
+                        up: new Float32Array(n),
+                        count: n
+                    };
+                    var bounds = [Infinity, Infinity, -Infinity, -Infinity];
+                    var cursor = null;
+                    var stage = 0;
                     var t = 0;
 
-                    function step() {
-                        var until = Date.now() + 4;
-                        while (p < prims.length && Date.now() < until) {
-                            var g = prims[p].geometry;
-                            var idx = g.indices;
-                            var stop = Math.min(t + 600, idx.length);
-                            while (t < stop) {
-                                addTri(g.vertices, idx[t], idx[t + 1], idx[t + 2]);
-                                t += 3;
-                            }
-                            if (t >= idx.length) {
-                                p++;
-                                t = 0;
-                            }
-                        }
-                        if (p < prims.length) {
-                            setTimeout(slice, 0);
+                    // Stage 0: normals and boxes. Stage 1: count per cell. Stage 2: fill cells.
+                    function tri(t) {
+                        var box = d.box;
+                        var b = t * 6;
+                        if (stage === 0) {
+                            var o = t * 9;
+                            var ax = tris[o], ay = tris[o + 1], az = tris[o + 2];
+                            var bx = tris[o + 3], by = tris[o + 4], bz = tris[o + 5];
+                            var cx = tris[o + 6], cy = tris[o + 7], cz = tris[o + 8];
+                            var ux = bx - ax, uy = by - ay, uz = bz - az;
+                            var wx = cx - ax, wy = cy - ay, wz = cz - az;
+                            var nx = uy * wz - uz * wy;
+                            var ny = uz * wx - ux * wz;
+                            var nz = ux * wy - uy * wx;
+                            var len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+                            d.up[t] = len < 1e-9 ? -1 : Math.abs(ny) / len;
+                            box[b] = Math.min(ax, bx, cx);
+                            box[b + 1] = Math.min(ay, by, cy);
+                            box[b + 2] = Math.min(az, bz, cz);
+                            box[b + 3] = Math.max(ax, bx, cx);
+                            box[b + 4] = Math.max(ay, by, cy);
+                            box[b + 5] = Math.max(az, bz, cz);
+                            bounds[0] = Math.min(bounds[0], box[b]);
+                            bounds[1] = Math.min(bounds[1], box[b + 2]);
+                            bounds[2] = Math.max(bounds[2], box[b + 3]);
+                            bounds[3] = Math.max(bounds[3], box[b + 5]);
                             return;
                         }
-                        finish(done);
+                        if (d.up[t] < 0) {
+                            return;
+                        }
+                        var x0 = Math.floor(box[b] / cell) - d.gx;
+                        var x1 = Math.floor(box[b + 3] / cell) - d.gx;
+                        var z0 = Math.floor(box[b + 2] / cell) - d.gz;
+                        var z1 = Math.floor(box[b + 5] / cell) - d.gz;
+                        for (var ix = x0; ix <= x1; ix++) {
+                            for (var iz = z0; iz <= z1; iz++) {
+                                var c = ix * d.sz + iz;
+                                if (stage === 1) {
+                                    d.start[c + 1]++;
+                                } else {
+                                    d.items[cursor[c]++] = t;
+                                }
+                            }
+                        }
+                    }
+
+                    function nextStage() {
+                        if (stage === 0) {
+                            d.gx = Math.floor(bounds[0] / cell);
+                            d.gz = Math.floor(bounds[1] / cell);
+                            d.sx = Math.floor(bounds[2] / cell) - d.gx + 1;
+                            d.sz = Math.floor(bounds[3] / cell) - d.gz + 1;
+                            d.start = new Uint32Array(d.sx * d.sz + 1);
+                        } else if (stage === 1) {
+                            var cells = d.sx * d.sz;
+                            for (var c = 0; c < cells; c++) {
+                                d.start[c + 1] += d.start[c];
+                            }
+                            d.items = new Uint32Array(d.start[cells]);
+                            cursor = d.start.slice(0, cells);
+                        }
+                        stage++;
+                        t = 0;
                     }
 
                     function slice() {
                         try {
-                            step();
+                            var until = Date.now() + 4;
+                            while (stage < 3 && Date.now() < until) {
+                                var stop = Math.min(t + 2000, n);
+                                while (t < stop) {
+                                    tri(t);
+                                    t++;
+                                }
+                                if (t >= n) {
+                                    nextStage();
+                                }
+                            }
+                            if (stage < 3) {
+                                setTimeout(slice, 0);
+                                return;
+                            }
+                            finish(d, done);
                         } catch (e) {
                             if (fail) {
                                 fail(e);
@@ -605,10 +660,10 @@
                     slice();
                 }
 
-                // Build from Axion's parsed glTF primitives (world-space vertices).
-                // Uses a background worker so the page never stalls; falls back to
-                // building here in small slices if workers aren't allowed.
-                phys.build = function (prims, done, fail) {
+                // Build the collision grid from packed triangles. Uses a background
+                // worker so the page never stalls; falls back to building here in
+                // small slices if workers aren't allowed.
+                phys.build = function (tris, done, fail) {
                     var worker = null;
                     try {
                         var code = document.getElementById("physWorker").textContent;
@@ -619,43 +674,43 @@
                     }
                     if (!worker) {
                         sz.status("building on the page");
-                        buildHere(prims, done, fail);
+                        buildHere(tris, done, fail);
                         return;
                     }
                     sz.status("building in a worker");
 
                     var gave = false;
+                    var sent = null;
                     function fallBack() {
                         if (gave) {
                             return;
                         }
                         gave = true;
                         worker.terminate();
+                        // A transferred array is gone from this side; use the copy
                         sz.status("worker failed, building on the page");
-                        buildHere(prims, done, fail);
+                        buildHere(sent, done, fail);
                     }
 
                     worker.onmessage = function (e) {
+                        if (gave) {
+                            return;
+                        }
                         gave = true;
                         worker.terminate();
-                        phys.tris = e.data.tris;
-                        phys.box = e.data.box;
-                        phys.up = e.data.up;
-                        phys.grid = e.data.grid;
-                        phys.count = e.data.count;
-                        finish(done);
+                        sent = null;
+                        finish(e.data, done);
                     };
                     worker.onerror = function (e) {
                         e.preventDefault();
                         fallBack();
                     };
 
-                    var list = [];
-                    for (var i = 0; i < prims.length; i++) {
-                        list.push({ v: prims[i].geometry.vertices, idx: prims[i].geometry.indices });
-                    }
+                    // Keep a copy only while the worker might still fail
+                    sent = tris.slice();
                     try {
-                        worker.postMessage({ prims: list, cell: phys.cell });
+                        // Hand the array over instead of copying it
+                        worker.postMessage({ tris: tris, cell: phys.cell }, [tris.buffer]);
                     } catch (e) {
                         fallBack();
                         return;
@@ -674,19 +729,18 @@
                     out.length = 0;
                     phys.mark++;
 
-                    var x0 = Math.floor((x - r) / phys.cell);
-                    var x1 = Math.floor((x + r) / phys.cell);
-                    var z0 = Math.floor((z - r) / phys.cell);
-                    var z1 = Math.floor((z + r) / phys.cell);
+                    var x0 = Math.max(0, Math.floor((x - r) / phys.cell) - phys.gx);
+                    var x1 = Math.min(phys.sx - 1, Math.floor((x + r) / phys.cell) - phys.gx);
+                    var z0 = Math.max(0, Math.floor((z - r) / phys.cell) - phys.gz);
+                    var z1 = Math.min(phys.sz - 1, Math.floor((z + r) / phys.cell) - phys.gz);
+                    var start = phys.start;
+                    var items = phys.items;
 
                     for (var ix = x0; ix <= x1; ix++) {
                         for (var iz = z0; iz <= z1; iz++) {
-                            var list = phys.grid[key(ix, iz)];
-                            if (!list) {
-                                continue;
-                            }
-                            for (var i = 0; i < list.length; i++) {
-                                var t = list[i];
+                            var c = ix * phys.sz + iz;
+                            for (var i = start[c]; i < start[c + 1]; i++) {
+                                var t = items[i];
                                 if (phys.stamp[t] !== phys.mark) {
                                     phys.stamp[t] = phys.mark;
                                     out.push(t);
@@ -1688,7 +1742,13 @@
                         sz.app = app;
                         msg.textContent = "decoding Sponza…";
 
-                        return Axion.loadGLTF(app, AxionAssets.sponza, {
+                        // Decoded once: the renderer and the collision both read these bytes
+                        return Axion.unpackAsset(AxionAssets.sponza);
+                    }).then(function (bytes) {
+                        var app = sz.app;
+                        sz.bytes = bytes;
+
+                        return Axion.loadGLTF(app, bytes, {
                             onProgress: function (stage, done, total) {
                                 if (stage === "textures") {
                                     msg.textContent = "textures " + done + " / " + total;
@@ -1774,20 +1834,25 @@
                             // Wait a moment so the first frames get the machine to themselves.
                             sz.status("starting soon");
                             setTimeout(function () {
-                                sz.status("decoding model");
-                                Axion.unpackAsset(AxionAssets.sponza).then(function (bytes) {
+                                try {
                                     sz.status("reading triangles");
-                                    var glb = Axion.parseGLB(bytes);
+                                    var glb = Axion.parseGLB(sz.bytes);
                                     var model = Axion.parseGLTF(glb.json, [glb.bin]);
-                                    sz.status("building (" + model.primitives.length + " parts)");
-                                    sz.phys.build(model.primitives, function () {
+                                    var tris = sz.phys.pack(model);
+
+                                    // Everything but the packed triangles can be freed now
+                                    sz.bytes = null;
+                                    glb = null;
+                                    model = null;
+
+                                    sz.phys.build(tris, function () {
                                         sz.hint();
                                     }, function (e) {
                                         sz.status("failed: " + (e.message || e));
                                     });
-                                }).catch(function (e) {
+                                } catch (e) {
                                     sz.status("failed: " + (e.message || e));
-                                });
+                                }
                             }, 1500);
                         });
                     }).catch(function (e) {

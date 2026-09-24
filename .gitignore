@@ -7,3 +7,6 @@ test/frame.png
 demo/assets/sponza/
 demo/assets/sponza.glb
 demo/assets/sponza-web/
+
+# Poly Haven originals for the Pine Valley packs (scripts/fetch-valley.mjs)
+ph/

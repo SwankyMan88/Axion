@@ -10,11 +10,14 @@ try {
 
   for (const [name, code] of [['standard', AX.STANDARD_WGSL], ['shadow', AX.SHADOW_WGSL],
                               ['ao', AX.AO_WGSL], ['aoBlur', AX.AO_BLUR_WGSL],
+                              ['ssr', AX.SSR_WGSL],
                               ['resolve', AX.RESOLVE_WGSL],
                               ['bloomPrefilter', AX.BLOOM_PREFILTER_WGSL],
                               ['bloomDown', AX.BLOOM_DOWN_WGSL], ['bloomUp', AX.BLOOM_UP_WGSL],
                               ['final', AX.FINAL_WGSL], ['volume', AX.VOLUME_WGSL],
-                              ['exposure', AX.EXPOSURE_WGSL], ['dof', AX.DOF_WGSL]]) {
+                              ['exposure', AX.EXPOSURE_WGSL], ['dof', AX.DOF_WGSL],
+                              ['sky', AX.SKY_WGSL], ['terrain', AX.TERRAIN_WGSL],
+                              ['terrainShadow', AX.TERRAIN_SHADOW_WGSL]]) {
     const mod = gpu.device.createShaderModule({ code });
     const info = await mod.getCompilationInfo();
     const bad = info.messages.filter((m) => m.type === 'error');

@@ -40,7 +40,7 @@ page.on('console', (m) => { if (m.type() === 'error') console.log('[console]', m
 const target = process.argv[2] || process.env.PAGE || 'test/gpu-validate.html';
 await page.goto('http://localhost:8099/' + target, { waitUntil: 'load' });
 await page.waitForFunction(() => window.__result && window.__result.done, null,
-  { timeout: Number(process.env.AXION_TIMEOUT_MS || 150000) });
+  { timeout: Number(process.env.AXION_TIMEOUT_MS || 400000) });
 const result = await page.evaluate(() => window.__result);
 console.log(JSON.stringify(result, null, 2));
 

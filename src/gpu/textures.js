@@ -64,20 +64,24 @@ export const mipLevelsFor = (w, h) => Math.floor(Math.log2(Math.max(w, h))) + 1;
  * directly would darken every mip and make distant surfaces look dirtier than
  * near ones.
  */
-export function generateMips(device, texture) {
+export function generateMips(device, texture, layer = -1) {
   const { pipeline, sampler } = mipPipeline(device, texture.format);
   const enc = device.createCommandEncoder({ label: 'axion-mips' });
+  // One layer of an array texture is addressed as a plain 2D view of that layer.
+  const view = (level) => (layer < 0
+    ? texture.createView({ baseMipLevel: level, mipLevelCount: 1 })
+    : texture.createView({ dimension: '2d', baseMipLevel: level, mipLevelCount: 1, baseArrayLayer: layer, arrayLayerCount: 1 }));
   for (let level = 1; level < texture.mipLevelCount; level++) {
     const bind = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: sampler },
-        { binding: 1, resource: texture.createView({ baseMipLevel: level - 1, mipLevelCount: 1 }) },
+        { binding: 1, resource: view(level - 1) },
       ],
     });
     const pass = enc.beginRenderPass({
       colorAttachments: [{
-        view: texture.createView({ baseMipLevel: level, mipLevelCount: 1 }),
+        view: view(level),
         loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 0 },
       }],
     });
@@ -118,5 +122,36 @@ export function solidTexture(device, rgba, { srgb = false, label = 'axion-solid'
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
   });
   device.queue.writeTexture({ texture }, new Uint8Array(rgba), { bytesPerRow: 4 }, [1, 1]);
+  return texture;
+}
+
+/**
+ * A texture array from same-purpose images (terrain layers): each image is
+ * drawn at `size` x `size` into its own layer, with a full mip chain.
+ */
+export function textureArrayFromImages(device, images, { size = 1024, srgb = true, label = 'axion-texture-array' } = {}) {
+  const format = srgb ? 'rgba8unorm-srgb' : 'rgba8unorm';
+  const layers = Math.max(1, images.length);
+  const texture = device.createTexture({
+    label, format,
+    size: [size, size, layers],
+    mipLevelCount: mipLevelsFor(size, size),
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+  const canvas = new OffscreenCanvas(size, size);
+  const ctx = canvas.getContext('2d');
+  for (let i = 0; i < images.length; i++) {
+    const img = images[i];
+    if (img) {
+      ctx.clearRect(0, 0, size, size);
+      ctx.drawImage(img, 0, 0, size, size);
+    } else {
+      // A missing normal map is flat; a missing colour is mid grey.
+      ctx.fillStyle = srgb ? 'rgb(128, 128, 128)' : 'rgb(128, 128, 255)';
+      ctx.fillRect(0, 0, size, size);
+    }
+    device.queue.copyExternalImageToTexture({ source: canvas }, { texture, origin: [0, 0, i] }, [size, size]);
+    generateMips(device, texture, i);
+  }
   return texture;
 }

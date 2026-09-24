@@ -9,6 +9,7 @@ import {
 import { motionSystem, transformSystem, composeRange } from './systems/transform.js';
 import { m4compose, qFromEulerYXZ, qidentity } from './core/math.js';
 import * as primitives from './geometry/primitives.js';
+import { Terrain } from './render/terrain.js';
 
 /**
  * The ergonomic layer.
@@ -88,6 +89,61 @@ export class App {
   }
 
   material(desc) { return this.renderer.createMaterial(desc); }
+
+  /**
+   * Level of detail: one mesh id that draws whichever of several meshes suits
+   * each object's distance from the camera.
+   *   app.lod([{ mesh: hi, distance: 0 }, { mesh: mid, distance: 30 }, { mesh: lo, distance: 90 }],
+   *           { drawDistance: 300 })
+   */
+  lod(levels, options) { return this.renderer.createLod(levels, options); }
+
+  /** Stop drawing a mesh beyond `distance` metres (it shrinks away just before). 0 = always. */
+  drawDistance(mesh, distance, options) { this.renderer.setDrawDistance(mesh, distance, options); return this; }
+
+  /** Heightmap terrain with optional water and grass. See Terrain for the options. */
+  terrain(options) {
+    this.renderer.terrain?.destroy();
+    this.renderer.terrain = new Terrain(this.renderer, options);
+    return this.renderer.terrain;
+  }
+
+  /**
+   * Turn on the sun (and, by default, the sky). Angles in degrees; azimuth 0
+   * points the sun along +x, 90 along +z.
+   *   app.sun({ elevation: 35, azimuth: 120, intensity: 3 })
+   */
+  sun({ elevation, azimuth, direction, intensity, color, shadows, sky = true } = {}) {
+    const r = this.renderer;
+    r.sun.enabled = true;
+    if (direction) r.sun.direction = direction;
+    else if (elevation !== undefined || azimuth !== undefined) {
+      r.setSunAngles(elevation ?? 40, azimuth ?? 35);
+    }
+    if (intensity !== undefined) r.sun.intensity = intensity;
+    if (color !== undefined) r.sun.color = color;
+    if (shadows) Object.assign(r.sun.shadows, shadows);
+    if (sky) r.sky.enabled = true;
+    return this;
+  }
+
+  /**
+   * Place many copies of a model: `list` is a flat array of
+   * x, y, z, yaw (radians), scale per copy. Every part of the model is placed
+   * with the same transforms, in one archetype-contiguous block per part.
+   */
+  place(model, list, { stride = 5 } = {}) {
+    const count = Math.floor(list.length / stride);
+    for (const part of model.parts) {
+      this.addMany(count, part.mesh, part.material, (i, out) => {
+        const o = i * stride;
+        out.position[0] = list[o]; out.position[1] = list[o + 1]; out.position[2] = list[o + 2];
+        out.rotation[0] = 0; out.rotation[1] = list[o + 3]; out.rotation[2] = 0;
+        out.scale = list[o + 4];
+      }, { color: false });
+    }
+    return count;
+  }
 
   /* ------------------------------------------------------------ scene  */
 

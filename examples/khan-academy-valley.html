@@ -278,6 +278,23 @@
                 overflow: hidden;
             }
 
+            #loadPlay {
+                display: none;
+                margin-top: 6px;
+                padding: 11px 46px;
+                border: 0;
+                border-radius: 22px;
+                background: rgb(118, 172, 106);
+                color: rgb(14, 22, 12);
+                font: bold 16px sans-serif;
+                letter-spacing: 0.05em;
+                cursor: pointer;
+            }
+
+            #loadPlay:hover {
+                background: rgb(142, 196, 128);
+            }
+
             #loadFull {
                 margin-top: 10px;
                 padding: 8px 20px;
@@ -321,6 +338,7 @@
             <div id="loadTitle">Pine Valley</div>
             <div id="loadBar"><div id="loadFill"></div></div>
             <div id="loadText">starting…</div>
+            <button id="loadPlay" type="button">Play</button>
             <button id="loadFull" type="button">Play in fullscreen</button>
         </div>
         <div id="msg"></div>
@@ -1386,6 +1404,7 @@
                 };
 
                 full.isFull = isFull;
+                full.enter = enter;
             })();
         </script>
 
@@ -2375,11 +2394,24 @@
                         app.start();
                     }
 
-                    document.getElementById("load").className = "done";
-
-                    if (vl.full.popped) {
-                        vl.full.prompt();
-                    }
+                    // Ready: wait on the loading screen for a click on Play
+                    vl.progress("Ready", 1);
+                    var play = document.getElementById("loadPlay");
+                    play.style.display = "block";
+                    play.onclick = function () {
+                        document.getElementById("load").className = "done";
+                        if (window.ValleySound) {
+                            ValleySound.start();
+                        }
+                        // In the tab of its own, Play also goes fullscreen
+                        if (vl.full.popped && vl.full.enter) {
+                            vl.full.enter(function () {});
+                        }
+                        var req = vl.canvas.requestPointerLock ? vl.canvas.requestPointerLock() : null;
+                        if (req && req.catch) {
+                            req.catch(function () {});
+                        }
+                    };
                 }).catch(function (e) {
                     vl.progress("Error: " + (e && e.message ? e.message : e));
                 });

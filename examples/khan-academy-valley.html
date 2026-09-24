@@ -278,6 +278,23 @@
                 overflow: hidden;
             }
 
+            #loadFull {
+                margin-top: 10px;
+                padding: 8px 20px;
+                border: 1px solid rgba(160, 205, 150, 0.45);
+                border-radius: 18px;
+                background: rgba(120, 170, 110, 0.12);
+                color: rgb(206, 226, 200);
+                font: 13px sans-serif;
+                letter-spacing: 0.03em;
+                cursor: pointer;
+            }
+
+            #loadFull:hover {
+                background: rgba(120, 170, 110, 0.28);
+                border-color: rgb(150, 200, 140);
+            }
+
             #loadFill {
                 width: 0;
                 height: 100%;
@@ -304,6 +321,7 @@
             <div id="loadTitle">Pine Valley</div>
             <div id="loadBar"><div id="loadFill"></div></div>
             <div id="loadText">starting…</div>
+            <button id="loadFull" type="button">Play in fullscreen</button>
         </div>
         <div id="msg"></div>
         <div id="status">collision: waiting</div>
@@ -1298,26 +1316,52 @@
                         vl.app.stop();
                     }
                     vl.msg.textContent = "Running in the new tab. Close it to come back here.";
+                    if (!vl.ready) {
+                        vl.progress("Running in the new tab. Close it to come back here.");
+                    }
                     var watch = setInterval(function () {
                         if (!w.closed) {
                             return;
                         }
                         clearInterval(watch);
                         full.tab = null;
-                        if (vl.app) {
+                        if (vl.app && vl.ready) {
                             vl.app.start();
                         }
                         vl.hint();
                     }, 500);
                 }
 
+                /*
+                 * Inside Khan Academy's frame, fullscreen is refused, and asking for
+                 * it first uses up the click: by the time the refusal arrives the
+                 * browser no longer lets the page open a tab. So in a frame the
+                 * tab is opened straight away, while the click still counts.
+                 */
                 full.toggle = function () {
                     if (isFull()) {
                         leave();
                         return;
                     }
-                    enter(popOut);
+                    if (window.top !== window) {
+                        popOut();
+                        return;
+                    }
+                    enter(function () {
+                        vl.msg.textContent = "The browser blocked fullscreen. Press F11 instead.";
+                    });
                 };
+
+                // The button on the loading screen works before the world is in
+                var early = document.getElementById("loadFull");
+                if (early) {
+                    if (full.popped) {
+                        early.style.display = "none";
+                    }
+                    early.onclick = function () {
+                        full.toggle();
+                    };
+                }
 
                 // In the popped-out tab: one click to go fullscreen
                 // (browsers only allow it right after a click)
@@ -2326,7 +2370,10 @@
                     vl.buildMenu(app, world);
                     vl.ready = true;
                     vl.hint();
-                    app.start();
+                    // Opened in its own tab meanwhile: this copy waits until that tab closes
+                    if (!vl.full.tab || vl.full.tab.closed) {
+                        app.start();
+                    }
 
                     document.getElementById("load").className = "done";
 

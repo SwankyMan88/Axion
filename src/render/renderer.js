@@ -464,6 +464,7 @@ export class Renderer {
         { binding: 4, visibility: FRAG, texture: { sampleType: 'depth', viewDimension: '2d-array' } },
         { binding: 5, visibility: FRAG, sampler: { type: 'comparison' } },
         { binding: 6, visibility: FRAG, texture: { sampleType: 'depth', viewDimension: '2d-array' } },
+        { binding: 7, visibility: FRAG, texture: { sampleType: 'unfilterable-float' } },
       ],
     });
     this._exposureLayout = d.createBindGroupLayout({
@@ -2250,7 +2251,8 @@ export class Renderer {
     let volumePasses = 0;
     if (this.volumetric.enabled && this.volumetric.density > 0) {
       if (!this._volumeBindGroup || this._volumeShadowView !== this._shadowArrayView
-        || this._volumeSunView !== this._sunShadowView) {
+        || this._volumeSunView !== this._sunShadowView || this._volumeHorizon !== this.horizonView) {
+        this._volumeHorizon = this.horizonView;
         this._volumeShadowView = this._shadowArrayView;
         this._volumeSunView = this._sunShadowView;
         this._volumeBindGroup = this.device.createBindGroup({
@@ -2263,6 +2265,7 @@ export class Renderer {
             { binding: 4, resource: this._shadowArrayView },
             { binding: 5, resource: this._shadowSampler },
             { binding: 6, resource: this._sunShadowView },
+            { binding: 7, resource: this.horizonView },
           ],
         });
       }

@@ -1099,6 +1099,23 @@ struct Light {
 @group(0) @binding(4) var shadowMaps : texture_depth_2d_array;
 @group(0) @binding(5) var shadowSampler : sampler_comparison;
 @group(0) @binding(6) var sunShadowMaps : texture_depth_2d_array;
+@group(0) @binding(7) var horizonTex : texture_2d<f32>;
+
+fn horizonShadow(P : vec3<f32>) -> f32 {
+  if (camera.terrain.w < 0.5) { return 1.0; }
+  let dims = vec2<i32>(textureDimensions(horizonTex, 0));
+  if (dims.x < 2) { return 1.0; }
+  let g = clamp((P.xz - camera.terrain.xy) / camera.terrain.z * vec2<f32>(dims - 1),
+                vec2<f32>(0.0), vec2<f32>(dims - 1) - 0.001);
+  let i = vec2<i32>(floor(g));
+  let f = g - floor(g);
+  let a = textureLoad(horizonTex, i, 0).r;
+  let b = textureLoad(horizonTex, i + vec2<i32>(1, 0), 0).r;
+  let c = textureLoad(horizonTex, i + vec2<i32>(0, 1), 0).r;
+  let d = textureLoad(horizonTex, i + vec2<i32>(1, 1), 0).r;
+  let top = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+  return smoothstep(top - 1.5, top + 2.5, P.y);
+}
 
 @vertex
 fn vs(@builtin(vertex_index) vi : u32) -> FSOut { return fullscreen(vi); }
@@ -1180,7 +1197,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
     var light = ambient;
     if (camera.sunDir.w > 0.5) {
       let phaseSun = phaseHG(dot(dir, camera.sunDir.xyz), camera.vol.z);
-      light = light + camera.sunColor.rgb * phaseSun * sunTap(X) * camera.vol2.w * 4.0;
+      light = light + camera.sunColor.rgb * phaseSun * sunTap(X) * horizonShadow(X) * camera.vol2.w * 4.0;
     }
     for (var li : u32 = 0u; li < count; li = li + 1u) {
       let l = lights[li];
@@ -1641,8 +1658,10 @@ fn traceSSR(P : vec3<f32>, N : vec3<f32>, R : vec3<f32>, jitter : f32) -> Reflec
 
   // Fade where the march has no information: at the edge of the screen and at
   // the very end of the ray.
-  let edge = min(min(hitUV.x, 1.0 - hitUV.x), min(hitUV.y, 1.0 - hitUV.y));
-  let edgeFade = smoothstep(0.0, 0.1, edge);
+  // Sideways the fade is kept narrow: a reflection that dissolves a tenth of
+  // the way in from the side reads as the water changing, not as the screen ending.
+  let edgeXY = min(min(hitUV.x, 1.0 - hitUV.x) * 3.0, min(hitUV.y, 1.0 - hitUV.y));
+  let edgeFade = smoothstep(0.0, 0.1, edgeXY);
   // The end is measured along the ray in the world, not across the screen:
   // depth crowds into the last few screen steps of a long ray, so a far
   // mountain hit sits at 0.97 of the screen line but halfway along the ray.

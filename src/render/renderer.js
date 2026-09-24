@@ -79,6 +79,11 @@ export class Renderer {
     this.depthPrepass = options.depthPrepass !== false;
     /** Multiplies every LOD switch and draw distance. Below 1 is faster, above 1 sharper. */
     this.lodBias = options.lodBias ?? 1;
+    /**
+     * Share of each LOD switch distance over which the two levels cross-fade
+     * (dithered, so both are opaque and nothing is sorted). 0 = hard switch.
+     */
+    this.lodFade = options.lodFade ?? 0.15;
     /** Side of the square cells objects are grouped into for culling, in metres. */
     this.cellSize = options.cellSize ?? 32;
 
@@ -930,7 +935,8 @@ export class Renderer {
           ] : [{ shaderLocation: 0, offset: 0, format: 'float32x3' }],
         }],
       },
-      fragment: masked ? { module: this._modules.standard, entryPoint: 'fsDepthMask', targets: [] } : undefined,
+      // Opaque surfaces need a fragment step too, for the dithered LOD cross-fade
+      fragment: { module: this._modules.standard, entryPoint: masked ? 'fsDepthMask' : 'fsDepth', targets: [] },
       primitive: {
         topology: 'triangle-list',
         cullMode: material.doubleSided ? 'none' : 'back',
@@ -1233,9 +1239,10 @@ export class Renderer {
     if (!this._spheres || this._spheres.length < total * 4) {
       this._spheres = new Float32Array(Math.max(1024, total * 4));
     }
-    if (this._tmpSlot.length < total) {
-      this._tmpSlot = new Uint32Array(total);
-      this._tmpLevel = new Uint8Array(total);
+    // Twice the objects: one crossing between detail levels is drawn at both
+    if (this._tmpSlot.length < total * 2) {
+      this._tmpSlot = new Uint32Array(total * 2);
+      this._tmpLevel = new Uint8Array(total * 2);
     }
 
     const rowSlots = archetypes.map((a) => (a.has[Dynamic.id] === 1 ? new Uint32Array(a.count) : null));
@@ -1375,38 +1382,60 @@ export class Renderer {
   _cullInstances(camera) {
     const sp = this._spheres, cull = this.frustumCulling, f = this._frustum;
     const cx = camera.position[0], cy = camera.position[1], cz = camera.position[2];
-    const vis = this._u32List('visibleList', this._instTotal);
+    const vis = this._u32List('visibleList', this._instTotal * 2);
     const tmp = this._tmpSlot, lvl = this._tmpLevel;
     const draws = this._draws;
     draws.length = 0;
     const counts = [0, 0, 0, 0, 0, 0, 0, 0];
     let visible = 0, tris = 0;
+    const band = Math.min(Math.max(this.lodFade, 0), 0.5);
+    const bias = this.lodBias;
 
     for (const g of this._groups) {
       const mesh = g.meshRef;
       if (!mesh) continue;
-      const maxD = mesh.drawDistance > 0 ? mesh.drawDistance * this.lodBias : Infinity;
+      const maxD = mesh.drawDistance > 0 ? mesh.drawDistance * bias : Infinity;
       const maxD2 = maxD * maxD;
       const levels = mesh.lod ? mesh.lod.meshes.length : 1;
+      const lodD = mesh.lod ? mesh.lod.dist : null;
       for (let l = 0; l < levels; l++) counts[l] = 0;
       let k = 0;
 
       for (const cell of g.cells) {
         let test = 2;
+        let cellLevel = -1;
         if (!cell.dynamic) {
           const bx = cell.box;
-          if (maxD < Infinity) {
-            const dx = Math.max(bx[0] - cx, 0, cx - bx[3]);
-            const dy = Math.max(bx[1] - cy, 0, cy - bx[4]);
-            const dz = Math.max(bx[2] - cz, 0, cz - bx[5]);
-            if (dx * dx + dy * dy + dz * dz > maxD2) continue;
-          }
+          const dx = Math.max(bx[0] - cx, 0, cx - bx[3]);
+          const dy = Math.max(bx[1] - cy, 0, cy - bx[4]);
+          const dz = Math.max(bx[2] - cz, 0, cz - bx[5]);
+          const near2 = dx * dx + dy * dy + dz * dz;
+          if (near2 > maxD2) continue;
           test = cull ? this._boxInFrustum(bx) : 1;
           if (test === 0) continue;
+          // A cell wholly in view, wholly in draw range and wholly inside one
+          // detail level (clear of any cross-fade band) is taken as it is,
+          // without looking at its objects one by one.
+          if (test === 1) {
+            const fx = Math.max(Math.abs(bx[0] - cx), Math.abs(bx[3] - cx));
+            const fy = Math.max(Math.abs(bx[1] - cy), Math.abs(bx[4] - cy));
+            const fz = Math.max(Math.abs(bx[2] - cz), Math.abs(bx[5] - cz));
+            const far = Math.sqrt(fx * fx + fy * fy + fz * fz), near = Math.sqrt(near2);
+            if (far < maxD) {
+              const l0 = levels > 1 ? this._levelFor(mesh, near) : 0;
+              const next = l0 + 1 < levels ? lodD[l0 + 1] * bias * (1 - band) : Infinity;
+              if (far < next && (levels === 1 || this._levelFor(mesh, far) === l0)) cellLevel = l0;
+            }
+          }
         } else if (!cull) {
           test = 1;
         }
         const end = cell.start + cell.count;
+        if (cellLevel >= 0) {
+          for (let s = cell.start; s < end; s++) { tmp[k] = s; lvl[k] = cellLevel; k++; }
+          counts[cellLevel] += cell.count;
+          continue;
+        }
         for (let s = cell.start; s < end; s++) {
           const so = s * 4;
           const x = sp[so], y = sp[so + 1], z = sp[so + 2];
@@ -1422,7 +1451,22 @@ export class Renderer {
           const dx = x - cx, dy = y - cy, dz = z - cz;
           const d2 = dx * dx + dy * dy + dz * dz;
           if (d2 > maxD2) continue;
-          const l = levels > 1 ? this._levelFor(mesh, Math.sqrt(d2)) : 0;
+          if (levels === 1) { tmp[k] = s; lvl[k] = 0; k++; counts[0]++; continue; }
+          const d = Math.sqrt(d2);
+          const l = this._levelFor(mesh, d);
+          // Near the switch to the next level: draw both, dithered against
+          // each other, so one dissolves into the other instead of popping.
+          // The top byte of the slot carries the blend: 1..127 fading out,
+          // with bit 31 set fading in.
+          if (band > 0 && l + 1 < levels) {
+            const sw = lodD[l + 1] * bias, start = sw * (1 - band);
+            if (d > start) {
+              const q = Math.min(127, Math.max(1, Math.round((d - start) / (sw - start) * 126) + 1));
+              tmp[k] = s | (q << 24); lvl[k] = l; k++; counts[l]++;
+              tmp[k] = (s | (q << 24) | 0x80000000) >>> 0; lvl[k] = l + 1; k++; counts[l + 1]++;
+              continue;
+            }
+          }
           tmp[k] = s; lvl[k] = l; k++;
           counts[l]++;
         }

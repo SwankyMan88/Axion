@@ -1,4 +1,4 @@
-/*! Axion 0.9.7 — WebGPU, data-oriented 3D engine. MIT. */
+/*! Axion 0.9.8 — WebGPU, data-oriented 3D engine. MIT. */
 var Axion = (() => {
   var __defProp = Object.defineProperty;
   var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -1048,6 +1048,23 @@ struct Instance {
   extra : vec4<f32>,   // x = translucency, y = fade-out distance, z = leaf flutter, w = unused
 };
 
+/** The slot number in a visible-list entry; its top byte is the LOD cross-fade. */
+fn slotOf(raw : u32) -> u32 { return raw & 0xFFFFFFu; }
+
+/**
+ * The LOD cross-fade: discard this pixel when it belongs to the other level.
+ * code is the entry's top byte: 0 = no fade, 1..127 fading out, 129..255
+ * fading in. Both levels use the same screen pattern, so every pixel is
+ * covered by exactly one of them.
+ */
+fn lodDither(code : f32, pixel : vec2<f32>) -> bool {
+  if (code < 0.5) { return false; }
+  let fadingIn = code >= 128.0;
+  let p = (select(code, code - 128.0, fadingIn) - 1.0) / 126.0;
+  let n = fract(52.9829189 * fract(dot(floor(pixel), vec2<f32>(0.06711056, 0.00583715))));
+  return select((n < p), (n >= p), fadingIn);
+}
+
 @group(0) @binding(1) var<storage, read> instances : array<Instance>;
 // Slots that survived culling this frame; instance_index walks this list.
 @group(0) @binding(5) var<storage, read> visible : array<u32>;
@@ -1108,7 +1125,8 @@ fn vs(
   @location(1) normal   : vec3<f32>,
   @location(2) uv       : vec2<f32>,
 ) -> VSOut {
-  let inst = instances[visible[ii]];
+  let raw = visible[ii];
+  let inst = instances[slotOf(raw)];
   let world = instanceWorld(inst, position);
   let n = normalize((inst.model * vec4<f32>(normal, 0.0)).xyz);
 
@@ -1120,7 +1138,7 @@ fn vs(
   out.color = inst.color;
   out.pbr = inst.pbr;
   out.surf = inst.surf;
-  out.extra = inst.extra;
+  out.extra = vec4<f32>(inst.extra.xyz, f32(raw >> 24u));
   return out;
 }
 
@@ -1128,17 +1146,32 @@ fn vs(
  * Depth prepass. Same math as vs above, and both outputs are @invariant, so
  * the main pass can test depth for equality and shade every pixel once.
  */
+struct DepthOut {
+  @invariant @builtin(position) clip : vec4<f32>,
+  @location(0) @interpolate(flat) fade : f32,
+};
+
 @vertex
 fn vsDepth(@builtin(instance_index) ii : u32,
-           @location(0) position : vec3<f32>) -> @invariant @builtin(position) vec4<f32> {
-  let inst = instances[visible[ii]];
-  return camera.viewProj * vec4<f32>(instanceWorld(inst, position), 1.0);
+           @location(0) position : vec3<f32>) -> DepthOut {
+  let raw = visible[ii];
+  let inst = instances[slotOf(raw)];
+  var o : DepthOut;
+  o.clip = camera.viewProj * vec4<f32>(instanceWorld(inst, position), 1.0);
+  o.fade = f32(raw >> 24u);
+  return o;
+}
+
+@fragment
+fn fsDepth(in : DepthOut) {
+  if (lodDither(in.fade, in.clip.xy)) { discard; }
 }
 
 struct MaskDepthOut {
   @invariant @builtin(position) clip : vec4<f32>,
   @location(0) uv : vec2<f32>,
   @location(1) @interpolate(flat) alpha : f32,
+  @location(2) @interpolate(flat) fade : f32,
 };
 
 /** Depth prepass for alpha-tested surfaces: the same cut-out as the main pass. */
@@ -1146,11 +1179,13 @@ struct MaskDepthOut {
 fn vsDepthMask(@builtin(instance_index) ii : u32,
                @location(0) position : vec3<f32>,
                @location(2) uv : vec2<f32>) -> MaskDepthOut {
-  let inst = instances[visible[ii]];
+  let raw = visible[ii];
+  let inst = instances[slotOf(raw)];
   var o : MaskDepthOut;
   o.clip = camera.viewProj * vec4<f32>(instanceWorld(inst, position), 1.0);
   o.uv = uv;
   o.alpha = inst.color.a;
+  o.fade = f32(raw >> 24u);
   return o;
 }
 
@@ -1170,7 +1205,7 @@ fn cutoutAlpha(a : f32, uv : vec2<f32>) -> f32 {
 @fragment
 fn fsDepthMask(in : MaskDepthOut) {
   let a = cutoutAlpha(textureSample(baseColorTex, matSampler, in.uv).a, in.uv) * in.alpha;
-  if (a < material.alphaCutoff) { discard; }
+  if (a < material.alphaCutoff || lodDither(in.fade, in.clip.xy)) { discard; }
 }
 
 @fragment
@@ -1186,6 +1221,7 @@ fn fs(in : VSOut, @builtin(front_facing) front : bool) -> GBuffer {
   let duv1 = dpdx(in.uv);
   let duv2 = dpdy(in.uv);
   let cut = cutoutAlpha(base.a, in.uv);
+  if (lodDither(in.extra.w, in.clip.xy)) { discard; }
 
   var alpha = in.color.a * base.a;
   if (material.alphaCutoff > 0.0) {
@@ -3582,6 +3618,7 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       this.fxaa = options.fxaa !== false;
       this.depthPrepass = options.depthPrepass !== false;
       this.lodBias = options.lodBias ?? 1;
+      this.lodFade = options.lodFade ?? 0.15;
       this.cellSize = options.cellSize ?? 32;
       this.ssr = {
         intensity: options.ssr?.intensity ?? 1,
@@ -4393,7 +4430,8 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
             ] : [{ shaderLocation: 0, offset: 0, format: "float32x3" }]
           }]
         },
-        fragment: masked ? { module: this._modules.standard, entryPoint: "fsDepthMask", targets: [] } : void 0,
+        // Opaque surfaces need a fragment step too, for the dithered LOD cross-fade
+        fragment: { module: this._modules.standard, entryPoint: masked ? "fsDepthMask" : "fsDepth", targets: [] },
         primitive: {
           topology: "triangle-list",
           cullMode: material.doubleSided ? "none" : "back",
@@ -4720,9 +4758,9 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
       if (!this._spheres || this._spheres.length < total * 4) {
         this._spheres = new Float32Array(Math.max(1024, total * 4));
       }
-      if (this._tmpSlot.length < total) {
-        this._tmpSlot = new Uint32Array(total);
-        this._tmpLevel = new Uint8Array(total);
+      if (this._tmpSlot.length < total * 2) {
+        this._tmpSlot = new Uint32Array(total * 2);
+        this._tmpLevel = new Uint8Array(total * 2);
       }
       const rowSlots = archetypes.map((a) => a.has[Dynamic.id] === 1 ? new Uint32Array(a.count) : null);
       const groups = [];
@@ -4869,36 +4907,59 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
     _cullInstances(camera) {
       const sp = this._spheres, cull = this.frustumCulling, f = this._frustum;
       const cx = camera.position[0], cy = camera.position[1], cz = camera.position[2];
-      const vis = this._u32List("visibleList", this._instTotal);
+      const vis = this._u32List("visibleList", this._instTotal * 2);
       const tmp2 = this._tmpSlot, lvl = this._tmpLevel;
       const draws = this._draws;
       draws.length = 0;
       const counts = [0, 0, 0, 0, 0, 0, 0, 0];
       let visible = 0, tris = 0;
+      const band = Math.min(Math.max(this.lodFade, 0), 0.5);
+      const bias = this.lodBias;
       for (const g of this._groups) {
         const mesh2 = g.meshRef;
         if (!mesh2) continue;
-        const maxD = mesh2.drawDistance > 0 ? mesh2.drawDistance * this.lodBias : Infinity;
+        const maxD = mesh2.drawDistance > 0 ? mesh2.drawDistance * bias : Infinity;
         const maxD2 = maxD * maxD;
         const levels = mesh2.lod ? mesh2.lod.meshes.length : 1;
+        const lodD = mesh2.lod ? mesh2.lod.dist : null;
         for (let l = 0; l < levels; l++) counts[l] = 0;
         let k = 0;
         for (const cell of g.cells) {
           let test = 2;
+          let cellLevel = -1;
           if (!cell.dynamic) {
             const bx = cell.box;
-            if (maxD < Infinity) {
-              const dx = Math.max(bx[0] - cx, 0, cx - bx[3]);
-              const dy = Math.max(bx[1] - cy, 0, cy - bx[4]);
-              const dz = Math.max(bx[2] - cz, 0, cz - bx[5]);
-              if (dx * dx + dy * dy + dz * dz > maxD2) continue;
-            }
+            const dx = Math.max(bx[0] - cx, 0, cx - bx[3]);
+            const dy = Math.max(bx[1] - cy, 0, cy - bx[4]);
+            const dz = Math.max(bx[2] - cz, 0, cz - bx[5]);
+            const near2 = dx * dx + dy * dy + dz * dz;
+            if (near2 > maxD2) continue;
             test = cull ? this._boxInFrustum(bx) : 1;
             if (test === 0) continue;
+            if (test === 1) {
+              const fx = Math.max(Math.abs(bx[0] - cx), Math.abs(bx[3] - cx));
+              const fy = Math.max(Math.abs(bx[1] - cy), Math.abs(bx[4] - cy));
+              const fz = Math.max(Math.abs(bx[2] - cz), Math.abs(bx[5] - cz));
+              const far = Math.sqrt(fx * fx + fy * fy + fz * fz), near = Math.sqrt(near2);
+              if (far < maxD) {
+                const l0 = levels > 1 ? this._levelFor(mesh2, near) : 0;
+                const next = l0 + 1 < levels ? lodD[l0 + 1] * bias * (1 - band) : Infinity;
+                if (far < next && (levels === 1 || this._levelFor(mesh2, far) === l0)) cellLevel = l0;
+              }
+            }
           } else if (!cull) {
             test = 1;
           }
           const end = cell.start + cell.count;
+          if (cellLevel >= 0) {
+            for (let s = cell.start; s < end; s++) {
+              tmp2[k] = s;
+              lvl[k] = cellLevel;
+              k++;
+            }
+            counts[cellLevel] += cell.count;
+            continue;
+          }
           for (let s = cell.start; s < end; s++) {
             const so = s * 4;
             const x = sp[so], y = sp[so + 1], z = sp[so + 2];
@@ -4914,7 +4975,30 @@ fn fs(in : FSOut) -> @location(0) vec4<f32> {
             const dx = x - cx, dy = y - cy, dz = z - cz;
             const d2 = dx * dx + dy * dy + dz * dz;
             if (d2 > maxD2) continue;
-            const l = levels > 1 ? this._levelFor(mesh2, Math.sqrt(d2)) : 0;
+            if (levels === 1) {
+              tmp2[k] = s;
+              lvl[k] = 0;
+              k++;
+              counts[0]++;
+              continue;
+            }
+            const d = Math.sqrt(d2);
+            const l = this._levelFor(mesh2, d);
+            if (band > 0 && l + 1 < levels) {
+              const sw = lodD[l + 1] * bias, start = sw * (1 - band);
+              if (d > start) {
+                const q = Math.min(127, Math.max(1, Math.round((d - start) / (sw - start) * 126) + 1));
+                tmp2[k] = s | q << 24;
+                lvl[k] = l;
+                k++;
+                counts[l]++;
+                tmp2[k] = (s | q << 24 | 2147483648) >>> 0;
+                lvl[k] = l + 1;
+                k++;
+                counts[l + 1]++;
+                continue;
+              }
+            }
             tmp2[k] = s;
             lvl[k] = l;
             k++;
@@ -6436,8 +6520,12 @@ fn fsWater(in : WOut) -> GBuffer {
 
   // The fallback reflection, packed into the albedo target: colour (square
   // root, over 8) and the distance it was found at (0 = only sky)
+  // Looking steeply down, water reflects almost nothing: skip the march there
   let R2 = reflect(-V, N);
-  let m = mirrorMarch(world + vec3<f32>(0.0, 0.05, 0.0), R2);
+  var m = vec4<f32>(0.0, 0.0, 0.0, -1.0);
+  if (dot(N, V) < 0.6) {
+    m = mirrorMarch(world + vec3<f32>(0.0, 0.05, 0.0), R2);
+  }
   var out = gbuffer(Lo, 1.0, N, albedo, s.roughness, 0.0);
   if (m.w > 0.0) {
     out.albedo = vec4<f32>(sqrt(clamp(m.rgb / 8.0, vec3<f32>(0.0), vec3<f32>(1.0))), 0.02 + 0.98 * (1.0 - exp(-m.w / 800.0)));
@@ -7002,7 +7090,10 @@ fn vs(@builtin(instance_index) ii : u32, @location(0) grid : vec3<f32>) -> @buil
       const wl = this.water.enabled ? this.water.level : -Infinity;
       const visit = (level, ix, iz) => {
         const w = this._nodeBox(level, ix, iz, bx);
+        const top = bx[4];
+        if (bx[1] < wl && bx[4] < wl + 1) bx[4] = wl + 1;
         if (frustum && !this._boxInFrustum(frustum, bx)) return;
+        bx[4] = top;
         const dx = Math.max(bx[0] - cx, 0, cx - bx[3]);
         const dy = Math.max(bx[1] - cy, 0, cy - bx[4]);
         const dz = Math.max(bx[2] - cz, 0, cz - bx[5]);
@@ -8394,6 +8485,6 @@ fn vs(@builtin(instance_index) ii : u32, @location(0) grid : vec3<f32>) -> @buil
   }
 
   // src/index.js
-  var VERSION = "0.9.7";
+  var VERSION = "0.9.8";
   return __toCommonJS(index_exports);
 })();

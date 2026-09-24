@@ -445,8 +445,12 @@ fn fsWater(in : WOut) -> GBuffer {
 
   // The fallback reflection, packed into the albedo target: colour (square
   // root, over 8) and the distance it was found at (0 = only sky)
+  // Looking steeply down, water reflects almost nothing: skip the march there
   let R2 = reflect(-V, N);
-  let m = mirrorMarch(world + vec3<f32>(0.0, 0.05, 0.0), R2);
+  var m = vec4<f32>(0.0, 0.0, 0.0, -1.0);
+  if (dot(N, V) < 0.6) {
+    m = mirrorMarch(world + vec3<f32>(0.0, 0.05, 0.0), R2);
+  }
   var out = gbuffer(Lo, 1.0, N, albedo, s.roughness, 0.0);
   if (m.w > 0.0) {
     out.albedo = vec4<f32>(sqrt(clamp(m.rgb / 8.0, vec3<f32>(0.0), vec3<f32>(1.0))), 0.02 + 0.98 * (1.0 - exp(-m.w / 800.0)));

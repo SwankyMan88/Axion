@@ -390,7 +390,13 @@ export class Terrain {
     const wl = this.water.enabled ? this.water.level : -Infinity;
     const visit = (level, ix, iz) => {
       const w = this._nodeBox(level, ix, iz, bx);
+      // Under a lake the patch's box sits below the water it also carries: the
+      // box is tested up to the water surface, or looking down at the lake
+      // would drop the water with the lake bed out of view.
+      const top = bx[4];
+      if (bx[1] < wl && bx[4] < wl + 1) bx[4] = wl + 1;
       if (frustum && !this._boxInFrustum(frustum, bx)) return;
+      bx[4] = top;
       const dx = Math.max(bx[0] - cx, 0, cx - bx[3]);
       const dy = Math.max(bx[1] - cy, 0, cy - bx[4]);
       const dz = Math.max(bx[2] - cz, 0, cz - bx[5]);

@@ -689,6 +689,23 @@ struct Instance {
   extra : vec4<f32>,   // x = translucency, y = fade-out distance, z = leaf flutter, w = unused
 };
 
+/** The slot number in a visible-list entry; its top byte is the LOD cross-fade. */
+fn slotOf(raw : u32) -> u32 { return raw & 0xFFFFFFu; }
+
+/**
+ * The LOD cross-fade: discard this pixel when it belongs to the other level.
+ * code is the entry's top byte: 0 = no fade, 1..127 fading out, 129..255
+ * fading in. Both levels use the same screen pattern, so every pixel is
+ * covered by exactly one of them.
+ */
+fn lodDither(code : f32, pixel : vec2<f32>) -> bool {
+  if (code < 0.5) { return false; }
+  let fadingIn = code >= 128.0;
+  let p = (select(code, code - 128.0, fadingIn) - 1.0) / 126.0;
+  let n = fract(52.9829189 * fract(dot(floor(pixel), vec2<f32>(0.06711056, 0.00583715))));
+  return select((n < p), (n >= p), fadingIn);
+}
+
 @group(0) @binding(1) var<storage, read> instances : array<Instance>;
 // Slots that survived culling this frame; instance_index walks this list.
 @group(0) @binding(5) var<storage, read> visible : array<u32>;
@@ -749,7 +766,8 @@ fn vs(
   @location(1) normal   : vec3<f32>,
   @location(2) uv       : vec2<f32>,
 ) -> VSOut {
-  let inst = instances[visible[ii]];
+  let raw = visible[ii];
+  let inst = instances[slotOf(raw)];
   let world = instanceWorld(inst, position);
   let n = normalize((inst.model * vec4<f32>(normal, 0.0)).xyz);
 
@@ -761,7 +779,7 @@ fn vs(
   out.color = inst.color;
   out.pbr = inst.pbr;
   out.surf = inst.surf;
-  out.extra = inst.extra;
+  out.extra = vec4<f32>(inst.extra.xyz, f32(raw >> 24u));
   return out;
 }
 
@@ -769,17 +787,32 @@ fn vs(
  * Depth prepass. Same math as vs above, and both outputs are @invariant, so
  * the main pass can test depth for equality and shade every pixel once.
  */
+struct DepthOut {
+  @invariant @builtin(position) clip : vec4<f32>,
+  @location(0) @interpolate(flat) fade : f32,
+};
+
 @vertex
 fn vsDepth(@builtin(instance_index) ii : u32,
-           @location(0) position : vec3<f32>) -> @invariant @builtin(position) vec4<f32> {
-  let inst = instances[visible[ii]];
-  return camera.viewProj * vec4<f32>(instanceWorld(inst, position), 1.0);
+           @location(0) position : vec3<f32>) -> DepthOut {
+  let raw = visible[ii];
+  let inst = instances[slotOf(raw)];
+  var o : DepthOut;
+  o.clip = camera.viewProj * vec4<f32>(instanceWorld(inst, position), 1.0);
+  o.fade = f32(raw >> 24u);
+  return o;
+}
+
+@fragment
+fn fsDepth(in : DepthOut) {
+  if (lodDither(in.fade, in.clip.xy)) { discard; }
 }
 
 struct MaskDepthOut {
   @invariant @builtin(position) clip : vec4<f32>,
   @location(0) uv : vec2<f32>,
   @location(1) @interpolate(flat) alpha : f32,
+  @location(2) @interpolate(flat) fade : f32,
 };
 
 /** Depth prepass for alpha-tested surfaces: the same cut-out as the main pass. */
@@ -787,11 +820,13 @@ struct MaskDepthOut {
 fn vsDepthMask(@builtin(instance_index) ii : u32,
                @location(0) position : vec3<f32>,
                @location(2) uv : vec2<f32>) -> MaskDepthOut {
-  let inst = instances[visible[ii]];
+  let raw = visible[ii];
+  let inst = instances[slotOf(raw)];
   var o : MaskDepthOut;
   o.clip = camera.viewProj * vec4<f32>(instanceWorld(inst, position), 1.0);
   o.uv = uv;
   o.alpha = inst.color.a;
+  o.fade = f32(raw >> 24u);
   return o;
 }
 
@@ -811,7 +846,7 @@ fn cutoutAlpha(a : f32, uv : vec2<f32>) -> f32 {
 @fragment
 fn fsDepthMask(in : MaskDepthOut) {
   let a = cutoutAlpha(textureSample(baseColorTex, matSampler, in.uv).a, in.uv) * in.alpha;
-  if (a < material.alphaCutoff) { discard; }
+  if (a < material.alphaCutoff || lodDither(in.fade, in.clip.xy)) { discard; }
 }
 
 @fragment
@@ -827,6 +862,7 @@ fn fs(in : VSOut, @builtin(front_facing) front : bool) -> GBuffer {
   let duv1 = dpdx(in.uv);
   let duv2 = dpdy(in.uv);
   let cut = cutoutAlpha(base.a, in.uv);
+  if (lodDither(in.extra.w, in.clip.xy)) { discard; }
 
   var alpha = in.color.a * base.a;
   if (material.alphaCutoff > 0.0) {

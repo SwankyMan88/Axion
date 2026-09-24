@@ -399,8 +399,16 @@ export class Renderer {
         { binding: 4, visibility: FRAG, sampler: { type: 'comparison' } },
         { binding: 5, visibility: VERT, buffer: { type: 'read-only-storage' } },
         { binding: 6, visibility: FRAG, texture: { sampleType: 'depth', viewDimension: '2d-array' } },
+        { binding: 7, visibility: FRAG, texture: { sampleType: 'unfilterable-float' } },
       ],
     });
+    // Terrain horizon shadows (see Terrain): until a terrain provides them, one texel that shades nothing.
+    this._noHorizon = d.createTexture({
+      label: 'axion-no-horizon', size: [1, 1], format: 'r32float',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    d.queue.writeTexture({ texture: this._noHorizon }, new Float32Array([-1e9]), { bytesPerRow: 4 }, [1, 1]);
+    this.horizonView = this._noHorizon.createView();
     // Group 1: one bind group per material. Same layout in the geometry pass
     // and the alpha-tested shadow pass.
     this._materialLayout = d.createBindGroupLayout({
@@ -841,7 +849,9 @@ export class Renderer {
   _rebuildFrameBindGroup() {
     if (this._boundInstanceBuffer === this.instances.buffer
       && this._boundVisibleBuffer === this.visibleList.buffer
-      && this._boundSunView === this._sunShadowView) return;
+      && this._boundSunView === this._sunShadowView
+      && this._boundHorizon === this.horizonView) return;
+    this._boundHorizon = this.horizonView;
     this._boundInstanceBuffer = this.instances.buffer;
     this._boundVisibleBuffer = this.visibleList.buffer;
     this._boundSunView = this._sunShadowView;
@@ -856,6 +866,7 @@ export class Renderer {
         { binding: 4, resource: this._shadowSampler },
         { binding: 5, resource: { buffer: this.visibleList.buffer } },
         { binding: 6, resource: this._sunShadowView },
+        { binding: 7, resource: this.horizonView },
       ],
     });
   }

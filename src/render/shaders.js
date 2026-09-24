@@ -405,6 +405,7 @@ struct Light {
 @group(0) @binding(3) var shadowMaps : texture_depth_2d_array;
 @group(0) @binding(4) var shadowSampler : sampler_comparison;
 @group(0) @binding(6) var sunShadowMaps : texture_depth_2d_array;
+@group(0) @binding(7) var horizonTex : texture_2d<f32>;
 
 struct GBuffer {
   @location(0) color   : vec4<f32>,
@@ -528,6 +529,27 @@ fn sunShadow(P : vec3<f32>, geomN : vec3<f32>, nDotL : f32, pixel : vec2<f32>) -
   return mix(s, 1.0, smoothstep(splits.w * 0.85, splits.w, viewZ));
 }
 
+/**
+ * Shadows of the terrain itself, however far away the hill is: a map-wide grid
+ * holds, per column of ground, the height below which the sun (or moon) is
+ * hidden by the land toward it. Covers what the cascades can't reach.
+ */
+fn horizonShadow(P : vec3<f32>) -> f32 {
+  if (camera.terrain.w < 0.5) { return 1.0; }
+  let dims = vec2<i32>(textureDimensions(horizonTex, 0));
+  if (dims.x < 2) { return 1.0; }
+  let g = clamp((P.xz - camera.terrain.xy) / camera.terrain.z * vec2<f32>(dims - 1),
+                vec2<f32>(0.0), vec2<f32>(dims - 1) - 0.001);
+  let i = vec2<i32>(floor(g));
+  let f = g - floor(g);
+  let a = textureLoad(horizonTex, i, 0).r;
+  let b = textureLoad(horizonTex, i + vec2<i32>(1, 0), 0).r;
+  let c = textureLoad(horizonTex, i + vec2<i32>(0, 1), 0).r;
+  let d = textureLoad(horizonTex, i + vec2<i32>(1, 1), 0).r;
+  let top = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+  return smoothstep(top - 1.5, top + 2.5, P.y);
+}
+
 /** Shadow the clouds cast: the cloud field where the sun ray through P crosses the cloud plane. */
 fn cloudShadow(P : vec3<f32>) -> f32 {
   if (camera.extra.z <= 0.0 || camera.sky.x < 0.5 || camera.sky.z <= 0.0) { return 1.0; }
@@ -594,7 +616,7 @@ fn shadeDirect(s : Surface, pixel : vec2<f32>) -> vec3<f32> {
     let nl = dot(s.N, L);
     let nDotL = max(nl, 0.0);
     if (nDotL > 0.0 || s.translucency > 0.0) {
-      let sh = sunShadow(s.P, s.geomN, max(dot(s.geomN, L), 0.0), pixel) * cloudShadow(s.P);
+      let sh = sunShadow(s.P, s.geomN, max(dot(s.geomN, L), 0.0), pixel) * cloudShadow(s.P) * horizonShadow(s.P);
       let radiance = camera.sunColor.rgb * sh;
       if (nDotL > 0.0) {
         Lo = Lo + brdf(s.N, s.V, L, s.albedo, s.roughness, s.metallic, nDotV, nDotL) * radiance;

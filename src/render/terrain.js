@@ -462,8 +462,63 @@ export class Terrain {
     }
   }
 
+  /**
+   * Horizon shadows: for a grid over the whole map, the height below which the
+   * light is hidden by terrain toward it. Rebuilt a few rows per frame when the
+   * light has moved, so a moving sun never stalls a frame.
+   */
+  _updateHorizon() {
+    const dir = this.renderer._sunDir;
+    if (!dir) return;
+    const H = this._horizon ??= { size: 256, row: -1, dir: null, work: null, tex: null };
+    const G = H.size;
+    if (H.row < 0) {
+      if (H.dir && H.dir[0] * dir[0] + H.dir[1] * dir[1] + H.dir[2] * dir[2] > 0.99999) return;
+      H.dir = dir.slice();
+      H.row = 0;
+      H.work = new Float32Array(G * G);
+      let hi = -Infinity;
+      for (const v of this.heights) if (v > hi) hi = v;
+      H.max = hi;
+    }
+    const [lx, ly, lz] = H.dir;
+    const flat = Math.hypot(lx, lz);
+    const cell = this.size / (G - 1);
+    const rows = Math.min(G - H.row, 24);
+    for (let j = H.row; j < H.row + rows; j++) {
+      for (let i = 0; i < G; i++) {
+        const x = this.origin[0] + i * cell, z = this.origin[1] + j * cell;
+        let top = -1e9;
+        if (ly <= 0.002) top = 1e9;                     // light below the horizon
+        else if (flat > 1e-4) {
+          const dx = lx / flat, dz = lz / flat, slope = ly / flat;
+          let d = cell * 1.5;
+          while (d < this.size) {
+            if (H.max - d * slope <= top) break;       // nothing farther can be higher
+            const h = this.heightAt(x + dx * d, z + dz * d) - d * slope;
+            if (h > top) top = h;
+            d += cell * (0.75 + d / 400);
+          }
+        }
+        H.work[j * G + i] = top;
+      }
+    }
+    H.row += rows;
+    if (H.row < G) return;
+    H.row = -1;
+    if (!H.tex) {
+      H.tex = this.device.createTexture({
+        label: 'axion-terrain-horizon', size: [G, G], format: 'r32float',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      });
+      this.renderer.horizonView = H.tex.createView();
+    }
+    this.device.queue.writeTexture({ texture: H.tex }, H.work, { bytesPerRow: G * 4 }, [G, G]);
+  }
+
   /** Called once per frame by the renderer, before any pass is encoded. */
   frame({ camera, frustum, cascades, cascadeRedraw }) {
+    this._updateHorizon();
     const list = [], water = [], grass = [], rings = [];
     this._selectMain(camera, frustum, list, water);
     if (this.grass.enabled && this.grass.density > 0) this._selectGrass(camera, frustum, grass, rings);
@@ -573,6 +628,10 @@ export class Terrain {
   }
 
   destroy() {
+    if (this._horizon?.tex) {
+      this.renderer.horizonView = this.renderer._noHorizon.createView();
+      this._horizon.tex.destroy();
+    }
     for (const t of [this.heightTex, this.normalTex, this.splatTex, this.albedoArr, this.normalArr]) t?.destroy();
     for (const b of [this.paramBuffer, this.patchBuffer, this.vertexBuffer, this.indexBuffer]) b?.destroy();
   }

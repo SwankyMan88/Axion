@@ -673,6 +673,7 @@ struct Light {
 @group(0) @binding(3) var shadowMaps : texture_depth_2d_array;
 @group(0) @binding(4) var shadowSampler : sampler_comparison;
 @group(0) @binding(6) var sunShadowMaps : texture_depth_2d_array;
+@group(0) @binding(7) var horizonTex : texture_2d<f32>;
 
 struct GBuffer {
   @location(0) color   : vec4<f32>,
@@ -796,6 +797,27 @@ fn sunShadow(P : vec3<f32>, geomN : vec3<f32>, nDotL : f32, pixel : vec2<f32>) -
   return mix(s, 1.0, smoothstep(splits.w * 0.85, splits.w, viewZ));
 }
 
+/**
+ * Shadows of the terrain itself, however far away the hill is: a map-wide grid
+ * holds, per column of ground, the height below which the sun (or moon) is
+ * hidden by the land toward it. Covers what the cascades can't reach.
+ */
+fn horizonShadow(P : vec3<f32>) -> f32 {
+  if (camera.terrain.w < 0.5) { return 1.0; }
+  let dims = vec2<i32>(textureDimensions(horizonTex, 0));
+  if (dims.x < 2) { return 1.0; }
+  let g = clamp((P.xz - camera.terrain.xy) / camera.terrain.z * vec2<f32>(dims - 1),
+                vec2<f32>(0.0), vec2<f32>(dims - 1) - 0.001);
+  let i = vec2<i32>(floor(g));
+  let f = g - floor(g);
+  let a = textureLoad(horizonTex, i, 0).r;
+  let b = textureLoad(horizonTex, i + vec2<i32>(1, 0), 0).r;
+  let c = textureLoad(horizonTex, i + vec2<i32>(0, 1), 0).r;
+  let d = textureLoad(horizonTex, i + vec2<i32>(1, 1), 0).r;
+  let top = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+  return smoothstep(top - 1.5, top + 2.5, P.y);
+}
+
 /** Shadow the clouds cast: the cloud field where the sun ray through P crosses the cloud plane. */
 fn cloudShadow(P : vec3<f32>) -> f32 {
   if (camera.extra.z <= 0.0 || camera.sky.x < 0.5 || camera.sky.z <= 0.0) { return 1.0; }
@@ -862,7 +884,7 @@ fn shadeDirect(s : Surface, pixel : vec2<f32>) -> vec3<f32> {
     let nl = dot(s.N, L);
     let nDotL = max(nl, 0.0);
     if (nDotL > 0.0 || s.translucency > 0.0) {
-      let sh = sunShadow(s.P, s.geomN, max(dot(s.geomN, L), 0.0), pixel) * cloudShadow(s.P);
+      let sh = sunShadow(s.P, s.geomN, max(dot(s.geomN, L), 0.0), pixel) * cloudShadow(s.P) * horizonShadow(s.P);
       let radiance = camera.sunColor.rgb * sh;
       if (nDotL > 0.0) {
         Lo = Lo + brdf(s.N, s.V, L, s.albedo, s.roughness, s.metallic, nDotV, nDotL) * radiance;
@@ -3663,9 +3685,18 @@ var Renderer = class {
         { binding: 3, visibility: FRAG, texture: { sampleType: "depth", viewDimension: "2d-array" } },
         { binding: 4, visibility: FRAG, sampler: { type: "comparison" } },
         { binding: 5, visibility: VERT, buffer: { type: "read-only-storage" } },
-        { binding: 6, visibility: FRAG, texture: { sampleType: "depth", viewDimension: "2d-array" } }
+        { binding: 6, visibility: FRAG, texture: { sampleType: "depth", viewDimension: "2d-array" } },
+        { binding: 7, visibility: FRAG, texture: { sampleType: "unfilterable-float" } }
       ]
     });
+    this._noHorizon = d.createTexture({
+      label: "axion-no-horizon",
+      size: [1, 1],
+      format: "r32float",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+    });
+    d.queue.writeTexture({ texture: this._noHorizon }, new Float32Array([-1e9]), { bytesPerRow: 4 }, [1, 1]);
+    this.horizonView = this._noHorizon.createView();
     this._materialLayout = d.createBindGroupLayout({
       label: "axion-material",
       entries: [
@@ -4142,7 +4173,8 @@ var Renderer = class {
   }
   /** Recreated only when a buffer or texture it references was replaced. */
   _rebuildFrameBindGroup() {
-    if (this._boundInstanceBuffer === this.instances.buffer && this._boundVisibleBuffer === this.visibleList.buffer && this._boundSunView === this._sunShadowView) return;
+    if (this._boundInstanceBuffer === this.instances.buffer && this._boundVisibleBuffer === this.visibleList.buffer && this._boundSunView === this._sunShadowView && this._boundHorizon === this.horizonView) return;
+    this._boundHorizon = this.horizonView;
     this._boundInstanceBuffer = this.instances.buffer;
     this._boundVisibleBuffer = this.visibleList.buffer;
     this._boundSunView = this._sunShadowView;
@@ -4156,7 +4188,8 @@ var Renderer = class {
         { binding: 3, resource: this._shadowArrayView },
         { binding: 4, resource: this._shadowSampler },
         { binding: 5, resource: { buffer: this.visibleList.buffer } },
-        { binding: 6, resource: this._sunShadowView }
+        { binding: 6, resource: this._sunShadowView },
+        { binding: 7, resource: this.horizonView }
       ]
     });
   }
@@ -6782,8 +6815,64 @@ var Terrain = class {
       inner = [x0, x1, z0, z1];
     }
   }
+  /**
+   * Horizon shadows: for a grid over the whole map, the height below which the
+   * light is hidden by terrain toward it. Rebuilt a few rows per frame when the
+   * light has moved, so a moving sun never stalls a frame.
+   */
+  _updateHorizon() {
+    const dir = this.renderer._sunDir;
+    if (!dir) return;
+    const H = this._horizon ??= { size: 256, row: -1, dir: null, work: null, tex: null };
+    const G = H.size;
+    if (H.row < 0) {
+      if (H.dir && H.dir[0] * dir[0] + H.dir[1] * dir[1] + H.dir[2] * dir[2] > 0.99999) return;
+      H.dir = dir.slice();
+      H.row = 0;
+      H.work = new Float32Array(G * G);
+      let hi = -Infinity;
+      for (const v of this.heights) if (v > hi) hi = v;
+      H.max = hi;
+    }
+    const [lx, ly, lz] = H.dir;
+    const flat = Math.hypot(lx, lz);
+    const cell = this.size / (G - 1);
+    const rows = Math.min(G - H.row, 24);
+    for (let j = H.row; j < H.row + rows; j++) {
+      for (let i = 0; i < G; i++) {
+        const x = this.origin[0] + i * cell, z = this.origin[1] + j * cell;
+        let top = -1e9;
+        if (ly <= 2e-3) top = 1e9;
+        else if (flat > 1e-4) {
+          const dx = lx / flat, dz = lz / flat, slope = ly / flat;
+          let d = cell * 1.5;
+          while (d < this.size) {
+            if (H.max - d * slope <= top) break;
+            const h = this.heightAt(x + dx * d, z + dz * d) - d * slope;
+            if (h > top) top = h;
+            d += cell * (0.75 + d / 400);
+          }
+        }
+        H.work[j * G + i] = top;
+      }
+    }
+    H.row += rows;
+    if (H.row < G) return;
+    H.row = -1;
+    if (!H.tex) {
+      H.tex = this.device.createTexture({
+        label: "axion-terrain-horizon",
+        size: [G, G],
+        format: "r32float",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+      });
+      this.renderer.horizonView = H.tex.createView();
+    }
+    this.device.queue.writeTexture({ texture: H.tex }, H.work, { bytesPerRow: G * 4 }, [G, G]);
+  }
   /** Called once per frame by the renderer, before any pass is encoded. */
   frame({ camera, frustum, cascades, cascadeRedraw }) {
+    this._updateHorizon();
     const list = [], water = [], grass = [], rings = [];
     this._selectMain(camera, frustum, list, water);
     if (this.grass.enabled && this.grass.density > 0) this._selectGrass(camera, frustum, grass, rings);
@@ -6888,6 +6977,10 @@ var Terrain = class {
     return 1;
   }
   destroy() {
+    if (this._horizon?.tex) {
+      this.renderer.horizonView = this.renderer._noHorizon.createView();
+      this._horizon.tex.destroy();
+    }
     for (const t of [this.heightTex, this.normalTex, this.splatTex, this.albedoArr, this.normalArr]) t?.destroy();
     for (const b of [this.paramBuffer, this.patchBuffer, this.vertexBuffer, this.indexBuffer]) b?.destroy();
   }
